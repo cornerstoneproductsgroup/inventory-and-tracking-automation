@@ -180,6 +180,42 @@ def main() -> int:
 
 
 
+    required_scripts = ("run_commercehub_chain.py", "run_sps.py")
+
+    missing_scripts = [str(INVENTORY_DIR / n) for n in required_scripts if not (INVENTORY_DIR / n).is_file()]
+
+    if missing_scripts:
+
+        print("\nERROR: Missing script(s) under Inventory Submissions:")
+
+        for path in missing_scripts:
+
+            print(f"  - {path}")
+
+        print(
+
+            "\nThis folder must contain the same Python files as your main PC (including run_commercehub_chain.py).\n"
+
+            "Typical fixes from cmd.exe:\n"
+
+            f'  cd /d "{ROOT}"\n'
+
+            "  git submodule update --init --recursive\n"
+
+            "\nIf you do not use submodules, either copy the full \"Inventory Submissions\" folder from your main PC,\n"
+
+            "or clone your Inventory-Automation repo into:\n"
+
+            f'  "{INVENTORY_DIR}"\n'
+
+            "then run git pull there."
+
+        )
+
+        return 1
+
+
+
     errors: list[str] = []
 
     for title, cmd, cwd in steps:

@@ -108,6 +108,7 @@ class LowesTrackingAutomation:
         }
         self.csv_index: Dict[str, CsvRecord] = {}
         self._fedex_reference_min_digits: int = 5
+        self._fedex_rows_loaded: int = 0
 
     def get_enabled_workflows(self, workflow_filter: str) -> List[Tuple[str, Dict]]:
         rithum = self.config["rithum"]
@@ -231,6 +232,8 @@ class LowesTrackingAutomation:
         for key in keys:
             self.csv_index.setdefault(key, record)
 
+        self._fedex_rows_loaded += 1
+
     def _load_from_csv_by_header(self, file_path: Path, csv_config: Dict, shipment_type_value: str) -> None:
         delimiter = csv_config.get("delimiter", ",")
         po_col = csv_config["po_column"]
@@ -335,6 +338,7 @@ class LowesTrackingAutomation:
 
     def load_csv_index(self) -> None:
         csv_config = self.config["fedex_csv"]
+        self._fedex_rows_loaded = 0
         self._fedex_reference_min_digits = int(csv_config.get("reference_match_min_digits", 5))
         shipment_type_value = csv_config["shipment_type_value"]
         source_file = self._resolve_tracking_file(csv_config)
@@ -353,7 +357,12 @@ class LowesTrackingAutomation:
                 "Use .csv, .xlsx, or .xlsm."
             )
 
-        print(f"Loaded {len(self.csv_index)} PO entries from {source_file}")
+        key_count = len(self.csv_index)
+        unique_records = len({id(rec) for rec in self.csv_index.values()})
+        print(
+            f"Loaded {self._fedex_rows_loaded} FedEx row(s) "
+            f"({unique_records} shipment record(s), {key_count} PO lookup key(s)) from {source_file}"
+        )
 
     def launch_browser(self, playwright) -> Browser:
         browser_settings = self.config["browser"]
