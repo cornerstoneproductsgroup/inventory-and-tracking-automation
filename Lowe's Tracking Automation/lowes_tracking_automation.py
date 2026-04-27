@@ -546,10 +546,49 @@ class LowesTrackingAutomation:
         t = (text or "").strip()
         if not t:
             return None
-        m = re.search(r"(\d+(?:\.\d+)?)\s*EA\b", t, re.IGNORECASE)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*EA", t, re.IGNORECASE)
         if m:
             return m.group(1)
         return self._extract_numeric_quantity(t)
+
+    def _remaining_qty_in_row_with_ship_input(self, qty_input_locator) -> Optional[str]:
+        """
+        Quantity Remaining (\"2 EA\") must come from the *same table row* as the ship-qty
+        input. A global ``div.css-10ndwee`` matches many unrelated nodes, so pairing by
+        index often reads the wrong div and yields 1 from the FedEx fallback.
+        """
+        try:
+            axis_variants = (
+                "ancestor::tr[1]",
+                "ancestor::*[local-name()='tr'][1]",
+                "ancestor::*[@role='row'][1]",
+            )
+            for ax in axis_variants:
+                row = qty_input_locator.locator(f"xpath={ax}")
+                if row.count() == 0:
+                    continue
+                r0 = row.first
+                try:
+                    mcell = r0.get_by_text(re.compile(r"\d+(?:\.\d+)?\s*EA", re.I))
+                    if mcell.count() > 0:
+                        t = mcell.first.inner_text().strip()
+                        p = self._parse_remaining_qty_display(t)
+                        if p:
+                            return p
+                except Exception:
+                    pass
+                for sub in ("[class*='10ndwee']", "div[class*='10ndwee']", "*[contains(@class,'10ndwee')]"):
+                    cells = r0.locator(sub)
+                    for j in range(min(cells.count(), 30)):
+                        t = cells.nth(j).inner_text().strip()
+                        if not t or "EA" not in t.upper():
+                            continue
+                        p = self._parse_remaining_qty_display(t)
+                        if p:
+                            return p
+            return None
+        except Exception:
+            return None
 
     def _resolve_ship_quantity_for_line(
         self,
@@ -562,6 +601,10 @@ class LowesTrackingAutomation:
         """Resolve ship qty for one line (ship-to-store may have many qty + \"N EA\" pairs)."""
         if not bool(workflow_cfg.get("use_quantity_remaining", False)):
             return fallback
+
+        parsed = self._remaining_qty_in_row_with_ship_input(qty_input_locator)
+        if parsed:
+            return parsed
 
         if rem_locator is not None:
             try:
