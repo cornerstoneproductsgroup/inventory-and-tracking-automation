@@ -538,30 +538,52 @@ class LowesTrackingAutomation:
             return None
         return match.group(1)
 
-    def _resolve_ship_quantity(self, page: Page, selectors: Dict, workflow_cfg: Dict, csv_quantity: str) -> str:
-        if not bool(workflow_cfg.get("use_quantity_remaining", False)):
-            return csv_quantity
+    def _parse_remaining_qty_display(self, text: str) -> Optional[str]:
+        """
+        Ship-to-store (React) shows remaining like \"2 EA\" in div.css-10ndwee.
+        Prefer the integer before EA, then fall back to any number in the string.
+        """
+        t = (text or "").strip()
+        if not t:
+            return None
+        m = re.search(r"(\d+(?:\.\d+)?)\s*EA\b", t, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return self._extract_numeric_quantity(t)
 
-        remaining_selector = (selectors.get("quantity_remaining") or "").strip()
-        if remaining_selector:
+    def _resolve_ship_quantity_for_line(
+        self,
+        qty_input_locator,
+        rem_locator,
+        line_idx: int,
+        workflow_cfg: Dict,
+        fallback: str,
+    ) -> str:
+        """Resolve ship qty for one line (ship-to-store may have many qty + \"N EA\" pairs)."""
+        if not bool(workflow_cfg.get("use_quantity_remaining", False)):
+            return fallback
+
+        if rem_locator is not None:
             try:
-                remaining_text = page.locator(remaining_selector).first.inner_text().strip()
-                parsed = self._extract_numeric_quantity(remaining_text)
-                if parsed:
-                    return parsed
+                n_rem = rem_locator.count()
+                if n_rem > 0:
+                    rem_idx = min(line_idx, n_rem - 1)
+                    remaining_text = rem_locator.nth(rem_idx).inner_text().strip()
+                    parsed = self._parse_remaining_qty_display(remaining_text)
+                    if parsed:
+                        return parsed
             except Exception:
                 pass
 
-        # Fallback for quantity remaining when a max attr is present on ship qty input.
         try:
-            max_attr = page.locator(selectors["quantity_input"]).first.get_attribute("max")
-            parsed = self._extract_numeric_quantity(max_attr or "")
+            max_attr = qty_input_locator.get_attribute("max") or ""
+            parsed = self._extract_numeric_quantity(max_attr)
             if parsed:
                 return parsed
         except Exception:
             pass
 
-        return csv_quantity
+        return fallback
 
     def _extract_order_id_from_href(self, href: str) -> Optional[str]:
         match = re.search(r"[?&]Hub_PO=(\d+)", href or "")
@@ -569,17 +591,62 @@ class LowesTrackingAutomation:
             return match.group(1)
         return None
 
-    def _resolve_line_quantity_from_input(self, page: Page, qty_input, fallback_quantity: str) -> str:
+    def _quantity_from_remaining_cell(self, page: Page, remaining_id: str) -> Optional[str]:
+        try:
+            loc = page.locator(f"[id='{remaining_id}']")
+            if loc.count() == 0:
+                return None
+            remaining_text = loc.first.inner_text().strip()
+            return self._parse_remaining_qty_display(remaining_text)
+        except Exception:
+            return None
+
+    def _resolve_line_quantity_from_input(
+        self,
+        page: Page,
+        qty_input,
+        fallback_quantity: str,
+        *,
+        order_id: Optional[str] = None,
+    ) -> str:
+        """
+        Prefer CommerceHub per-line \"remaining\" qty over FedEx default (often 1).
+        Shipped inputs usually have name=order(...).item(...).shipped but no id.
+        """
+        shipped_suffix = ".shipped"
         input_id = (qty_input.get_attribute("id") or "").strip()
-        if input_id and input_id.startswith("order(") and input_id.endswith(".shipped"):
-            remaining_id = f"cell.line.{input_id[:-len('.shipped')]}.remaining"
-            try:
-                remaining_text = page.locator(f"[id='{remaining_id}']").first.inner_text().strip()
-                parsed = self._extract_numeric_quantity(remaining_text)
-                if parsed:
-                    return parsed
-            except Exception:
-                pass
+        if input_id.startswith("order(") and input_id.endswith(shipped_suffix):
+            rid = f"cell.line.{input_id[: -len(shipped_suffix)]}.remaining"
+            parsed = self._quantity_from_remaining_cell(page, rid)
+            if parsed:
+                return parsed
+
+        name = (qty_input.get_attribute("name") or "").strip()
+        if name.startswith("order(") and name.endswith(shipped_suffix):
+            rid = f"cell.line.{name[: -len(shipped_suffix)]}.remaining"
+            parsed = self._quantity_from_remaining_cell(page, rid)
+            if parsed:
+                return parsed
+
+        # Depot-style: td id contains order id, item index, and .remaining
+        if order_id and name:
+            m = re.search(r"\.item\(([^)]+)\)\.shipped$", name)
+            if m:
+                item_token = m.group(1)
+                try:
+                    rem = page.locator(
+                        "xpath=//td[contains(@id,'order("
+                        + order_id
+                        + ")') and contains(@id,'.item("
+                        + item_token
+                        + ")') and contains(@id,'.remaining')]"
+                    )
+                    if rem.count() > 0:
+                        parsed = self._parse_remaining_qty_display(rem.first.inner_text().strip())
+                        if parsed:
+                            return parsed
+                except Exception:
+                    pass
 
         max_attr = (qty_input.get_attribute("max") or "").strip()
         parsed_max = self._extract_numeric_quantity(max_attr)
@@ -638,12 +705,14 @@ class LowesTrackingAutomation:
                 if not po_number:
                     continue
 
+                href = po_link.get_attribute("href") or ""
+
                 self.stats["orders_seen"] += 1
                 print(f"[{workflow_name}] Detected PO: {po_number}")
 
                 record = self.lookup_record(po_number)
                 if record is None:
-                    hub_po = self._extract_order_id_from_href(href or "")
+                    hub_po = self._extract_order_id_from_href(href)
                     if hub_po:
                         record = self.lookup_record(hub_po)
                 if record is None:
@@ -653,7 +722,6 @@ class LowesTrackingAutomation:
                         continue
                     raise ValueError(f"No CSV match found for PO '{po_number}'")
 
-                href = po_link.get_attribute("href") or ""
                 order_id = self._extract_order_id_from_href(href)
                 if not order_id:
                     self.stats["orders_failed"] += 1
@@ -691,7 +759,9 @@ class LowesTrackingAutomation:
 
                 for idx in range(qty_inputs.count()):
                     qty_input = qty_inputs.nth(idx)
-                    line_quantity = self._resolve_line_quantity_from_input(page, qty_input, record.quantity)
+                    line_quantity = self._resolve_line_quantity_from_input(
+                        page, qty_input, record.quantity, order_id=order_id
+                    )
                     qty_input.fill(line_quantity)
 
                 self.stats["orders_matched"] += 1
@@ -839,9 +909,22 @@ class LowesTrackingAutomation:
 
         self.set_input_or_select(page, selectors["tracking_input"], record.tracking_number)
         shipment_value = str(workflow_cfg.get("shipment_type_value_override") or record.shipment_type)
-        ship_quantity = self._resolve_ship_quantity(page, selectors, workflow_cfg, record.quantity)
         self.set_input_or_select(page, selectors["shipment_type_input"], shipment_value)
-        self.set_input_or_select(page, selectors["quantity_input"], ship_quantity)
+
+        rem_sel = (selectors.get("quantity_remaining") or "").strip()
+        rem_loc = page.locator(rem_sel) if rem_sel else None
+        qty_loc = page.locator(selectors["quantity_input"])
+        if qty_loc.count() == 0:
+            raise ValueError("quantity_input selector matched no elements on the order page")
+        for line_idx in range(qty_loc.count()):
+            ship_quantity = self._resolve_ship_quantity_for_line(
+                qty_loc.nth(line_idx),
+                rem_loc,
+                line_idx,
+                workflow_cfg,
+                record.quantity,
+            )
+            qty_loc.nth(line_idx).fill(str(ship_quantity))
 
         if self.config["automation"].get("pause_for_manual_review_before_submit", False):
             input("Press Enter to submit this order...")
