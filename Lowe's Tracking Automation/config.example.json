@@ -1,0 +1,98 @@
+{
+  "browser": {
+    "headless": false,
+    "slow_mo_ms": 100
+  },
+  "rithum": {
+    "login_url": "https://dsm.commercehub.com/dsm/gotoHome.do",
+    "orders_url": "https://dsm.commercehub.com/dsm/gotoOpenOrders.do?PID=lowes",
+    "username": "rfetzer@cornerstoneproductsgroup.com",
+    "password": "Lowesdepotdepotso1106!",
+    "login_delays_ms": {
+      "after_email_continue": 1200,
+      "after_password_continue": 1200,
+      "before_profile_selector": 1500
+    },
+    "workflows": {
+      "ship_to_customer": {
+        "enabled": true,
+        "orders_url": "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship&tabContext=web_quickship&status=open&substatus=accepted&merchant=lowes",
+        "process_in_list": true,
+        "shipment_type_value_override": "FEDX",
+        "use_quantity_remaining": true,
+        "run_until_stopped": false,
+        "run_until_queue_empty": true,
+        "idle_sleep_seconds": 10,
+        "selectors": {
+          "po_links": "a.simple_link[href*='gotoOrderDetail.do?Hub_PO=']",
+          "submit_button": "input#confirmbtn[name='confirmbtn'][type='submit']"
+        }
+      },
+      "ship_to_store": {
+        "enabled": true,
+        "orders_url": "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickshipgs1&tabContext=web_quickshipgs1&status=open&substatus=accepted&merchant=lowes",
+        "shipment_type_value_override": "FEDX",
+        "use_quantity_remaining": true,
+        "selectors": {
+          "order_links": "tr[onclick*='gotoOrderRealmForm.do?orderid='][onclick*='action=web_shipgs1']",
+          "po_on_order_page": "a[data-testid='confirm-order-link']",
+          "tracking_input": "input[data-testid*='-tracking-number-input']",
+          "shipment_type_input": "select[data-testid*='-ship-method']",
+          "quantity_input": "input[data-testid*='-ship-qty-input']",
+          "quantity_remaining": "div.css-10ndwee",
+          "submit_button": "button:has-text('Confirm')"
+        }
+      },
+      "invoice": {
+        "enabled": true,
+        "orders_url": "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickinvoice&tabContext=web_quickinvoice&merchant=lowes",
+        "process_invoice_list": true,
+        "idle_after_submit_ms": 1000,
+        "delay_between_invoice_autofill_ms": 150,
+        "selectors": {
+          "invoice_select_all_button": "input#checkall[name='checkall']",
+          "invoice_autofill_buttons": "input[type='button'][name$='.invoicenumber.autofill'][value='Auto Fill']",
+          "submit_button": "input#confirmbtn[name='confirmbtn'][type='submit']"
+        }
+      }
+    },
+    "selectors": {
+      "username_input": "input#username[name='username']",
+      "password_input": "input#password[name='password']",
+      "username_continue_button": "button[type='submit']._button-login-id",
+      "password_continue_button": "button[type='submit']._button-login-password",
+      "login_button": "button[type='submit']._button-login-password",
+      "profile_selector": "a.application-identity-item:has-text('Cornerstone Products Group')",
+      "logged_in_ready": "a[href*='gotoOpenOrders.do?PID=lowes']",
+      "order_links": "a.order-link",
+      "po_on_order_page": "[data-testid='po-number']",
+      "tracking_input": "input[name='trackingNumber']",
+      "shipment_type_input": "input[name='shipmentType']",
+      "quantity_input": "input[name='quantity']",
+      "submit_button": "button[type='submit']",
+      "submit_success_banner": ".toast-success"
+    }
+  },
+  "fedex_csv": {
+    "directory": "//rygarcorp.com/shares/Cornerstone/Dot Com Packing Slips/1-Orders Before Extraction/Order Splitter Output/z - Lowe's Tracking",
+    "base_name": "Lowe's Fedex Master",
+    "allowed_extensions": [".xlsx", ".xlsm", ".csv"],
+    "path": "",
+    "sheet_name": "",
+    "data_starts_on_row": 2,
+    "delimiter": ",",
+    "po_column_letter": "C",
+    "tracking_column_letter": "E",
+    "quantity_value": "1",
+    "shipment_type_value": "Parcel"
+  },
+  "automation": {
+    "max_orders": 50,
+    "skip_orders_without_csv_match": true,
+    "pause_for_manual_review_before_submit": false,
+    "dry_run_browser_hold_seconds_ship_to_store": 25,
+    "dry_run_browser_hold_seconds_ship_to_customer": 12,
+    "dry_run_browser_hold_seconds_invoice": 15,
+    "dry_run_browser_hold_seconds": 15
+  }
+}
