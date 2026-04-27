@@ -94,6 +94,36 @@ def _canonical_po_from_fedex_cell(raw: str, min_digit_run: int) -> str:
     return first.strip()
 
 
+def _digit_runs_at_least(text: str, min_len: int) -> List[str]:
+    """Contiguous digit runs of at least min_len (avoids treating '407024614 EGLAI1' as 4070246141)."""
+    ml = max(4, int(min_len))
+    return re.findall(rf"\d{{{ml},}}", text or "")
+
+
+def _po_lookup_candidate_strings(raw: str, min_digit_run: int) -> List[str]:
+    """Ordered unique strings to try against csv_index keys (Rithum PO / reference line)."""
+    s = (raw or "").strip()
+    if not s:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def add(t: str) -> None:
+        u = (t or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    add(s)
+    parts = s.split()
+    if parts:
+        add(parts[0])
+        add(parts[-1])
+    for run in _digit_runs_at_least(s, min_digit_run):
+        add(run)
+    return out
+
+
 class LowesTrackingAutomation:
     def __init__(self, config: Dict):
         self.config = config
@@ -446,18 +476,14 @@ class LowesTrackingAutomation:
         return links
 
     def lookup_record(self, po_number: str) -> Optional[CsvRecord]:
-        normalized_po = po_number.strip()
-        if normalized_po in self.csv_index:
-            return self.csv_index[normalized_po]
+        min_run = max(5, int(getattr(self, "_fedex_reference_min_digits", 5)))
+        normalized_po = (po_number or "").replace("\u00a0", " ").strip()
 
-        # Some Rithum references include extra text after the PO
-        # (for example: "123456 partial shipment"). Try matching against
-        # the first token before falling back to broader matching.
-        po_first_token = normalized_po.split()[0] if normalized_po else ""
-        if po_first_token and po_first_token in self.csv_index:
-            return self.csv_index[po_first_token]
+        for cand in _po_lookup_candidate_strings(normalized_po, min_run):
+            if cand in self.csv_index:
+                return self.csv_index[cand]
 
-        # Prefix match: reference starts with PO and then has trailing words.
+        # Prefix match: Rithum reference starts with a FedEx key, then trailing words.
         normalized_upper = normalized_po.upper()
         for key, value in self.csv_index.items():
             key_text = key.strip()
@@ -472,13 +498,28 @@ class LowesTrackingAutomation:
             if not next_char.isalnum():
                 return value
 
-        # Fallback: match with non-digits stripped (helps with formats like PO-123 vs 123)
-        po_digits = re.sub(r"\D", "", normalized_po)
-        if not po_digits:
+        # FedEx cell may be "407024614 EGLAI1": match digit *runs*, not all digits concatenated.
+        po_runs = _digit_runs_at_least(normalized_po, min_run)
+        if not po_runs:
+            collapsed = re.sub(r"\D", "", normalized_po)
+            if collapsed:
+                po_runs = [collapsed]
+        if not po_runs:
             return None
+
         for key, value in self.csv_index.items():
-            if re.sub(r"\D", "", key) == po_digits:
-                return value
+            key_runs = _digit_runs_at_least(key, min_run)
+            if not key_runs:
+                continue
+            for pr in po_runs:
+                if pr in key_runs:
+                    return value
+                if pr.isdigit():
+                    for kr in key_runs:
+                        if not kr.isdigit():
+                            continue
+                        if int(kr) == int(pr):
+                            return value
         return None
 
     def set_input_or_select(self, page: Page, selector: str, value: str) -> None:
@@ -601,6 +642,10 @@ class LowesTrackingAutomation:
                 print(f"[{workflow_name}] Detected PO: {po_number}")
 
                 record = self.lookup_record(po_number)
+                if record is None:
+                    hub_po = self._extract_order_id_from_href(href or "")
+                    if hub_po:
+                        record = self.lookup_record(hub_po)
                 if record is None:
                     self.stats["orders_skipped_no_match"] += 1
                     if self.config["automation"].get("skip_orders_without_csv_match", True):
@@ -775,6 +820,10 @@ class LowesTrackingAutomation:
 
         print(f"[{workflow_name}] Detected PO: {po_number}")
         record = self.lookup_record(po_number)
+        if record is None:
+            hub_po = self._extract_order_id_from_href(order_url or "")
+            if hub_po:
+                record = self.lookup_record(hub_po)
         if record is None:
             self.stats["orders_skipped_no_match"] += 1
             if self.config["automation"].get("skip_orders_without_csv_match", True):
