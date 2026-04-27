@@ -82,6 +82,7 @@
     "data_starts_on_row": 2,
     "delimiter": ",",
     "po_column_letter": "C",
+    "reference_match_min_digits": 5,
     "tracking_column_letter": "E",
     "quantity_value": "1",
     "shipment_type_value": "Parcel"

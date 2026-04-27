@@ -52,6 +52,48 @@ class CsvRecord:
     shipment_type: str
 
 
+def _fedex_po_lookup_keys_from_cell(raw: str, min_digit_run: int) -> List[str]:
+    """
+    FedEx / Worldship reference cells may contain SKU text plus the Lowe's PO in one field.
+    Index every whitespace token and every long digit run so Rithum's PO can match a subset.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return []
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def add(key: str) -> None:
+        t = key.strip()
+        if not t or t in seen:
+            return
+        seen.add(t)
+        out.append(t)
+
+    add(s)
+    pat = rf"\d{{{min_digit_run},}}"
+    for token in re.split(r"\s+", s):
+        add(token)
+        for m in re.finditer(pat, token):
+            add(m.group(0))
+    for m in re.finditer(pat, s):
+        add(m.group(0))
+    return out
+
+
+def _canonical_po_from_fedex_cell(raw: str, min_digit_run: int) -> str:
+    """Prefer the longest numeric PO-like token for logging / CsvRecord.po_number."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    pat = rf"\d{{{min_digit_run},}}"
+    runs = re.findall(pat, s)
+    if runs:
+        return max(runs, key=len)
+    first = s.split()[0] if s.split() else s
+    return first.strip()
+
+
 class LowesTrackingAutomation:
     def __init__(self, config: Dict):
         self.config = config
@@ -65,6 +107,7 @@ class LowesTrackingAutomation:
             "invoice_batches_submitted": 0,
         }
         self.csv_index: Dict[str, CsvRecord] = {}
+        self._fedex_reference_min_digits: int = 5
 
     def get_enabled_workflows(self, workflow_filter: str) -> List[Tuple[str, Dict]]:
         rithum = self.config["rithum"]
@@ -169,19 +212,24 @@ class LowesTrackingAutomation:
         quantity_value: str,
         shipment_type_value: str,
     ) -> None:
-        po = po_value.strip()
         tracking = tracking_value.strip()
-        if not po or not tracking:
+        if not tracking:
             return
+        min_run = max(1, int(self._fedex_reference_min_digits))
+        keys = _fedex_po_lookup_keys_from_cell(po_value, min_run)
+        if not keys:
+            return
+        canonical = _canonical_po_from_fedex_cell(po_value, min_run)
         record = CsvRecord(
-            po_number=po,
+            po_number=canonical,
             tracking_number=tracking,
             quantity=quantity_value.strip(),
             shipment_type=shipment_type_value,
         )
         # Keep first record by default. If duplicates exist, use the first
         # so behavior stays predictable.
-        self.csv_index.setdefault(po, record)
+        for key in keys:
+            self.csv_index.setdefault(key, record)
 
     def _load_from_csv_by_header(self, file_path: Path, csv_config: Dict, shipment_type_value: str) -> None:
         delimiter = csv_config.get("delimiter", ",")
@@ -287,6 +335,7 @@ class LowesTrackingAutomation:
 
     def load_csv_index(self) -> None:
         csv_config = self.config["fedex_csv"]
+        self._fedex_reference_min_digits = int(csv_config.get("reference_match_min_digits", 5))
         shipment_type_value = csv_config["shipment_type_value"]
         source_file = self._resolve_tracking_file(csv_config)
         source_ext = source_file.suffix.lower()
