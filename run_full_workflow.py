@@ -9,6 +9,7 @@ Orchestrates the full daily workflow:
    Lowe's ship-to-store, ship-to-customer, invoicing — see Inventory Submissions\\run_commercehub_chain.py
 
 2. SPS Commerce — Tractor Supply inventory (separate site; own login)
+3. SPS Commerce — Tractor Supply tracking (runs right after SPS inventory)
 
 
 
@@ -103,10 +104,16 @@ def main() -> int:
         help="Omit --submit for Lowe's/Depot steps in the chain (inventory still submits).",
 
     )
+    parser.add_argument(
+        "--skip-sps-tracking",
+        action="store_true",
+        help="Skip SPS Tractor Supply tracking step after SPS inventory.",
+    )
 
     args = parser.parse_args()
 
     lowes_submit = not args.dry_run_lowes
+    run_sps_tracking = not args.skip_sps_tracking
 
 
 
@@ -177,6 +184,22 @@ def main() -> int:
         ),
 
     ]
+
+    tracking_script = INVENTORY_DIR / "run_sps_tracking.py"
+    if run_sps_tracking and tracking_script.is_file():
+        steps.append(
+            (
+                "SPS Commerce — Tractor Supply tracking",
+                [python_exe, "run_sps_tracking.py", "--submit"],
+                INVENTORY_DIR,
+            )
+        )
+    elif run_sps_tracking:
+        print(
+            "NOTE: SPS tracking step requested, but script not found:\n"
+            f"      {tracking_script}\n"
+            "      Add run_sps_tracking.py under Inventory Submissions to enable this step."
+        )
 
 
 
