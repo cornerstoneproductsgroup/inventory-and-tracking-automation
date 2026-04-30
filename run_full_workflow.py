@@ -11,6 +11,12 @@ Orchestrates the full daily workflow:
 2. SPS Commerce — Tractor Supply inventory (separate site; own login)
 3. SPS Commerce — Tractor Supply tracking (runs right after SPS inventory)
 
+Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking.
+Use --tracking-invoicing-only to skip Rithum/CommerceHub inventory and SPS inventory while still running
+Depot/Lowe's tracking and invoicing in the CommerceHub chain, then SPS Tractor Supply tracking.
+The chain script must accept --skip-inventory (see Inventory Submissions\\run_commercehub_chain.py).
+Or run Run Full Workflow.bat with no arguments for a numbered menu.
+
 
 
 Each step uses the Inventory Submissions\\.venv Python when present.
@@ -22,6 +28,8 @@ from __future__ import annotations
 
 
 import argparse
+
+import os
 
 import subprocess
 
@@ -109,11 +117,42 @@ def main() -> int:
         action="store_true",
         help="Skip SPS Tractor Supply tracking step after SPS inventory.",
     )
+    parser.add_argument(
+        "--skip-commercehub",
+        action="store_true",
+        help="Skip CommerceHub chain (Rithum inventory, Depot, Lowe's).",
+    )
+    parser.add_argument(
+        "--skip-sps-inventory",
+        action="store_true",
+        help="Skip SPS Tractor Supply inventory (run SPS tracking only if CommerceHub is also skipped, or after CommerceHub).",
+    )
+    parser.add_argument(
+        "--tracking-invoicing-only",
+        action="store_true",
+        help=(
+            "Skip Rithum/CommerceHub inventory and SPS Tractor Supply inventory; run CommerceHub chain "
+            "with --skip-inventory (Depot/Lowe's tracking + invoicing), then SPS tracking. "
+            "Cannot be combined with --skip-commercehub."
+        ),
+    )
 
     args = parser.parse_args()
 
+    if args.tracking_invoicing_only and args.skip_commercehub:
+        parser.error("--tracking-invoicing-only cannot be combined with --skip-commercehub")
+
+    tracking_invoicing_only = bool(args.tracking_invoicing_only)
     lowes_submit = not args.dry_run_lowes
     run_sps_tracking = not args.skip_sps_tracking
+    skip_commercehub = bool(args.skip_commercehub)
+    skip_sps_inventory = bool(args.skip_sps_inventory) or tracking_invoicing_only
+
+    if tracking_invoicing_only:
+        print(
+            "Mode: tracking + invoicing only — SPS inventory skipped; CommerceHub chain runs with "
+            "--skip-inventory (your run_commercehub_chain.py must honor that flag for Rithum inventory)."
+        )
 
 
 
@@ -159,38 +198,54 @@ def main() -> int:
 
         chain_cmd.append("--submit")
 
+    if tracking_invoicing_only:
+        chain_cmd.append("--skip-inventory")
 
 
-    steps: list[tuple[str, list[str], Path]] = [
 
-        (
+    steps: list[tuple[str, list[str], Path]] = []
 
-            "CommerceHub — one login: inventory, Depot, Lowe's",
+    if not skip_commercehub:
+        commercehub_title = (
+            "CommerceHub — one login: Depot, Lowe's tracking & invoicing (Rithum inventory skipped)"
+            if tracking_invoicing_only
+            else "CommerceHub — one login: inventory, Depot, Lowe's"
+        )
+        steps.append(
+            (
+                commercehub_title,
+                chain_cmd,
+                INVENTORY_DIR,
+            )
+        )
 
-            chain_cmd,
-
-            INVENTORY_DIR,
-
-        ),
-
-        (
-
-            "SPS Commerce — Tractor Supply inventory",
-
-            [python_exe, "run_sps.py"],
-
-            INVENTORY_DIR,
-
-        ),
-
-    ]
+    if not skip_sps_inventory:
+        steps.append(
+            (
+                "SPS Commerce — Tractor Supply inventory",
+                [python_exe, "run_sps.py"],
+                INVENTORY_DIR,
+            )
+        )
 
     tracking_script = INVENTORY_DIR / "run_sps_tracking.py"
+    sps_storage_json = INVENTORY_DIR / "sps_playwright_storage.json"
     if run_sps_tracking and tracking_script.is_file():
+        tracking_cmd: list[str] = [python_exe, "run_sps_tracking.py", "--submit"]
+        need_interactive = not sps_storage_json.is_file() and os.environ.get(
+            "SPS_TRACKING_NON_INTERACTIVE", ""
+        ).strip().lower() not in ("1", "true", "yes", "y", "on")
+        if need_interactive:
+            tracking_cmd.append("--interactive-login")
+            print(
+                "\nNOTE: No sps_playwright_storage.json — tracking will pause once for SPS login in the browser, "
+                "then save that session for future runs.\n"
+                "      Set SPS_TRACKING_NON_INTERACTIVE=1 to skip this (automation must supply the file).\n"
+            )
         steps.append(
             (
                 "SPS Commerce — Tractor Supply tracking",
-                [python_exe, "run_sps_tracking.py", "--submit"],
+                tracking_cmd,
                 INVENTORY_DIR,
             )
         )
@@ -201,11 +256,22 @@ def main() -> int:
             "      Add run_sps_tracking.py under Inventory Submissions to enable this step."
         )
 
+    if not steps:
+        print(
+            "ERROR: No steps to run (everything skipped). "
+            "Omit some --skip-* flags or run without skipping all steps."
+        )
+        return 1
 
+    required_names: list[str] = []
+    if not skip_commercehub:
+        required_names.append("run_commercehub_chain.py")
+    if not skip_sps_inventory:
+        required_names.append("run_sps.py")
+    if run_sps_tracking and tracking_script.is_file():
+        required_names.append("run_sps_tracking.py")
 
-    required_scripts = ("run_commercehub_chain.py", "run_sps.py")
-
-    missing_scripts = [str(INVENTORY_DIR / n) for n in required_scripts if not (INVENTORY_DIR / n).is_file()]
+    missing_scripts = [str(INVENTORY_DIR / n) for n in required_names if not (INVENTORY_DIR / n).is_file()]
 
     if missing_scripts:
 
