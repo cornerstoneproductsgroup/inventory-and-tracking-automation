@@ -57,6 +57,14 @@ _INVOICE_AUTOFILL_CLICKABLE = (
 )
 
 
+def _wait_for_invoice_page_ready(page: Page, timeout_ms: int) -> bool:
+    """
+    Wait until quickinvoice form controls are attached in any frame.
+    This avoids false "queue empty" when Rithum is still rendering next page.
+    """
+    return _wait_invoice_form_frame(page, timeout_ms) is not None
+
+
 def _filled_input(page: Page, selector: str) -> bool:
     loc = page.locator(selector).first
     if loc.count() == 0:
@@ -283,6 +291,22 @@ def _wait_invoice_form_frame(page: Page, timeout_ms: int) -> Frame | None:
 
 
 def _process_depot_invoice_page(page: Page) -> bool:
+    if not _wait_for_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+        print(
+            f"Depot invoicing: timed out waiting {int(_INVOICE_AUTOFILL_TIMEOUT_MS / 1000)}s; "
+            "retrying page load once..."
+        )
+        try:
+            page.reload(wait_until="domcontentloaded")
+        except Exception:
+            try:
+                page.goto(INVOICE_URL, wait_until="domcontentloaded")
+            except Exception:
+                pass
+        if not _wait_for_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+            print("Depot invoicing: no invoice rows or queue empty; moving on.")
+            return False
+
     invoice_frame = _wait_invoice_form_frame(page, _INVOICE_AUTOFILL_TIMEOUT_MS)
     if invoice_frame is None:
         print("Depot invoicing: no invoice rows or queue empty; moving on.")
@@ -337,7 +361,14 @@ def _process_depot_invoice_page(page: Page) -> bool:
             page.wait_for_load_state("domcontentloaded", timeout=120000)
         except Exception:
             pass
-        page.wait_for_timeout(2000 if _chain_fast() else 3500)
+        # Ensure the next invoice page is actually rendered before next loop cycle.
+        if not _wait_for_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+            print(
+                f"Depot invoicing: submit returned but next page not ready after "
+                f"{int(_INVOICE_AUTOFILL_TIMEOUT_MS / 1000)}s."
+            )
+            return False
+        page.wait_for_timeout(500 if _chain_fast() else 900)
         return True
     except Exception:
         print("Depot invoicing: submit not found.")
