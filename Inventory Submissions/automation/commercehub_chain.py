@@ -53,6 +53,16 @@ def main() -> int:
             help="Skip Rithum inventory submission; still run Depot tracking/invoicing and Lowe's workflows.",
         )
         parser.add_argument(
+            "--skip-depot",
+            action="store_true",
+            help="Skip Home Depot tracking and invoicing steps.",
+        )
+        parser.add_argument(
+            "--skip-lowes",
+            action="store_true",
+            help="Skip Lowe's workflows (tracking/invoicing).",
+        )
+        parser.add_argument(
             "--lowes-config",
             type=Path,
             default=_LOWES_DIR / "config.example.json",
@@ -87,18 +97,24 @@ def main() -> int:
                     print("\n=== Rithum inventory (Lowe's + Home Depot) ===")
                     run_rithum_inventory_on_authenticated_page(page, settings)
 
-                print("\n=== Home Depot tracking ===")
-                run_depot_tracking_with_page(page)
+                if args.skip_depot:
+                    print("\n=== Home Depot tracking/invoicing skipped (--skip-depot) ===")
+                else:
+                    print("\n=== Home Depot tracking ===")
+                    run_depot_tracking_with_page(page)
 
-                print("\n=== Home Depot invoicing ===")
-                run_depot_invoicing_with_page(page)
+                    print("\n=== Home Depot invoicing ===")
+                    run_depot_invoicing_with_page(page)
 
-                print("\n=== Lowe's workflows (all) ===")
-                automation.run_workflows_after_login(
-                    page,
-                    do_submit=bool(args.submit),
-                    workflow_filter="all",
-                )
+                if args.skip_lowes:
+                    print("\n=== Lowe's workflows skipped (--skip-lowes) ===")
+                else:
+                    print("\n=== Lowe's workflows (all) ===")
+                    automation.run_workflows_after_login(
+                        page,
+                        do_submit=bool(args.submit),
+                        workflow_filter="all",
+                    )
             finally:
                 context.close()
                 browser.close()

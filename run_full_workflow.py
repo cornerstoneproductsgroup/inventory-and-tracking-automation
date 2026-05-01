@@ -1,6 +1,6 @@
 """
 
-Orchestrates the full daily workflow:
+Orchestrates the full daily workflow.
 
 
 
@@ -11,10 +11,12 @@ Orchestrates the full daily workflow:
 2. SPS Commerce — Tractor Supply inventory (separate site; own login)
 3. SPS Commerce — Tractor Supply tracking (runs right after SPS inventory)
 
-Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking.
-Use --tracking-invoicing-only to skip Rithum/CommerceHub inventory and SPS inventory while still running
-Depot/Lowe's tracking and invoicing in the CommerceHub chain, then SPS Tractor Supply tracking.
-The chain script must accept --skip-inventory (see Inventory Submissions\\run_commercehub_chain.py).
+Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
+--skip-depot, --skip-lowes.
+Use --tracking-invoicing-only to skip Rithum/CommerceHub inventory and SPS inventory while still
+running Depot/Lowe's tracking and invoicing in the CommerceHub chain, then SPS Tractor Supply
+tracking.
+The chain script must accept --skip-inventory, --skip-depot, and --skip-lowes.
 Or run Run Full Workflow.bat with no arguments for a numbered menu.
 
 
@@ -143,6 +145,21 @@ def main() -> int:
         help="Skip CommerceHub chain (Rithum inventory, Depot, Lowe's).",
     )
     parser.add_argument(
+        "--skip-depot",
+        action="store_true",
+        help="Skip Home Depot tracking/invoicing inside the CommerceHub chain.",
+    )
+    parser.add_argument(
+        "--skip-lowes",
+        action="store_true",
+        help="Skip Lowe's tracking/invoicing inside the CommerceHub chain.",
+    )
+    parser.add_argument(
+        "--skip-inventory",
+        action="store_true",
+        help="Skip Rithum/CommerceHub inventory inside the CommerceHub chain.",
+    )
+    parser.add_argument(
         "--skip-sps-inventory",
         action="store_true",
         help="Skip SPS Tractor Supply inventory (run SPS tracking only if CommerceHub is also skipped, or after CommerceHub).",
@@ -163,10 +180,13 @@ def main() -> int:
         parser.error("--tracking-invoicing-only cannot be combined with --skip-commercehub")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
+    skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
     lowes_submit = not args.dry_run_lowes
     run_sps_tracking = not args.skip_sps_tracking
     skip_commercehub = bool(args.skip_commercehub)
     skip_sps_inventory = bool(args.skip_sps_inventory) or tracking_invoicing_only
+    skip_depot = bool(args.skip_depot)
+    skip_lowes = bool(args.skip_lowes)
 
     if tracking_invoicing_only:
         print(
@@ -202,17 +222,25 @@ def main() -> int:
 
 
 
-    if tracking_invoicing_only and not script_supports_flag(
-        python_exe, "run_commercehub_chain.py", "--skip-inventory", INVENTORY_DIR
-    ):
+    required_chain_flags: list[str] = []
+    if skip_inventory:
+        required_chain_flags.append("--skip-inventory")
+    if skip_depot:
+        required_chain_flags.append("--skip-depot")
+    if skip_lowes:
+        required_chain_flags.append("--skip-lowes")
+
+    for required_flag in required_chain_flags:
+        if script_supports_flag(python_exe, "run_commercehub_chain.py", required_flag, INVENTORY_DIR):
+            continue
         print(
-            "\nERROR: tracking + invoicing only requires an updated Inventory Submissions script:\n"
-            "  - run_commercehub_chain.py must support --skip-inventory\n"
+            "\nERROR: this mode requires an updated Inventory Submissions script:\n"
+            f"  - run_commercehub_chain.py must support {required_flag}\n"
             "\nOn this machine, that flag is not available. Update/pull Inventory Submissions and retry.\n"
             "Quick check after update:\n"
             f'  cd /d "{INVENTORY_DIR}"\n'
             "  python run_commercehub_chain.py --help\n"
-            "  (should list --skip-inventory)\n"
+            f"  (should list {required_flag})\n"
         )
         return 1
 
@@ -240,26 +268,37 @@ def main() -> int:
 
         chain_cmd.append("--submit")
 
-    if tracking_invoicing_only:
+    if skip_inventory:
         chain_cmd.append("--skip-inventory")
+    if skip_depot:
+        chain_cmd.append("--skip-depot")
+    if skip_lowes:
+        chain_cmd.append("--skip-lowes")
 
 
 
     steps: list[tuple[str, list[str], Path]] = []
 
     if not skip_commercehub:
-        commercehub_title = (
-            "CommerceHub — one login: Depot, Lowe's tracking & invoicing (Rithum inventory skipped)"
-            if tracking_invoicing_only
-            else "CommerceHub — one login: inventory, Depot, Lowe's"
-        )
-        steps.append(
-            (
-                commercehub_title,
-                chain_cmd,
-                INVENTORY_DIR,
+        scope_parts: list[str] = []
+        if not skip_inventory:
+            scope_parts.append("inventory")
+        if not skip_depot:
+            scope_parts.append("Depot tracking/invoicing")
+        if not skip_lowes:
+            scope_parts.append("Lowe's tracking/invoicing")
+        if scope_parts:
+            scope_text = ", ".join(scope_parts)
+            commercehub_title = f"CommerceHub — one login: {scope_text}"
+            steps.append(
+                (
+                    commercehub_title,
+                    chain_cmd,
+                    INVENTORY_DIR,
+                )
             )
-        )
+        else:
+            print("NOTE: CommerceHub selected but no CommerceHub actions enabled; skipping that step.")
 
     if not skip_sps_inventory:
         steps.append(
@@ -331,9 +370,9 @@ def main() -> int:
 
             f'  cd /d "{ROOT}"\n'
 
-            "  git submodule update --init --recursive\n"
+            "  git pull origin main\n"
 
-            "\nIf you do not use submodules, either copy the full \"Inventory Submissions\" folder from your main PC,\n"
+            "\nIf pull does not restore missing files, copy the full \"Inventory Submissions\" folder from your main PC,\n"
 
             "or clone your Inventory-Automation repo into:\n"
 

@@ -11,34 +11,52 @@ if not "%~1"=="" goto RUN
 
 echo.
 echo Which steps to run? ^(keyboard — no Enter needed^)
-echo   1  All steps ^(default^)
-echo   2  Skip CommerceHub ^(SPS inventory + SPS tracking^)
-echo   3  Skip SPS inventory ^(CommerceHub + SPS tracking^)
-echo   4  SPS tracking only ^(skip CommerceHub + SPS inventory — already in SPS^)
-echo   5  Skip SPS tracking ^(CommerceHub + SPS inventory only^)
-echo   6  Tracking + invoicing only ^(skip CH inventory + SPS inv; Depot/Lowe's + SPS tracking^)
-echo   7  Cancel
+echo   1  All Steps
+echo   2  Depot Tracking and Invoicing
+echo   3  Lowe's Tracking and Invoicing
+echo   4  Commercehub and SPS Inventory + Depot Tracking Invoicing
+echo   5  Commercehub and SPS Inventory + Lowe's Tracking Invoicing
+echo   6  Commercehub and SPS Inventory + Depot and Lowe's Tracking Invoicing
+echo   7  SPS Full ^(SPS Inventory and Tracking^)
+echo   8  Commercehub Inventory
+echo   9  SPS Inventory
+echo   A  All Tracking and Invoicing ^(No Inventory^)
 echo.
-choice /C 1234567 /N /M "Press 1-7: "
-if errorlevel 7 exit /b 0
-if errorlevel 6 (
+choice /C 123456789A /N /M "Press 1-9 or A: "
+if errorlevel 10 (
   set "EXTRA_ARGS=--tracking-invoicing-only"
   goto RUN
 )
-if errorlevel 5 (
+if errorlevel 9 (
+  set "EXTRA_ARGS=--skip-commercehub --skip-sps-tracking"
+  goto RUN
+)
+if errorlevel 8 (
+  set "EXTRA_ARGS=--skip-sps-inventory --skip-sps-tracking --skip-depot --skip-lowes"
+  goto RUN
+)
+if errorlevel 7 (
+  set "EXTRA_ARGS=--skip-commercehub"
+  goto RUN
+)
+if errorlevel 6 (
   set "EXTRA_ARGS=--skip-sps-tracking"
   goto RUN
 )
+if errorlevel 5 (
+  set "EXTRA_ARGS=--skip-sps-tracking --skip-depot"
+  goto RUN
+)
 if errorlevel 4 (
-  set "EXTRA_ARGS=--skip-commercehub --skip-sps-inventory"
+  set "EXTRA_ARGS=--skip-sps-tracking --skip-lowes"
   goto RUN
 )
 if errorlevel 3 (
-  set "EXTRA_ARGS=--skip-sps-inventory"
+  set "EXTRA_ARGS=--skip-sps-inventory --skip-sps-tracking --skip-inventory --skip-depot"
   goto RUN
 )
 if errorlevel 2 (
-  set "EXTRA_ARGS=--skip-commercehub"
+  set "EXTRA_ARGS=--skip-sps-inventory --skip-sps-tracking --skip-inventory --skip-lowes"
   goto RUN
 )
 
