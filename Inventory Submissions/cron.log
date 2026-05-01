@@ -1,0 +1,47 @@
+=== Starting Rithum inventory update ===
+[ERROR] Rithum failed: Page.screenshot: Target page, context or browser has been closed
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: Page.screenshot: Target page, context or browser has been closed
+
+Some automations failed:
+  - Rithum: Page.screenshot: Target page, context or browser has been closed
+  - SPS: Page.screenshot: Target page, context or browser has been closed
+=== Starting Rithum inventory update ===
+Rithum inventory update submitted successfully.
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: Page.screenshot: Target page, context or browser has been closed
+
+Some automations failed:
+  - SPS: Page.screenshot: Target page, context or browser has been closed
+=== Starting Rithum inventory update ===
+[ERROR] Rithum failed: Page.screenshot: Target page, context or browser has been closed
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: Page.screenshot: Target page, context or browser has been closed
+
+Some automations failed:
+  - Rithum: Page.screenshot: Target page, context or browser has been closed
+  - SPS: Page.screenshot: Target page, context or browser has been closed
+=== Starting Rithum inventory update ===
+[ERROR] Rithum failed: Timed out during automation: Timeout 30000ms exceeded.
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: SPS automation failed: Could not find '[data-testid='createNewDocPartnerSelector-value']' on page or in any iframe.
+
+Some automations failed:
+  - Rithum: Timed out during automation: Timeout 30000ms exceeded.
+  - SPS: SPS automation failed: Could not find '[data-testid='createNewDocPartnerSelector-value']' on page or in any iframe.
+=== Starting Rithum inventory update ===
+Rithum inventory update submitted successfully.
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: Page.screenshot: Target page, context or browser has been closed
+
+Some automations failed:
+  - SPS: Page.screenshot: Target page, context or browser has been closed
+=== Starting Rithum inventory update ===
+Rithum inventory update submitted successfully.
+=== Starting SPS Commerce (Tractor Supply) inventory update ===
+[ERROR] SPS failed: SPS automation failed: Could not find '[data-testid='createNewDocPartnerSelector-value']' on page or in any iframe.
+
+Some automations failed:
+  - SPS: SPS automation failed: Could not find '[data-testid='createNewDocPartnerSelector-value']' on page or in any iframe.
+^CThe system cannot find the path specified.
+The system cannot find the path specified.
