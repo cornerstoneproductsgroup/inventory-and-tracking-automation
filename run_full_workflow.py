@@ -95,6 +95,26 @@ def run_step(title: str, cmd: list[str], cwd: Path) -> tuple[bool, str]:
 
 
 
+def script_supports_flag(
+    python_exe: str, script_name: str, flag: str, cwd: Path, timeout_s: int = 25
+) -> bool:
+    script_path = cwd / script_name
+    if not script_path.is_file():
+        return False
+    try:
+        probe = subprocess.run(
+            [python_exe, script_name, "--help"],
+            cwd=str(cwd),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return flag in f"{probe.stdout}\n{probe.stderr}"
+
+
 def main() -> int:
 
     parser = argparse.ArgumentParser(
@@ -181,6 +201,28 @@ def main() -> int:
         print(f"Using project Python: {python_exe}")
 
 
+
+    if tracking_invoicing_only and not script_supports_flag(
+        python_exe, "run_commercehub_chain.py", "--skip-inventory", INVENTORY_DIR
+    ):
+        print(
+            "\nERROR: tracking + invoicing only requires an updated Inventory Submissions script:\n"
+            "  - run_commercehub_chain.py must support --skip-inventory\n"
+            "\nOn this machine, that flag is not available. Update/pull Inventory Submissions and retry.\n"
+            "Quick check after update:\n"
+            f'  cd /d "{INVENTORY_DIR}"\n'
+            "  python run_commercehub_chain.py --help\n"
+            "  (should list --skip-inventory)\n"
+        )
+        return 1
+
+    if tracking_invoicing_only and not (INVENTORY_DIR / "run_sps_tracking.py").is_file():
+        print(
+            "\nERROR: tracking + invoicing only requires SPS tracking script:\n"
+            f"  - Missing: {INVENTORY_DIR / 'run_sps_tracking.py'}\n"
+            "\nUpdate/pull Inventory Submissions on this machine and retry."
+        )
+        return 1
 
     chain_cmd: list[str] = [
 

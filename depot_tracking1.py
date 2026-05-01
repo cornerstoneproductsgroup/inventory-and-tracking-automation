@@ -179,8 +179,8 @@ def process_page(driver, tracking_dict):
                 f"//input[starts-with(@name,'order({order_id}).box(1).item') and contains(@name,'.shipped')]",
             )
             skip_order = all(is_field_filled(q) for q in qty_inputs) and is_field_filled(ship_method_field)
-
-            if skip_order:
+            # Still process when CSV has tracking but tracking field is empty (qty/ship can already be set).
+            if skip_order and is_field_filled(tracking_field):
                 continue
 
             qty_cells = driver.find_elements(
