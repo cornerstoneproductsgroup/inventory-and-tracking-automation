@@ -21,8 +21,13 @@ echo   7  SPS Full ^(SPS Inventory and Tracking^)
 echo   8  Commercehub Inventory
 echo   9  SPS Inventory
 echo   A  All Tracking and Invoicing ^(No Inventory^)
+echo   B  SPS Tracking
 echo.
-choice /C 123456789A /N /M "Press 1-9 or A: "
+choice /C 123456789AB /N /M "Press 1-9, A, or B: "
+if errorlevel 11 (
+  set "EXTRA_ARGS=--skip-commercehub --skip-sps-inventory"
+  goto RUN
+)
 if errorlevel 10 (
   set "EXTRA_ARGS=--tracking-invoicing-only"
   goto RUN

@@ -92,7 +92,13 @@ def run_sps_inventory_update() -> None:
     today = datetime.now().strftime("%m/%d/%Y")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=settings.headless)
+        browser = p.chromium.launch(
+            headless=settings.headless,
+            args=[
+                "--disable-features=BlockThirdPartyCookies,TrackingProtection3pcd",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         context = browser.new_context()
         page = context.new_page()
         page.set_default_timeout(settings.timeout_ms)

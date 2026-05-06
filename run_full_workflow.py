@@ -173,6 +173,11 @@ def main() -> int:
             "Cannot be combined with --skip-commercehub."
         ),
     )
+    parser.add_argument(
+        "--force-sps-interactive-login",
+        action="store_true",
+        help="Force SPS tracking step to open interactive login and save a fresh session file.",
+    )
 
     args = parser.parse_args()
 
@@ -313,16 +318,25 @@ def main() -> int:
     sps_storage_json = INVENTORY_DIR / "sps_playwright_storage.json"
     if run_sps_tracking and tracking_script.is_file():
         tracking_cmd: list[str] = [python_exe, "run_sps_tracking.py", "--submit"]
-        need_interactive = not sps_storage_json.is_file() and os.environ.get(
+        need_interactive = args.force_sps_interactive_login or (
+            not sps_storage_json.is_file()
+            and os.environ.get(
             "SPS_TRACKING_NON_INTERACTIVE", ""
-        ).strip().lower() not in ("1", "true", "yes", "y", "on")
+            ).strip().lower() not in ("1", "true", "yes", "y", "on")
+        )
         if need_interactive:
             tracking_cmd.append("--interactive-login")
-            print(
-                "\nNOTE: No sps_playwright_storage.json — tracking will pause once for SPS login in the browser, "
-                "then save that session for future runs.\n"
-                "      Set SPS_TRACKING_NON_INTERACTIVE=1 to skip this (automation must supply the file).\n"
-            )
+            if args.force_sps_interactive_login:
+                print(
+                    "\nNOTE: Forcing interactive SPS login before tracking to refresh saved session.\n"
+                    f"      Session file target: {sps_storage_json}\n"
+                )
+            else:
+                print(
+                    "\nNOTE: No sps_playwright_storage.json — tracking will pause once for SPS login in the browser, "
+                    "then save that session for future runs.\n"
+                    "      Set SPS_TRACKING_NON_INTERACTIVE=1 to skip this (automation must supply the file).\n"
+                )
         steps.append(
             (
                 "SPS Commerce — Tractor Supply tracking",
