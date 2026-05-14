@@ -21,6 +21,13 @@ DASHBOARD_URL = "https://commerce.spscommerce.com/fulfillment/dashboard/"
 TRANSACTIONS_LIST_URL = "https://commerce.spscommerce.com/fulfillment/transactions/list/"
 _HERE = Path(__file__).resolve().parent
 DEFAULT_STORAGE_STATE = _HERE / "sps_playwright_storage.json"
+# Optional: SKU -> unit weight (lb) for Grainger ASN gross weight. Override with SPS_SKU_WEIGHTS_CSV.
+_DEFAULT_SKU_WEIGHTS_CSV_NAMES = (
+    "Weights mapping.csv",
+    "weights_mapping.csv",
+    "SKU_weights.csv",
+    "sku_weights.csv",
+)
 
 
 def normalize_po(value: str) -> str:
@@ -62,8 +69,239 @@ def load_tracking_map(csv_path: Path) -> dict[str, str]:
         tracking = (row[1] or "").strip().split()[0]
         if not po or not tracking:
             continue
-        out.setdefault(po, tracking)
+        out[po] = tracking  # last row wins for duplicate POs in the sheet
     return out
+
+
+def resolve_sku_weights_csv_path() -> Path | None:
+    """CSV with SKU (or item) and weight in lb per unit. Env SPS_SKU_WEIGHTS_CSV overrides defaults."""
+    env = (os.environ.get("SPS_SKU_WEIGHTS_CSV") or "").strip()
+    if env:
+        p = Path(env)
+        return p if p.is_file() else None
+    for name in _DEFAULT_SKU_WEIGHTS_CSV_NAMES:
+        p = _HERE / name
+        if p.is_file():
+            return p
+    return None
+
+
+def load_sku_weight_map(csv_path: Path) -> dict[str, float]:
+    """
+    Load SKU -> pounds per unit. Flexible headers (SKU/Item/Part and Weight/Lbs/LB).
+    Keys stored UPPER for case-insensitive lookup.
+    """
+    if not csv_path.is_file():
+        return {}
+
+    rows: list[list[str]] | None = None
+    for enc in ("utf-8-sig", "latin1"):
+        try:
+            with csv_path.open("r", newline="", encoding=enc) as f:
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+                except Exception:
+                    dialect = csv.excel
+                reader = csv.reader(f, dialect)
+                rows = list(reader)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if not rows:
+        return {}
+
+    def _norm_cell(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "").strip().lower())
+
+    header = [_norm_cell(c) for c in rows[0]]
+    sku_idx: int | None = None
+    wt_idx: int | None = None
+
+    def _pick_indices(fieldnames: list[str]) -> tuple[int | None, int | None]:
+        si: int | None = None
+        wi: int | None = None
+        for i, cn in enumerate(fieldnames):
+            if si is None and re.search(
+                r"^(sku|item|part|vendor|buyer|style|product|mph|mfg|model)", cn, re.I
+            ):
+                si = i
+            if wi is None and re.search(r"(weight|lb|lbs|pound|shipwt|ship\s*wt|gross)", cn, re.I):
+                wi = i
+        return si, wi
+
+    sku_idx, wt_idx = _pick_indices(header)
+    data_start = 1
+    if sku_idx is None or wt_idx is None:
+        # No header row detected — assume col0 = SKU, col1 = weight.
+        sku_idx, wt_idx = 0, 1
+        data_start = 0
+
+    out: dict[str, float] = {}
+    for row in rows[data_start:]:
+        if len(row) <= max(sku_idx or 0, wt_idx or 0):
+            continue
+        sku_raw = (row[sku_idx] if sku_idx is not None else "").strip()
+        wt_raw = (row[wt_idx] if wt_idx is not None else "").strip()
+        if not sku_raw or not wt_raw:
+            continue
+        m = re.search(r"(\d+(?:\.\d+)?)", wt_raw.replace(",", ""))
+        if not m:
+            continue
+        try:
+            w = float(m.group(1))
+        except ValueError:
+            continue
+        if w <= 0:
+            continue
+        key = sku_raw.upper()
+        out[key] = w
+    return out
+
+
+def _grainger_pick_qty_near_sku(page: Page, body_text: str, sku: str) -> int:
+    """Best-effort ordered qty: labels after SKU on page, then table row with SKU, else 1."""
+    msku = re.search(rf"(?i){re.escape(sku)}", body_text)
+    window = body_text[msku.start() : msku.start() + 1000] if msku else body_text[:2500]
+    for pat in (
+        r"(?i)ordered[^\d]{0,60}(\d{1,5})\b",
+        r"(?i)order\s*qty[^\d]{0,40}(\d{1,5})\b",
+        r"(?i)units?\s*ordered[^\d]{0,40}(\d{1,5})\b",
+        r"(?i)qty\s*ordered[^\d]{0,40}(\d{1,5})\b",
+    ):
+        m = re.search(pat, window)
+        if m:
+            try:
+                q = int(m.group(1))
+                if 1 <= q <= 50_000:
+                    return q
+            except Exception:
+                continue
+    # Table row containing SKU: use last plausible integer in that row (often qty column).
+    for ctx in _contexts(page):
+        try:
+            rows = ctx.locator("tr")
+            for i in range(min(rows.count(), 120)):
+                row = rows.nth(i)
+                try:
+                    rt = row.inner_text()
+                except Exception:
+                    continue
+                if not re.search(rf"(?i)\b{re.escape(sku)}\b", rt):
+                    continue
+                nums: list[int] = []
+                for g in re.findall(r"\b(\d{1,5})\b", rt):
+                    try:
+                        n = int(g)
+                    except ValueError:
+                        continue
+                    if 1 <= n <= 50_000:
+                        nums.append(n)
+                if nums:
+                    return nums[-1]
+        except Exception:
+            continue
+    return 1
+
+
+def _grainger_find_mapped_sku_qty(page: Page, weight_by_sku: dict[str, float]) -> tuple[str, int] | None:
+    if not weight_by_sku:
+        return None
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        text = ""
+    for sku_key in sorted(weight_by_sku.keys(), key=len, reverse=True):
+        if not sku_key:
+            continue
+        if not re.search(rf"(?i)(?<![A-Z0-9]){re.escape(sku_key)}(?![A-Z0-9])", text):
+            continue
+        qty = _grainger_pick_qty_near_sku(page, text, sku_key)
+        return sku_key, qty
+    return None
+
+
+def _grainger_gross_weight_lbs(page: Page, weights_csv: Path | None) -> str:
+    """Gross ship weight (lb): SKU weights map × line qty when possible."""
+    if not weights_csv:
+        return _estimate_gross_weight(page)
+    wb = load_sku_weight_map(weights_csv)
+    if not wb:
+        print(f"WARN: SKU weights file empty or unreadable: {weights_csv}")
+        return _estimate_gross_weight(page)
+    hit = _grainger_find_mapped_sku_qty(page, wb)
+    if not hit:
+        print("WARN: No mapped SKU found on ASN page; gross weight uses numeric fallback.")
+        return _estimate_gross_weight(page)
+    sku_key, qty = hit
+    unit = wb.get(sku_key.upper()) or wb.get(sku_key)
+    if unit is None or unit <= 0:
+        return _estimate_gross_weight(page)
+    total = max(1, int(round(float(unit) * max(1, qty))))
+    print(f"Grainger ASN: gross weight {total} lb (SKU {sku_key!r} × {qty} @ {unit} lb/unit from weights map).")
+    return str(total)
+
+
+def _fill_grainger_asn_tracking(page: Page, tracking: str) -> None:
+    """Fill carrier tracking on Grainger ASN (header, Order/pack lines, then BOL if needed)."""
+    tracking_filled = False
+    for ctx in _contexts(page):
+        inputs = ctx.locator(
+            "input[data-testid*='trackingNumber-input__input'], "
+            "input[aria-label='Carrier Tracking #'], "
+            "input[aria-label*='Tracking' i]"
+        )
+        for i in range(min(inputs.count(), 60)):
+            inp = inputs.nth(i)
+            try:
+                if not inp.is_visible():
+                    continue
+            except Exception:
+                continue
+            if _fill_tracking_input(inp, tracking):
+                tracking_filled = True
+                break
+        if tracking_filled:
+            break
+
+    if not tracking_filled:
+        for ctx in _contexts(page):
+            try:
+                if _fill_tracking_for_order_index(ctx, 0, tracking) > 0:
+                    tracking_filled = True
+                    break
+            except Exception:
+                continue
+
+    if not tracking_filled:
+        try:
+            if _fill_pack_pages_for_order(page, 0, tracking) > 0:
+                tracking_filled = True
+        except Exception:
+            pass
+
+    if not tracking_filled:
+        for ctx in _contexts(page):
+            for sel in (
+                "input[data-testid='asn.header.shipment.billOfLading-input__input']",
+                "input[data-testid*='billOfLading'][data-testid$='__input']",
+            ):
+                try:
+                    trk = ctx.locator(sel).first
+                    if trk.count() > 0 and trk.is_visible() and _fill_tracking_input(trk, tracking):
+                        tracking_filled = True
+                        break
+                except Exception:
+                    continue
+            if tracking_filled:
+                break
+
+    if not tracking_filled:
+        raise RuntimeError(
+            "Could not fill Grainger ASN carrier tracking (tracking # / pack / BOL fields)."
+        )
 
 
 def _contexts(page: Page):
@@ -102,55 +340,72 @@ def click_first_visible(page: Page, selectors: list[str], *, timeout_ms: int = 1
     return False
 
 
+def _sps_visible_modal_like(page: Page) -> bool:
+    """True when a dialog/modal is open — avoid ESC / generic buttons that dismiss creation flows."""
+    for sel in ("[role='dialog']", ".sps-modal", "[class*='ReactModal__Content']"):
+        for ctx in _contexts(page):
+            try:
+                loc = ctx.locator(sel)
+                n = min(loc.count(), 6)
+                for i in range(n):
+                    if loc.nth(i).is_visible():
+                        return True
+            except Exception:
+                continue
+    return False
+
+
 def clear_click_blockers(page: Page) -> None:
     """Best-effort removal of modal/backdrop overlays that intercept clicks."""
-    # Try common close controls first.
-    click_first_visible(
-        page,
-        [
-            "button[aria-label='Close']",
-            "button[title='Close']",
-            "button:has-text('Close')",
-            "button:has-text('Dismiss')",
-            "button:has-text('Got it')",
-            "button:has-text('OK')",
-            "button:has-text('Continue')",
-            "[data-testid='modalCancelBtn']",
-            "[data-testid='modalOkBtn']",
-            "xpath=//*[self::button or @role='button'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'close')]",
-        ],
-        timeout_ms=1200,
-    )
-    # ESC often closes SPS drawers/modals.
-    for _ in range(2):
-        try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(200)
-        except Exception:
-            pass
-    # Remove common known backdrops if still present.
-    for sel in (
-        ".sps-modal__overlay",
-        ".sps-overlay",
-        ".sps-drawer__overlay",
-        ".ReactModal__Overlay",
-    ):
-        try:
-            for ctx in _contexts(page):
-                try:
-                    loc = ctx.locator(sel)
-                    n = min(loc.count(), 8)
-                    for i in range(n):
-                        try:
-                            node = loc.nth(i)
-                            if node.is_visible():
-                                node.evaluate("el => el.remove()")
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-        except Exception:
-            continue
+    if _sps_visible_modal_like(page):
+        # Do not press Escape or click Continue/OK while a modal is open (breaks Shipment Create New).
+        pass
+    else:
+        # Try common close controls (avoid Continue/OK — they advance the wrong modal on SPS).
+        click_first_visible(
+            page,
+            [
+                "button[aria-label='Close']",
+                "button[title='Close']",
+                "button:has-text('Close')",
+                "button:has-text('Dismiss')",
+                "button:has-text('Got it')",
+                "[data-testid='modalCancelBtn']",
+                "xpath=//*[self::button or @role='button'][contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'close')]",
+            ],
+            timeout_ms=1200,
+        )
+        # ESC often closes SPS drawers — but it also closes Create New modals; skip when dialog visible.
+        for _ in range(2):
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+            except Exception:
+                pass
+    # Removing overlays while a real modal is open can tear down the Shipment Create New dialog.
+    if not _sps_visible_modal_like(page):
+        for sel in (
+            ".sps-modal__overlay",
+            ".sps-overlay",
+            ".sps-drawer__overlay",
+            ".ReactModal__Overlay",
+        ):
+            try:
+                for ctx in _contexts(page):
+                    try:
+                        loc = ctx.locator(sel)
+                        n = min(loc.count(), 8)
+                        for i in range(n):
+                            try:
+                                node = loc.nth(i)
+                                if node.is_visible():
+                                    node.evaluate("el => el.remove()")
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+            except Exception:
+                continue
 
 
 def _looks_logged_out(url: str) -> bool:
@@ -253,6 +508,14 @@ def _raise_if_cookie_or_auth_wall(page: Page) -> None:
                 f"Dashboard: {DASHBOARD_URL}"
             )
     if _looks_logged_out(page.url) or _is_login_page_visible(page):
+        # SPS can briefly bounce through auth/login-looking routes during SPA/iframe transitions.
+        # Re-check once after a short settle delay before declaring logged out.
+        try:
+            page.wait_for_timeout(900)
+        except Exception:
+            pass
+        if _looks_authenticated_sps(page):
+            return
         raise RuntimeError(
             "Not logged into SPS Commerce in this browser session (redirected to sign-in). "
             "Fix: run SPS inventory once (it saves a session file after login), or run tracking with "
@@ -414,6 +677,14 @@ def login_with_env_credentials_then_save(
         print(f"Could not open SPS login URL for auto-login: {ex}")
         return False
 
+    # If session is already authenticated, don't force username/password submit.
+    if _wait_for_authenticated_sps(page, timeout_ms=10_000):
+        page.goto(TRANSACTIONS_LIST_URL, wait_until="domcontentloaded", timeout=120_000)
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=str(storage_path))
+        print(f"SPS session already authenticated; saved session: {storage_path}")
+        return True
+
     if not _perform_sps_login(page, username, password, effective_timeout):
         print("SPS auto-login could not complete username/password submit from .env.")
         return False
@@ -442,12 +713,12 @@ def goto_dashboard(page: Page) -> None:
     _raise_if_cookie_or_auth_wall(page)
 
 
-def open_ready_for_shipment(page: Page) -> None:
+def open_ready_for_shipment(page: Page, partner_name: str = "Tractor Supply Dropship") -> None:
     # Use only the Transactions + Advanced Search path.
-    open_ready_for_shipment_via_advanced_search(page)
+    open_ready_for_shipment_via_advanced_search(page, partner_name=partner_name)
 
 
-def open_ready_for_shipment_via_advanced_search(page: Page) -> None:
+def open_ready_for_shipment_via_advanced_search(page: Page, *, partner_name: str = "Tractor Supply Dropship") -> None:
     print("STEP 1.1: Open transactions list...")
     last_err: Exception | None = None
     for attempt in (1, 2):
@@ -531,49 +802,365 @@ def open_ready_for_shipment_via_advanced_search(page: Page) -> None:
     else:
         print("STEP 1.2 skipped: Advanced Search already open.")
 
-    print("STEP 1.3: Select Workflow = Shipment...")
-    ensure_workflow_shipment_selected(page, workflow_selector)
+    print(f"STEP 1.3: Select Partner = {partner_name}...")
+    ensure_partner_selected(page, partner_name)
     print("STEP 1.3 done.")
 
-    print("STEP 1.4: Click Search...")
-    click_advanced_search_button(page)
-    page.wait_for_load_state("domcontentloaded")
+    print("STEP 1.4: Select Workflow = Shipment...")
+    # Force focus to the exact Workflows Ready For box to avoid typing into Document Type.
+    click_first_visible(
+        page,
+        [
+            "input[data-testid='advancedSearchWorkflowsMultiselect__option-list-input']",
+            "xpath=//*[contains(normalize-space(.), 'Workflows Ready For')]/following::input[1]",
+        ],
+        timeout_ms=3000,
+    )
+    ensure_workflow_shipment_selected(page, workflow_selector)
     print("STEP 1.4 done.")
 
+    print("STEP 1.5: Click Search...")
+    click_advanced_search_button(page)
+    page.wait_for_load_state("domcontentloaded")
+    print("STEP 1.5 done.")
 
-def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
-    def _clear_existing_workflow_tags() -> None:
-        # Remove any pre-selected workflow chips (e.g., Acknowledgment) so only Shipment remains.
-        for _ in range(8):
+
+def ensure_partner_selected(page: Page, partner_name: str) -> None:
+    wanted = (partner_name or "").strip()
+    if not wanted:
+        return
+
+    def _partner_selected() -> bool:
+        low = wanted.lower()
+        checks = [
+            f"xpath=//*[contains(@id,'_tag-') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{low}')]",
+            f"xpath=//*[contains(@class,'tag') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{low}')]",
+            f"xpath=//*[contains(@class,'chip') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{low}')]",
+        ]
+        for sel in checks:
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _clear_partner_tags() -> None:
+        for _ in range(6):
             removed = False
             for sel in (
                 "button[aria-label*='Remove']",
                 "button[title*='Remove']",
                 "[data-testid*='remove']",
-                "i.sps-icon-close",
-                "i.sps-icon-x",
                 "[class*='tag'] [class*='close']",
                 "[class*='chip'] [class*='close']",
+                "i.sps-icon-close",
+                "i.sps-icon-x",
             ):
                 for ctx in _contexts(page):
-                    loc = ctx.locator(sel)
-                    n = min(loc.count(), 6)
-                    for i in range(n):
-                        node = loc.nth(i)
-                        try:
-                            if not node.is_visible():
-                                continue
+                    try:
+                        loc = ctx.locator(sel)
+                        n = min(loc.count(), 8)
+                        for i in range(n):
+                            node = loc.nth(i)
                             try:
-                                node.click(timeout=600)
+                                if not node.is_visible():
+                                    continue
+                                try:
+                                    node.click(timeout=600)
+                                except Exception:
+                                    node.click(timeout=600, force=True)
+                                removed = True
+                                page.wait_for_timeout(70)
+                                break
                             except Exception:
-                                node.click(timeout=600, force=True)
-                            removed = True
-                            page.wait_for_timeout(60)
+                                continue
+                        if removed:
                             break
-                        except Exception:
+                    except Exception:
+                        continue
+                if removed:
+                    break
+            if not removed:
+                break
+
+    def _partner_inputs():
+        selectors = [
+            "input[data-testid='advancedSearchPartnerMultiselect__option-list-input']",
+            "input[data-testid='advancedSearchPartnersMultiselect__option-list-input']",
+            "input[data-testid='advancedSearchTradingPartnersMultiselect__option-list-input']",
+            "xpath=//*[contains(normalize-space(.), 'Partner')]/following::input[1]",
+        ]
+        out = []
+        for sel in selectors:
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    out.append(loc.first)
+                except Exception:
+                    continue
+        return out
+
+    def _choose_partner_option(active_input=None) -> bool:
+        low = wanted.lower()
+        # Deterministic path: click option from the partner input's own option list.
+        if active_input is not None:
+            try:
+                owns = (active_input.get_attribute("aria-owns") or "").strip()
+            except Exception:
+                owns = ""
+            if owns:
+                for sel in (
+                    f"#{owns} [role='option']:has-text('{wanted}')",
+                    f"#{owns} li[role='option']:has-text('{wanted}')",
+                    f"#{owns} [role='option']",
+                ):
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() == 0:
                             continue
-                    if removed:
+                        # Prefer exact-ish text match first.
+                        chosen = None
+                        for i in range(loc.count()):
+                            node = loc.nth(i)
+                            txt = (node.inner_text() or "").strip().lower()
+                            if wanted.lower() in txt:
+                                chosen = node
+                                break
+                        if chosen is None:
+                            chosen = loc.first
+                        chosen.click(timeout=1500)
+                        page.wait_for_timeout(180)
+                        if _partner_selected():
+                            return True
+                    except Exception:
+                        continue
+        # Fallback option selectors across contexts.
+        if click_first_visible(
+            page,
+            [
+                f"li[role='option']:has-text('{wanted}')",
+                f"a[role='option']:has-text('{wanted}')",
+                f"[role='option']:has-text('{wanted}')",
+                f"xpath=//*[contains(@id,'option') and @role='option' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{low}')]",
+                f"xpath=//*[@role='option' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{low}')]",
+            ],
+            timeout_ms=1_400,
+        ):
+            page.wait_for_timeout(180)
+            return _partner_selected()
+        return False
+
+    if _partner_selected():
+        return
+
+    _clear_partner_tags()
+    for attempt in range(1, 6):
+        clear_click_blockers(page)
+        typed = False
+        active_input = None
+        for inp in _partner_inputs():
+            try:
+                inp.wait_for(state="visible", timeout=1_800)
+                try:
+                    inp.click(timeout=900)
+                except Exception:
+                    inp.click(timeout=900, force=True)
+                try:
+                    inp.fill("", timeout=700)
+                except Exception:
+                    pass
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+                inp.type(wanted, delay=18)
+                typed = True
+                active_input = inp
+                break
+            except Exception:
+                continue
+        if not typed:
+            page.wait_for_timeout(180)
+            continue
+
+        picked = _choose_partner_option(active_input=active_input)
+        if not picked:
+            page.wait_for_timeout(220)
+            continue
+
+        # Commit selection without tabbing into the next field (Document Type).
+        try:
+            if active_input is not None:
+                active_input.click(timeout=500)
+        except Exception:
+            pass
+        page.wait_for_timeout(180)
+        if _partner_selected():
+            print(f"Partner filter confirmed as '{wanted}' on attempt {attempt}.")
+            return
+        _clear_partner_tags()
+        page.wait_for_timeout(120)
+
+    raise RuntimeError(f"Could not select Partner '{wanted}' in Advanced Search.")
+
+
+def clear_document_type_filter(page: Page) -> None:
+    """Ensure Document Type is empty so partner/workflow search is not over-filtered."""
+    # Remove selected chips if present.
+    for _ in range(6):
+        removed = False
+        for sel in (
+            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
+            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::*[contains(@class,'close') or contains(@class,'sps-icon-close')][1]",
+        ):
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    node = loc.first
+                    if not node.is_visible():
+                        continue
+                    try:
+                        node.click(timeout=700)
+                    except Exception:
+                        node.click(timeout=700, force=True)
+                    removed = True
+                    page.wait_for_timeout(80)
+                    break
+                except Exception:
+                    continue
+            if removed:
+                break
+        if not removed:
+            break
+
+    # Also clear typed value if input exists.
+    for ctx in _contexts(page):
+        for sel in (
+            "input[data-testid='advancedSearchDocumentTypeMultiselect__option-list-input']",
+            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::input[1]",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                if loc.count() == 0:
+                    continue
+                inp = loc.first
+                if not inp.is_visible():
+                    continue
+                try:
+                    inp.click(timeout=600)
+                except Exception:
+                    inp.click(timeout=600, force=True)
+                try:
+                    inp.fill("", timeout=500)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+
+def ensure_document_type_order(page: Page) -> None:
+    """Force Document Type filter to Order to neutralize accidental focus drift."""
+    clear_document_type_filter(page)
+    for attempt in range(1, 6):
+        clear_click_blockers(page)
+        field = None
+        for ctx in _contexts(page):
+            for sel in (
+                "input[data-testid='advancedSearchDocumentTypeMultiselect__option-list-input']",
+                "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::input[1]",
+            ):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    cand = loc.first
+                    cand.wait_for(state="visible", timeout=1_500)
+                    field = cand
+                    break
+                except Exception:
+                    continue
+            if field is not None:
+                break
+        if field is None:
+            page.wait_for_timeout(180)
+            continue
+        try:
+            field.click(timeout=900)
+        except Exception:
+            field.click(timeout=900, force=True)
+        try:
+            field.fill("", timeout=700)
+        except Exception:
+            pass
+        field.type("Order", delay=20)
+        picked = click_first_visible(
+            page,
+            [
+                "li[role='option']:has-text('Order')",
+                "[role='option']:has-text('Order')",
+                "xpath=//*[@role='option' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
+            ],
+            timeout_ms=1_400,
+        )
+        if not picked:
+            try:
+                field.press("ArrowDown")
+                field.press("Enter")
+            except Exception:
+                pass
+        page.wait_for_timeout(150)
+        for sel in (
+            "xpath=//*[contains(@class,'tag') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
+            "xpath=//*[contains(@class,'chip') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
+            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')][1]",
+        ):
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        print(f"Document Type filter confirmed as 'Order' on attempt {attempt}.")
+                        return
+                except Exception:
+                    continue
+    raise RuntimeError("Could not set Document Type filter to 'Order'.")
+
+
+def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
+    def _clear_existing_workflow_tags() -> None:
+        # Remove only chips inside "Workflows Ready For" control (do NOT clear Partner chips).
+        workflow_close_selectors = [
+            "xpath=//*[contains(normalize-space(.), 'Workflows Ready For')]/following::*[contains(@class,'tag') or contains(@class,'chip')][1]//*[contains(@class,'close') or self::button][1]",
+            "xpath=//*[contains(normalize-space(.), 'Workflows Ready For')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
+            "xpath=//*[contains(normalize-space(.), 'Workflows Ready For')]/following::*[contains(@class,'sps-icon-close') or contains(@class,'sps-icon-x')][1]",
+        ]
+        for _ in range(8):
+            removed = False
+            for sel in workflow_close_selectors:
+                for ctx in _contexts(page):
+                    try:
+                        loc = ctx.locator(sel)
+                        if loc.count() == 0:
+                            continue
+                        node = loc.first
+                        if not node.is_visible():
+                            continue
+                        try:
+                            node.click(timeout=700)
+                        except Exception:
+                            try:
+                                node.evaluate("el => el.click()")
+                            except Exception:
+                                node.click(timeout=700, force=True)
+                        removed = True
+                        page.wait_for_timeout(80)
                         break
+                    except Exception:
+                        continue
                 if removed:
                     break
             if not removed:
@@ -648,6 +1235,29 @@ def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
         )
 
     def _type_shipment_into_field() -> bool:
+        # Strict primary path: exact workflow input testid.
+        for ctx in _contexts(page):
+            try:
+                loc = ctx.locator("input[data-testid='advancedSearchWorkflowsMultiselect__option-list-input']")
+                if loc.count() == 0:
+                    continue
+                fld = loc.first
+                fld.wait_for(state="visible", timeout=1_500)
+                try:
+                    fld.click(timeout=900)
+                except Exception:
+                    fld.click(timeout=900, force=True)
+                try:
+                    fld.fill("", timeout=700)
+                except Exception:
+                    pass
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Delete")
+                fld.type("Shipment", delay=20)
+                return True
+            except Exception:
+                continue
+        # Fallback: provided workflow selector.
         for ctx in _contexts(page):
             loc = ctx.locator(workflow_selector)
             if loc.count() == 0:
@@ -659,7 +1269,6 @@ def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
                     fld.click(timeout=800)
                 except Exception:
                     fld.click(timeout=800, force=True)
-                # Clear robustly so stale text doesn't block option matching.
                 try:
                     fld.fill("", timeout=700)
                 except Exception:
@@ -672,7 +1281,7 @@ def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
                 continue
         return False
 
-    def _pick_shipment_option() -> bool:
+    def _pick_shipment_option(active_field=None) -> bool:
         # Try deterministic option click first.
         if click_first_visible(
             page,
@@ -684,10 +1293,18 @@ def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
             timeout_ms=1_000,
         ):
             return True
-        # Then keyboard selection as fallback.
+        # Then keyboard selection as fallback, but only on the workflow field.
         try:
-            page.keyboard.press("ArrowDown")
-            page.keyboard.press("Enter")
+            active_testid = (
+                page.evaluate(
+                    "() => (document.activeElement && document.activeElement.getAttribute('data-testid')) || ''"
+                )
+                or ""
+            )
+            if active_field is None or "advancedsearchworkflowsmultiselect" not in active_testid.lower():
+                return False
+            active_field.press("ArrowDown")
+            active_field.press("Enter")
             return True
         except Exception:
             return False
@@ -708,23 +1325,31 @@ def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:
         page.wait_for_timeout(120)
 
         typed = _type_shipment_into_field()
-        if not typed:
-            # Last-resort typing into focused element.
+        active_workflow_field = None
+        for ctx in _contexts(page):
             try:
-                page.keyboard.type("Shipment", delay=25)
-                typed = True
+                loc = ctx.locator("input[data-testid='advancedSearchWorkflowsMultiselect__option-list-input']")
+                if loc.count() == 0:
+                    continue
+                fld = loc.first
+                if fld.is_visible():
+                    active_workflow_field = fld
+                    break
             except Exception:
-                typed = False
+                continue
+        if not typed:
+            typed = False
         if not typed:
             page.wait_for_timeout(200)
             continue
 
-        _pick_shipment_option()
+        _pick_shipment_option(active_field=active_workflow_field)
         page.wait_for_timeout(160)
 
-        # Clicking outside often commits multiselect chips in SPS widgets.
+        # Commit workflow selection without tabbing to neighboring filters.
         try:
-            page.keyboard.press("Tab")
+            if active_workflow_field is not None:
+                active_workflow_field.click(timeout=500)
         except Exception:
             pass
         page.wait_for_timeout(120)
@@ -879,15 +1504,1095 @@ def _open_next_tracked_order_from_results(
     return None
 
 
-def _click_workflow_new(page: Page, workflow_name: str) -> None:
+def _open_next_order_from_results(page: Page, processed_order_ids: set[str]) -> str | None:
+    """Open next visible open order from filtered results (top-down)."""
+    max_pages = 80
+    for _ in range(1, max_pages + 1):
+        clear_click_blockers(page)
+        wait_for_order_link_count(page, timeout_ms=45_000)
+        for ctx in _contexts(page):
+            links = ctx.locator("a.text-truncate[href*='/fulfillment/transactions/document/']")
+            if links.count() == 0:
+                links = ctx.locator("a[href*='/fulfillment/transactions/document/']")
+            for i in range(links.count()):
+                link = links.nth(i)
+                try:
+                    if not link.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    order_id = normalize_po(link.inner_text().strip())
+                except Exception:
+                    order_id = ""
+                if not order_id or order_id in processed_order_ids:
+                    continue
+                row = link.locator("xpath=ancestor::tr[1]")
+                if row.count() > 0:
+                    try:
+                        row_text = row.inner_text().strip()
+                        if re.search(r"\bopen\b", row_text, flags=re.I) is None:
+                            continue
+                    except Exception:
+                        pass
+                try:
+                    link.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    link.click(timeout=2500)
+                except Exception:
+                    try:
+                        link.evaluate("(el) => el.click()")
+                    except Exception:
+                        link.click(timeout=2500, force=True)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(500)
+                return order_id
+        if not _go_next_results_page(page):
+            break
+    return None
+
+
+def _sps_url_is_document(url: str) -> bool:
+    return "/fulfillment/transactions/document/" in (url or "").lower()
+
+
+def _sps_url_is_transaction_hub_not_document(url: str) -> bool:
+    """Transactions area (list/search/inbox) but not an order/document detail URL."""
+    u = (url or "").lower()
+    if "/fulfillment/transactions/document/" in u:
+        return False
+    return "/fulfillment/transactions/" in u
+
+
+def _grainger_shipment_workflow_visible(page: Page) -> bool:
+    """True when workflow rail shows a Shipment step (ASN is created from this order document)."""
+    if not _sps_url_is_document(page.url or ""):
+        return False
+    _tr_from = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    _tr_to = "abcdefghijklmnopqrstuvwxyz"
+    xpath = (
+        f"xpath=//*[(contains(@class,'workflow') or @data-testid='workflow')]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'shipment')]"
+    )
+    for ctx in _contexts(page):
+        try:
+            loc = ctx.locator(xpath)
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_grainger_order_document_ready_for_asn(page: Page, *, timeout_ms: int = 90_000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if _grainger_shipment_workflow_visible(page):
+            return True
+        page.wait_for_timeout(300)
+    return False
+
+
+def _grainger_ack_indicator_span(page: Page):
+    """First span[@title] under Order Status -> Acknowledgement in the workflow rail, if visible."""
+    _tr_from = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    _tr_to = "abcdefghijklmnopqrstuvwxyz"
+    xpath = (
+        f"xpath=(//*[(contains(@class,'workflow') or @data-testid='workflow')])[1]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgement') "
+        f"or contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgment')][1]"
+        f"/following::span[@title][1]"
+    )
+    for ctx in _contexts(page):
+        try:
+            loc = ctx.locator(xpath)
+            if loc.count() == 0:
+                continue
+            node = loc.first
+            if node.is_visible():
+                return node
+        except Exception:
+            continue
+    return None
+
+
+def _grainger_span_looks_like_sent_ack(title: str, text: str) -> bool:
+    if re.search(r"view\s+all", text or "", re.I):
+        return True
+    t = (title or "").strip()
+    if not t:
+        return False
+    if "," in t and re.search(r"\d", t):
+        return True
+    if re.fullmatch(r"\d{6,12}", t):
+        return True
+    return False
+
+
+def _grainger_wait_ack_transaction_list(page: Page, *, timeout_ms: int = 45_000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        u = (page.url or "").lower()
+        hub = "/fulfillment/transactions/" in u and "/document/" not in u
+        body_snip = ""
+        try:
+            body_snip = (page.inner_text("body") or "")[:4000]
+        except Exception:
+            pass
+        if hub or re.search(r"matching\s+results", body_snip, re.I):
+            for ctx in _contexts(page):
+                try:
+                    if ctx.locator("tbody tr a[href*='/fulfillment/transactions/document/']").count() >= 1:
+                        return True
+                except Exception:
+                    continue
+        page.wait_for_timeout(320)
+    return False
+
+
+def _grainger_click_first_ack_row_document_link(page: Page) -> bool:
+    """After View All: first results row that looks like an Acknowledgment document."""
+    for ctx in _contexts(page):
+        try:
+            rows = ctx.locator("tbody tr")
+            n = min(rows.count(), 80)
+            for i in range(n):
+                row = rows.nth(i)
+                try:
+                    if not row.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    rt = row.inner_text()
+                except Exception:
+                    continue
+                if re.search(r"Acknowledgement|Acknowledgment", rt, re.I) is None:
+                    continue
+                link = row.locator("a.text-truncate[href*='/fulfillment/transactions/document/']").first
+                if link.count() == 0:
+                    link = row.locator("a[href*='/fulfillment/transactions/document/']").first
+                if link.count() == 0:
+                    continue
+                btn = link.first
+                try:
+                    if not btn.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    btn.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    btn.click(timeout=5000)
+                except Exception:
+                    try:
+                        btn.evaluate("el => el.click()")
+                    except Exception:
+                        btn.click(timeout=5000, force=True)
+                return True
+        except Exception:
+            continue
+    for ctx in _contexts(page):
+        try:
+            link = ctx.locator("tbody tr a.text-truncate[href*='/fulfillment/transactions/document/']").first
+            if link.count() > 0 and link.is_visible():
+                link.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_grainger_ack_document_ready_for_shipment(page: Page, *, timeout_ms: int = 90_000) -> bool:
+    """Acknowledgment document (read-only or editable) before Shipment -> New."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if not _sps_url_is_document(page.url or ""):
+            page.wait_for_timeout(300)
+            continue
+        for sel in (
+            "[data-testid='poAck2.header.ackType-select-value']",
+            "[data-testid^='poAck2.']",
+            "th:has-text('SKU')",
+            "text=/\\bSKU\\b/",
+            "text=/\\bUnits\\b/",
+        ):
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        return True
+                except Exception:
+                    continue
+        page.wait_for_timeout(320)
+    return False
+
+
+def _grainger_try_open_existing_acknowledgment_flow(page: Page) -> bool:
+    """
+    If acknowledgments already exist, open one: single-id span -> that document; View All ->
+    transaction list -> first Acknowledgment row document link. Returns False to create a new ack.
+    """
+    sp = _grainger_ack_indicator_span(page)
+    if sp is None:
+        return False
+    try:
+        title = (sp.get_attribute("title") or "").strip()
+        txt = (sp.inner_text() or "").strip()
+    except Exception:
+        return False
+    if not _grainger_span_looks_like_sent_ack(title, txt):
+        return False
+    is_view_all = bool(re.search(r"view\s+all", txt, re.I)) or "," in title
+    print(f"Grainger: existing acknowledgment control found (View All={is_view_all}); opening ack document.")
+    try:
+        sp.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    try:
+        sp.click(timeout=4000)
+    except Exception:
+        try:
+            sp.evaluate("el => el.click()")
+        except Exception:
+            sp.click(timeout=4000, force=True)
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(500)
+    if is_view_all:
+        if not _grainger_wait_ack_transaction_list(page, timeout_ms=45_000):
+            raise RuntimeError("Acknowledgment list (after View All) did not load.")
+        if not _grainger_click_first_ack_row_document_link(page):
+            raise RuntimeError("Could not open first Acknowledgment document from the list.")
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(600)
+    return True
+
+
+def _grainger_modal_pick_advance_ship_notice(page: Page) -> None:
+    """Shipment -> Create New modal: select Advance Ship Notice inside the dialog only."""
+    deadline = time.monotonic() + 25.0
+    asn_label = re.compile(r"advance\s*ship\s*notice", re.I)
+    while time.monotonic() < deadline:
+        for ctx in _contexts(page):
+            for root in ("[role='dialog']", ".sps-modal", "[class*='modal__']"):
+                try:
+                    roots = ctx.locator(root)
+                    for ri in range(min(roots.count(), 6)):
+                        dlg = roots.nth(ri)
+                        try:
+                            if not dlg.is_visible():
+                                continue
+                        except Exception:
+                            continue
+                        try:
+                            blob = dlg.inner_text(timeout=1200)[:2500]
+                        except Exception:
+                            continue
+                        if not re.search(r"shipment|advance|ship|notice|asn|create\s*new", blob, re.I):
+                            continue
+                        for sel in (
+                            "label.sps-checkable__label",
+                            "label",
+                            "span",
+                            "div",
+                        ):
+                            try:
+                                cand = dlg.locator(sel).filter(has_text=asn_label)
+                                if cand.count() == 0:
+                                    continue
+                                node = cand.first
+                                if node.is_visible():
+                                    node.scroll_into_view_if_needed()
+                                    node.click(timeout=3500)
+                                    return
+                            except Exception:
+                                continue
+                        try:
+                            hit = dlg.locator("span, div, label, p").filter(has_text=asn_label)
+                            if hit.count() > 0 and hit.first.is_visible():
+                                hit.first.click(timeout=3500)
+                                return
+                        except Exception:
+                            pass
+                        try:
+                            tline = dlg.locator("text=/Advance\\s+Ship\\s*Notice/i")
+                            if tline.count() > 0 and tline.first.is_visible():
+                                tline.first.click(timeout=3500)
+                                return
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        page.wait_for_timeout(280)
+    raise RuntimeError("Could not select Advance Ship Notice inside Shipment Create New modal.")
+
+
+def _wait_for_grainger_invoice_from_po_modal_ready(page: Page, *, timeout_ms: int = 20_000) -> bool:
+    """Billing -> New modal showing Invoice (From PO) option."""
+    inv = re.compile(r"invoice\s*\(\s*from\s*po", re.I)
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for ctx in _contexts(page):
+            try:
+                dlg = ctx.locator("[role='dialog'], .sps-modal").filter(has_text=inv)
+                if dlg.count() > 0 and dlg.first.is_visible():
+                    return True
+            except Exception:
+                continue
+            try:
+                lab = ctx.locator("label.sps-checkable__label").filter(has_text=inv)
+                if lab.count() > 0 and lab.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(220)
+    return False
+
+
+def _grainger_modal_pick_invoice_from_po(page: Page) -> None:
+    """Inside Billing Create New modal: select the Invoice (From PO) radio/label."""
+    inv_label = re.compile(r"invoice\s*\(\s*from\s*po\s*\)", re.I)
+    deadline = time.monotonic() + 25.0
+    while time.monotonic() < deadline:
+        for ctx in _contexts(page):
+            for root in ("[role='dialog']", ".sps-modal", "[class*='modal__']"):
+                try:
+                    roots = ctx.locator(root)
+                    for ri in range(min(roots.count(), 8)):
+                        dlg = roots.nth(ri)
+                        try:
+                            if not dlg.is_visible():
+                                continue
+                        except Exception:
+                            continue
+                        try:
+                            blob = dlg.inner_text(timeout=1200)[:3500]
+                        except Exception:
+                            continue
+                        if not re.search(r"invoice|billing|from\s*po|create\s*new", blob, re.I):
+                            continue
+                        for sel in ("label.sps-checkable__label", "label", "span", "div"):
+                            try:
+                                cand = dlg.locator(sel).filter(has_text=inv_label)
+                                if cand.count() == 0:
+                                    continue
+                                node = cand.first
+                                if node.is_visible():
+                                    node.scroll_into_view_if_needed()
+                                    node.click(timeout=3500)
+                                    page.wait_for_timeout(200)
+                                    return
+                            except Exception:
+                                continue
+                        try:
+                            tline = dlg.locator("text=/Invoice\\s*\\(\\s*From\\s*PO\\s*\\)/i")
+                            if tline.count() > 0 and tline.first.is_visible():
+                                tline.first.click(timeout=3500)
+                                page.wait_for_timeout(200)
+                                return
+                        except Exception:
+                            pass
+                        try:
+                            radios = dlg.locator("input[type='radio']")
+                            for rj in range(min(radios.count(), 24)):
+                                r = radios.nth(rj)
+                                try:
+                                    if not r.is_visible():
+                                        continue
+                                except Exception:
+                                    continue
+                                rid = (r.get_attribute("id") or "").strip()
+                                if rid:
+                                    lab = dlg.locator(f"label[for='{rid}']")
+                                    if lab.count() > 0:
+                                        try:
+                                            lt = lab.first.inner_text(timeout=500)
+                                        except Exception:
+                                            lt = ""
+                                        if lt and re.search(inv_label, lt):
+                                            lab.first.click(timeout=3000)
+                                            page.wait_for_timeout(200)
+                                            return
+                                try:
+                                    host = r.locator("xpath=ancestor::label[1]")
+                                    if host.count() == 0:
+                                        host = r.locator(
+                                            "xpath=ancestor::div[contains(@class,'checkable')][1]"
+                                        )
+                                    if host.count() > 0:
+                                        ht = host.first.inner_text(timeout=500)[:400]
+                                        if re.search(inv_label, ht):
+                                            host.first.click(timeout=3000)
+                                            page.wait_for_timeout(200)
+                                            return
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        page.wait_for_timeout(280)
+    raise RuntimeError("Could not select Invoice (From PO) inside Billing Create New modal.")
+
+
+def _grainger_modal_click_create_new_after_invoice_choice(page: Page) -> bool:
+    """Click Create New on the same Billing modal after Invoice (From PO) is selected."""
+    inv = re.compile(r"from\s*po|invoice", re.I)
+    for ctx in _contexts(page):
+        for root in ("[role='dialog']", ".sps-modal"):
+            try:
+                roots = ctx.locator(root)
+                for ri in range(min(roots.count(), 8)):
+                    dlg = roots.nth(ri)
+                    try:
+                        if not dlg.is_visible():
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        b = dlg.inner_text(timeout=800)[:2500]
+                    except Exception:
+                        continue
+                    if not re.search(inv, b):
+                        continue
+                    for bs in (
+                        "button[data-testid='modalOkBtn'][title='Create New']",
+                        "button[data-testid='modalOkBtn']:has-text('Create New')",
+                        "div.sps-button.sps-button--confirm button[data-testid='modalOkBtn']",
+                    ):
+                        try:
+                            btn = dlg.locator(bs).first
+                            if btn.count() > 0 and btn.is_visible():
+                                try:
+                                    btn.scroll_into_view_if_needed()
+                                except Exception:
+                                    pass
+                                try:
+                                    btn.click(timeout=4000)
+                                except Exception:
+                                    try:
+                                        btn.evaluate("el => el.click()")
+                                    except Exception:
+                                        btn.click(timeout=4000, force=True)
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    # Fallback: any visible modal with Create New (single Billing dialog expected).
+    for ctx in _contexts(page):
+        for root in ("[role='dialog']", ".sps-modal"):
+            try:
+                roots = ctx.locator(root)
+                for ri in range(min(roots.count(), 8)):
+                    dlg = roots.nth(ri)
+                    try:
+                        if not dlg.is_visible():
+                            continue
+                    except Exception:
+                        continue
+                    btn = dlg.locator(
+                        "button[data-testid='modalOkBtn'][title='Create New'], "
+                        "button[data-testid='modalOkBtn']:has-text('Create New')"
+                    ).first
+                    try:
+                        if btn.count() > 0 and btn.is_visible():
+                            btn.click(timeout=4000)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    return False
+
+
+def _wait_grainger_invoice_editor_ready(page: Page, *, timeout_ms: int = 90_000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for ctx in _contexts(page):
+            try:
+                d = ctx.locator("input[data-testid='invoice2.header.invoiceDate-input_date_input']").first
+                if d.count() > 0 and d.is_visible():
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(300)
+    return False
+
+
+def _open_grainger_document_from_list_by_po(page: Page, po: str) -> bool:
+    """On transactions results (any results page), click the document link matching this PO."""
+    norm = normalize_po(po)
+    if not norm:
+        return False
+    max_pages = 80
+    for _ in range(1, max_pages + 1):
+        clear_click_blockers(page)
+        wait_for_order_link_count(page, timeout_ms=45_000)
+        for ctx in _contexts(page):
+            links = ctx.locator("a.text-truncate[href*='/fulfillment/transactions/document/']")
+            if links.count() == 0:
+                links = ctx.locator("a[href*='/fulfillment/transactions/document/']")
+            for i in range(links.count()):
+                link = links.nth(i)
+                try:
+                    if not link.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    link_po = normalize_po(link.inner_text().strip())
+                except Exception:
+                    link_po = ""
+                if link_po != norm:
+                    continue
+                try:
+                    link.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    link.click(timeout=3000)
+                except Exception:
+                    try:
+                        link.evaluate("(el) => el.click()")
+                    except Exception:
+                        link.click(timeout=3000, force=True)
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(500)
+                return True
+        if not _go_next_results_page(page):
+            break
+    return False
+
+
+def _ensure_grainger_on_order_view_after_ack_send(
+    page: Page,
+    anchor_document_url: str,
+    po: str,
+    *,
+    partner_name: str,
+    timeout_ms: int = 120_000,
+) -> None:
+    """
+    Sending an acknowledgment can redirect to the transactions list. ASN must be started from the
+    order document page; stay there until Shipment workflow is usable.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    page.wait_for_timeout(700)
+    # Give SPA time to settle on acknowledgment / order document without list flash.
+    while time.monotonic() < deadline:
+        if _grainger_shipment_workflow_visible(page):
+            print("Grainger: on order document with Shipment workflow after acknowledgment.")
+            return
+        if _sps_url_is_transaction_hub_not_document(page.url or ""):
+            break
+        page.wait_for_timeout(350)
+    if _grainger_shipment_workflow_visible(page):
+        return
+
+    reopened = False
+    if anchor_document_url and _sps_url_is_document(anchor_document_url):
+        print("Grainger: reopening saved order document after acknowledgment send.")
+        try:
+            page.goto(anchor_document_url, wait_until="domcontentloaded", timeout=120_000)
+            page.wait_for_timeout(900)
+            reopened = True
+        except Exception as ex:
+            print(f"Grainger: goto saved document URL failed ({ex}); trying list fallback.")
+    if reopened and _wait_grainger_order_document_ready_for_asn(page, timeout_ms=75_000):
+        return
+
+    # Ack doc may load before the shipment step paints; avoid list-click while still on document URL.
+    if _sps_url_is_document(page.url or "") and not _grainger_shipment_workflow_visible(page):
+        if _wait_grainger_order_document_ready_for_asn(page, timeout_ms=45_000):
+            return
+
+    # Results list / hub: reopen by PO column link.
+    if _sps_url_is_transaction_hub_not_document(page.url or ""):
+        print(f"Grainger: locating PO {po} on results to reopen order document.")
+        try:
+            open_ready_for_shipment(page, partner_name=partner_name)
+        except Exception as ex:
+            print(f"Grainger: could not refresh Advanced Search ({ex}); trying current results page.")
+        if _open_grainger_document_from_list_by_po(page, po):
+            page.wait_for_timeout(600)
+            if _wait_grainger_order_document_ready_for_asn(page, timeout_ms=75_000):
+                return
+
+    if _grainger_shipment_workflow_visible(page):
+        return
+
+    raise RuntimeError(
+        "After acknowledgment send, could not reach the order document with Shipment workflow "
+        "(avoid returning to transactions until ASN and invoice finish)."
+    )
+
+
+def _select_dropdown_value_by_testid(page: Page, value_testid: str, option_text: str) -> bool:
+    for ctx in _contexts(page):
+        try:
+            value = ctx.locator(f"[data-testid='{value_testid}']").first
+            if value.count() == 0:
+                continue
+            value.wait_for(state="visible", timeout=5000)
+            try:
+                value.click(timeout=1500)
+            except Exception:
+                value.click(timeout=1500, force=True)
+            if click_first_visible(
+                page,
+                [
+                    f"[role='option']:has-text('{option_text}')",
+                    f"li[role='option']:has-text('{option_text}')",
+                    f"text={option_text}",
+                ],
+                timeout_ms=2500,
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_ack_form_ready(page: Page, timeout_ms: int = 60_000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        # Require acknowledgment-editor signals; do not treat base PO page as ready.
+        for sel in (
+            "[data-testid='poAck2.header.ackType-select-value']",
+            "[data-testid='poAck2.ackRep.detail.0.additionalInfo.itemStatus-select-value']",
+            "input[data-testid^='poAck2.']",
+            "text=/acknowledge\\s*-\\s*with\\s*detail\\s*no\\s*change/i",
+            "text=/item\\s*accepted/i",
+        ):
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        return True
+                except Exception:
+                    continue
+        page.wait_for_timeout(250)
+    return False
+
+
+def _grainger_csv_tracking_for_open_order(open_po: str, tracking_by_po: dict[str, str]) -> tuple[str, str] | None:
+    """
+    Grainger: we already opened this order from the list — use that PO for CSV lookup.
+    Do not rely on page.inner_text after redirects (list may not expose PO as \\b\\d{10}\\b).
+    """
+    norm = normalize_po(open_po)
+    if not norm:
+        return None
+    tracking = tracking_by_po.get(norm)
+    if tracking:
+        return norm, tracking
+    return None
+
+
+def _extract_tracking_match_from_page(page: Page, tracking_by_po: dict[str, str]) -> tuple[str, str] | None:
+    """Find a PO on the current page that exists in CSV tracking map (prefer 10-digit tokens)."""
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        text = ""
+    seen: set[str] = set()
+    for po in re.findall(r"\b\d{10}\b", text):
+        norm = normalize_po(po)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        tracking = tracking_by_po.get(norm)
+        if tracking:
+            return norm, tracking
+    # Shorter POs / alternate formatting: any digit run that normalizes to a map key.
+    for m in re.finditer(r"\b\d{6,12}\b", text):
+        norm = normalize_po(m.group(0))
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        tracking = tracking_by_po.get(norm)
+        if tracking:
+            return norm, tracking
+    return None
+
+
+def _estimate_gross_weight(page: Page) -> str:
+    """
+    Placeholder gross-weight estimate.
+    Uses shipped/ordered qty if visible; defaults to 1 lb.
+    """
+    qty = 1
+    try:
+        text = page.inner_text("body")
+    except Exception:
+        text = ""
+    for m in re.finditer(r"\b(\d+)\b", text):
+        try:
+            n = int(m.group(1))
+        except Exception:
+            continue
+        if 1 <= n <= 500:
+            qty = n
+            break
+    return str(max(1, qty))
+
+
+def _click_grainger_acknowledgment_new(page: Page) -> None:
+    """
+    Acknowledgment 'New' is often a plain sps-button (no createNewBtn data-testid).
+    Shipments/Billing typically use button[data-testid='createNewBtn'] — do not confuse them.
+    """
+    clear_click_blockers(page)
+    _tr_from = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    _tr_to = "abcdefghijklmnopqrstuvwxyz"
+    scoped_selectors = [
+        # Scoped to workflow rail so we do not match body text; plain New, not createNewBtn.
+        f"xpath=(//*[(contains(@class,'workflow') or @data-testid='workflow')]//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'order status')])[1]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgement')]/following::button[contains(@class,'sps-button__clickable-element')][normalize-space()='New'][1]",
+        f"xpath=(//*[(contains(@class,'workflow') or @data-testid='workflow')]//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'order status')])[1]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgment')]/following::button[contains(@class,'sps-button__clickable-element')][normalize-space()='New'][1]",
+        f"xpath=(//*[(contains(@class,'workflow') or @data-testid='workflow')]//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'order status (')])[1]/following::button[contains(@class,'sps-button__clickable-element') and not(@data-testid='createNewBtn')][normalize-space()='New'][1]",
+        # If workflow container is not class-tagged, fall back to first Order Status + Ack text path.
+        f"xpath=(//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'order status')])[1]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgement')]/following::button[contains(@class,'sps-button__clickable-element')][normalize-space()='New'][1]",
+        f"xpath=(//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'order status')])[1]"
+        f"//*[contains(translate(normalize-space(.),'{_tr_from}','{_tr_to}'),'acknowledgment')]/following::button[contains(@class,'sps-button__clickable-element')][normalize-space()='New'][1]",
+    ]
+    for sel in scoped_selectors:
+        if click_first_visible(page, [sel], timeout_ms=5000):
+            return
+        for ctx in _contexts(page):
+            try:
+                loc = ctx.locator(sel)
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                btn.wait_for(state="visible", timeout=4000)
+                try:
+                    btn.click(timeout=2000)
+                except Exception:
+                    try:
+                        btn.evaluate("el => el.click()")
+                    except Exception:
+                        btn.click(timeout=2000, force=True)
+                return
+            except Exception:
+                continue
+    raise RuntimeError(
+        "Could not click Acknowledgment 'New' (plain workflow button — not createNewBtn)."
+    )
+
+
+def _create_grainger_ack_for_open_order(page: Page, *, submit: bool) -> None:
+    # Open the Order Status -> Acknowledgment -> Create New modal.
+    modal_ready = False
+    for attempt in range(1, 4):
+        _click_grainger_acknowledgment_new(page)
+        page.wait_for_timeout(350)
+        for sel in (
+            "button[data-testid='modalOkBtn'][title='Create New']",
+            "button[data-testid='modalOkBtn']:has-text('Create New')",
+            "text=/create\\s+new/i",
+            "text=/certified\\s+vendor\\s+poa/i",
+            "text=/acknowledg/i",
+        ):
+            found = False
+            for ctx in _contexts(page):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        found = True
+                        break
+                except Exception:
+                    continue
+            if found:
+                modal_ready = True
+                break
+        if modal_ready:
+            break
+        print(f"Grainger ack modal not ready on attempt {attempt}; retrying Acknowledgment New.")
+        page.wait_for_timeout(250)
+    if not modal_ready:
+        raise RuntimeError("Grainger acknowledgment Create New popup did not open.")
+
+    # Popup step: explicitly choose acknowledgment document option (radio circle/label).
+    picked_ack_option = click_first_visible(
+        page,
+        [
+            "label.sps-checkable__label:has-text('Certified Vendor POA')",
+            "label.sps-checkable__label:has-text('Acknowledgment')",
+            "text=Certified Vendor POA",
+            "text=Acknowledgment",
+            "input[type='radio'][data-testid*='ack']",
+            "input[type='radio'][value*='ack']",
+        ],
+        timeout_ms=10_000,
+    )
+    if not picked_ack_option:
+        # Try direct radio click in case label click is blocked by the overlay wall.
+        for ctx in _contexts(page):
+            for sel in (
+                "input[type='radio']",
+                "label.sps-checkable__label",
+            ):
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    node = loc.first
+                    try:
+                        node.click(timeout=1200)
+                    except Exception:
+                        try:
+                            node.evaluate("el => el.click()")
+                        except Exception:
+                            node.click(timeout=1200, force=True)
+                    picked_ack_option = True
+                    break
+                except Exception:
+                    continue
+            if picked_ack_option:
+                break
+    if not picked_ack_option:
+        raise RuntimeError("Could not select acknowledgment option in Grainger Create New popup.")
+
+    # Then click Create New with robust fallback paths.
+    created = click_first_visible(
+        page,
+        [
+            "button[data-testid='modalOkBtn'][title='Create New']",
+            "button[data-testid='modalOkBtn']:has-text('Create New')",
+            "div.sps-button.sps-button--confirm button[data-testid='modalOkBtn'][title='Create New']",
+        ],
+        timeout_ms=10_000,
+    )
+    if not created:
+        for ctx in _contexts(page):
+            try:
+                loc = ctx.locator("button[data-testid='modalOkBtn'][title='Create New']")
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                try:
+                    btn.click(timeout=1500)
+                except Exception:
+                    try:
+                        btn.evaluate("el => el.click()")
+                    except Exception:
+                        btn.click(timeout=1500, force=True)
+                created = True
+                break
+            except Exception:
+                continue
+    if not created:
+        raise RuntimeError("Could not click Create New for Grainger Acknowledgment.")
+
+    if not _wait_for_ack_form_ready(page, timeout_ms=60_000):
+        raise RuntimeError("Grainger Acknowledgment form did not load.")
+
+    ack_ok = _select_dropdown_value_by_testid(
+        page,
+        "poAck2.header.ackType-select-value",
+        "Acknowledge - With Detail No Change",
+    )
+    item_ok = _select_dropdown_value_by_testid(
+        page,
+        "poAck2.ackRep.detail.0.additionalInfo.itemStatus-select-value",
+        "Item Accepted",
+    )
+    if not ack_ok or not item_ok:
+        raise RuntimeError("Grainger acknowledgment dropdowns were not set correctly.")
+    print("Grainger acknowledgment form ready and values set.")
+
+    if submit:
+        send_documents(page)
+    else:
+        print("Dry run: acknowledgment prepared but not sent.")
+
+
+def _create_grainger_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> None:
+    _click_workflow_new(page, "Shipment", allow_global_fallback=False)
+    page.wait_for_timeout(450)
+    try:
+        for ctx in _contexts(page):
+            loc = ctx.locator("[role='dialog'], .sps-modal").first
+            if loc.count() > 0:
+                loc.wait_for(state="visible", timeout=12_000)
+                break
+    except Exception:
+        pass
+    try:
+        _grainger_modal_pick_advance_ship_notice(page)
+    except Exception as ex:
+        print(f"Grainger ASN: scoped modal pick failed ({ex}); falling back to generic Advance Ship Notice click.")
+        if not click_first_visible(
+            page,
+            [
+                "label.sps-checkable__label:has-text('Advance Ship Notice')",
+                "text=Advance Ship Notice",
+            ],
+            timeout_ms=6000,
+        ):
+            raise RuntimeError("Could not select Advance Ship Notice for Grainger ASN.") from ex
+    if not click_first_visible(
+        page,
+        [
+            "button[data-testid='modalOkBtn'][title='Create New']",
+            "button[data-testid='modalOkBtn']:has-text('Create New')",
+        ],
+        timeout_ms=10000,
+    ):
+        raise RuntimeError("Could not click Create New for Grainger ASN.")
+    wait_for_asn_form_ready(page, timeout_ms=90_000)
+
+    weights_csv = resolve_sku_weights_csv_path()
+    if weights_csv:
+        print(f"Grainger ASN: using SKU weights map {weights_csv}")
+    gross_weight = _grainger_gross_weight_lbs(page, weights_csv)
+    for ctx in _contexts(page):
+        try:
+            gw = ctx.locator("input[data-testid='asn.header.shipment.grossWeight-input__input']").first
+            if gw.count() > 0 and gw.is_visible():
+                try:
+                    gw.fill("")
+                    gw.fill(gross_weight)
+                except Exception:
+                    gw.click(timeout=1200, force=True)
+                    gw.fill(gross_weight)
+                break
+        except Exception:
+            continue
+    fill_asn_date(page)
+    _fill_grainger_asn_tracking(page, tracking)
+
+    if submit:
+        send_documents(page)
+        if not _wait_for_asn_document_ready(page, timeout_ms=70_000):
+            raise RuntimeError("Grainger ASN post-send page did not become ready.")
+    else:
+        print("Dry run: Grainger ASN prepared but not sent.")
+
+
+def _create_grainger_invoice_from_po_for_open_order(page: Page, *, submit: bool) -> None:
+    opened = False
+    for attempt in range(1, 7):
+        try:
+            _click_workflow_new(page, "Billing", allow_global_fallback=False)
+        except Exception:
+            pass
+        page.wait_for_timeout(450)
+        try:
+            for ctx in _contexts(page):
+                loc = ctx.locator("[role='dialog'], .sps-modal").first
+                if loc.count() > 0:
+                    loc.wait_for(state="visible", timeout=10_000)
+                    break
+        except Exception:
+            pass
+        if _wait_for_grainger_invoice_from_po_modal_ready(page, timeout_ms=6_000):
+            opened = True
+            break
+        print(f"Grainger invoice: Billing Create New modal not ready yet (attempt {attempt}).")
+        page.wait_for_timeout(400)
+    if not opened:
+        raise RuntimeError("Could not open Billing Create New modal for Invoice (From PO).")
+
+    try:
+        _grainger_modal_pick_invoice_from_po(page)
+    except Exception as ex:
+        print(f"Grainger invoice: dialog-scoped Invoice (From PO) click failed ({ex}); trying generic selectors.")
+        if not click_first_visible(
+            page,
+            [
+                "label.sps-checkable__label:has-text('Invoice (From PO)')",
+                "label.sps-checkable__label:has-text('Invoice From PO')",
+                "text=Invoice (From PO)",
+                "xpath=//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'invoice')][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'from po')]",
+            ],
+            timeout_ms=7000,
+        ):
+            raise RuntimeError("Could not select Invoice (From PO) in Billing modal.") from ex
+
+    page.wait_for_timeout(300)
+    if not _grainger_modal_click_create_new_after_invoice_choice(page):
+        if not click_first_visible(
+            page,
+            [
+                "button[data-testid='modalOkBtn'][title='Create New']",
+                "button[data-testid='modalOkBtn']:has-text('Create New')",
+            ],
+            timeout_ms=12_000,
+        ):
+            raise RuntimeError("Could not click Create New for Grainger Invoice (From PO).")
+
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(500)
+    if not _wait_grainger_invoice_editor_ready(page, timeout_ms=90_000):
+        print("WARN: Grainger invoice editor fields not detected in time; continuing best-effort.")
+    page.wait_for_timeout(400)
+
+    today = datetime.now().strftime("%m/%d/%Y")
+    for ctx in _contexts(page):
+        try:
+            d = ctx.locator("input[data-testid='invoice2.header.invoiceDate-input_date_input']").first
+            if d.count() > 0 and d.is_visible():
+                d.fill(today)
+                break
+        except Exception:
+            continue
+
+    po_for_invoice = ""
+    for ctx in _contexts(page):
+        try:
+            src = ctx.locator("a.text-truncate.d-block[href*='/fulfillment/transactions/document/']").first
+            if src.count() > 0:
+                po_for_invoice = normalize_po(src.inner_text().strip())
+                if po_for_invoice:
+                    break
+        except Exception:
+            continue
+    if not po_for_invoice:
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            body = ""
+        m = re.search(r"\b(\d{10})\b", body)
+        po_for_invoice = m.group(1) if m else ""
+    if po_for_invoice:
+        for ctx in _contexts(page):
+            for sel in (
+                "input[data-testid='invoice2.header.invoiceNumber-input__input']",
+                "input[aria-label='Invoice Number']",
+            ):
+                try:
+                    inv = ctx.locator(sel).first
+                    if inv.count() > 0 and inv.is_visible():
+                        inv.fill(po_for_invoice)
+                        break
+                except Exception:
+                    continue
+
+    if submit:
+        send_documents(page)
+    else:
+        print("Dry run: Grainger invoice prepared but not sent.")
+
+
+def _click_workflow_new(page: Page, workflow_name: str, *, allow_global_fallback: bool = True) -> None:
     clear_click_blockers(page)
     # Prefer workflow-rail-local "New" (e.g., Billing -> New) to avoid clicking wrong section.
     selectors = [
         f"xpath=//*[contains(@class,'workflow') or @data-testid='workflow']//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{workflow_name.lower()}')]/following::button[@data-testid='createNewBtn' and @title='New'][1]",
         f"xpath=//*[normalize-space()='{workflow_name}']/following::button[@data-testid='createNewBtn' and @title='New'][1]",
         f"xpath=//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{workflow_name.lower()}')]/following::button[@data-testid='createNewBtn' and @title='New'][1]",
-        "button[data-testid='createNewBtn'][title='New']",
     ]
+    if allow_global_fallback:
+        selectors.append("button[data-testid='createNewBtn'][title='New']")
 
     for sel in selectors:
         for ctx in _contexts(page):
@@ -1046,29 +2751,78 @@ def _create_invoice_from_asn_for_open_order(page: Page, *, submit: bool) -> bool
     return True
 
 
-def process_orders_individually(page: Page, tracking_by_po: dict[str, str], *, submit: bool) -> tuple[int, int]:
+def process_orders_individually(
+    page: Page,
+    tracking_by_po: dict[str, str],
+    *,
+    submit: bool,
+    partner_name: str = "Tractor Supply Dropship",
+) -> tuple[int, int]:
     """
     Per-PO flow:
-    Transactions + Advanced Search (Shipment) -> open PO -> create/send ASN ->
-    create/send Invoice-from-ASN -> return to transactions for next PO.
+    Tractor: transactions list -> open PO -> ASN -> Invoice from ASN -> next PO (new list pass).
+    Grainger: transactions list -> open PO -> ACK -> stay on/open order document -> ASN -> Invoice
+    (From PO) -> next PO. Post-ACK redirects to the list are undone so ASN runs on the order page.
     """
+    is_grainger = "grainger" in (partner_name or "").lower()
     attempted = 0
     completed = 0
     processed_po: set[str] = set()
-    max_iterations = max(1, len(tracking_by_po))
+    max_iterations = 200 if is_grainger else max(1, len(tracking_by_po))
     for _ in range(max_iterations):
-        open_ready_for_shipment(page)
-        picked = _open_next_tracked_order_from_results(page, tracking_by_po, processed_po)
-        if picked is None:
-            print("No additional Shipment/Open POs on transactions pages matched CSV tracking.")
-            break
-        po, tracking = picked
-        attempted += 1
-        processed_po.add(po)
-        print(f"\n=== PO {po}: matched from transactions list -> CSV tracking; processing ===")
+        anchor_doc_url = ""
+        open_ready_for_shipment(page, partner_name=partner_name)
+        if is_grainger:
+            po = _open_next_order_from_results(page, processed_po)
+            if po is None:
+                print("No additional open Grainger orders found in filtered transactions results.")
+                break
+            attempted += 1
+            processed_po.add(po)
+            print(f"\n=== Grainger order {po}: opened from top of filtered list ===")
+            anchor_doc_url = (page.url or "").strip()
+        else:
+            picked = _open_next_tracked_order_from_results(page, tracking_by_po, processed_po)
+            if picked is None:
+                print("No additional Shipment/Open POs on transactions pages matched CSV tracking.")
+                break
+            po, tracking = picked
+            attempted += 1
+            processed_po.add(po)
+            print(f"\n=== PO {po}: matched from transactions list -> CSV tracking; processing ===")
         try:
-            _create_asn_for_open_order(page, tracking, submit=submit)
-            _create_invoice_from_asn_for_open_order(page, submit=submit)
+            if is_grainger:
+                used_existing_ack = _grainger_try_open_existing_acknowledgment_flow(page)
+                if used_existing_ack:
+                    if not _wait_grainger_ack_document_ready_for_shipment(page, timeout_ms=90_000):
+                        raise RuntimeError(
+                            "Opened existing acknowledgment but page did not show ack content (SKU / poAck2)."
+                        )
+                    print("Grainger: on acknowledgment document; proceeding to shipment.")
+                else:
+                    _create_grainger_ack_for_open_order(page, submit=submit)
+                    if submit:
+                        _ensure_grainger_on_order_view_after_ack_send(
+                            page, anchor_doc_url, po, partner_name=partner_name
+                        )
+                tracking_match = _grainger_csv_tracking_for_open_order(po, tracking_by_po)
+                tracking_source = "opened order PO -> CSV map"
+                if not tracking_match:
+                    tracking_match = _extract_tracking_match_from_page(page, tracking_by_po)
+                    tracking_source = "page text -> CSV map"
+                if not tracking_match:
+                    print(
+                        f"Grainger order {po}: no CSV tracking for normalized PO "
+                        f"{normalize_po(po)!r} (and no map match from page text); skipping shipment/invoice."
+                    )
+                    continue
+                csv_po, tracking = tracking_match
+                print(f"Grainger order {po}: using CSV PO {csv_po} with tracking ({tracking_source}).")
+                _create_grainger_asn_for_open_order(page, tracking, submit=submit)
+                _create_grainger_invoice_from_po_for_open_order(page, submit=submit)
+            else:
+                _create_asn_for_open_order(page, tracking, submit=submit)
+                _create_invoice_from_asn_for_open_order(page, submit=submit)
             completed += 1
             print(f"PO {po}: completed.")
         except Exception as ex:
@@ -2467,6 +4221,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If no storage state file exists, open SPS, wait for you to log in in the browser, then save it.",
     )
+    parser.add_argument(
+        "--partner",
+        default="Tractor Supply Dropship",
+        help="SPS Partner filter for Advanced Search (e.g., 'Tractor Supply Dropship', 'Grainger').",
+    )
     return parser.parse_args()
 
 
@@ -2531,10 +4290,15 @@ def main() -> int:
                         did_auto_interactive_login = True
                 if args.interactive_login:
                     interactive_login_then_save(page, context, state_path)
-                open_ready_for_shipment(page)
+                open_ready_for_shipment(page, partner_name=args.partner)
                 print(f"After Transactions/Advanced Search: {page.url}")
                 print("STEP 2: Process each PO individually (Shipment then Invoice from ASN)...")
-                completed, attempted = process_orders_individually(page, tracking_by_po, submit=bool(args.submit))
+                completed, attempted = process_orders_individually(
+                    page,
+                    tracking_by_po,
+                    submit=bool(args.submit),
+                    partner_name=args.partner,
+                )
                 print(f"Individual PO flow completed: {completed}/{attempted} processed.")
                 exit_code = 0 if completed > 0 else 1
             except RuntimeError as ex:
@@ -2558,10 +4322,15 @@ def main() -> int:
                     )
                     if not login_with_env_credentials_then_save(page, context, state_path):
                         interactive_login_then_save(page, context, state_path)
-                    open_ready_for_shipment(page)
+                    open_ready_for_shipment(page, partner_name=args.partner)
                     print(f"After Transactions/Advanced Search: {page.url}")
                     print("STEP 2: Process each PO individually (Shipment then Invoice from ASN)...")
-                    completed, attempted = process_orders_individually(page, tracking_by_po, submit=bool(args.submit))
+                    completed, attempted = process_orders_individually(
+                        page,
+                        tracking_by_po,
+                        submit=bool(args.submit),
+                        partner_name=args.partner,
+                    )
                     print(f"Individual PO flow completed: {completed}/{attempted} processed.")
                     exit_code = 0 if completed > 0 else 1
                 else:
