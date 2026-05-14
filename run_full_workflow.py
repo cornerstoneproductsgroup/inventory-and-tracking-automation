@@ -2,8 +2,9 @@
 Orchestrates the full daily workflow.
 
 Phases (default):
-  0 — CommerceHub invoice reports first. The exporter folder is auto-detected (see
-      ``discover_invoice_report_directory``): CLI/env, then ``<repo>/invoice report``, then other paths.
+  0 — CommerceHub invoice reports first. ``all`` runs in parallel: CommerceHub (Depot then Lowe's,
+      one browser) and SPS Tractor Supply (second browser). Folder auto-detection: see
+      ``discover_invoice_report_directory`` (CLI/env, ``<repo>/invoice report``, etc.).
   1 — Inventories in parallel when both sides run: Rithum inventory (CommerceHub) and
       Tractor Supply inventory (SPS), each in its own browser.
   2 — Tracking / invoicing in parallel when both sides run: Depot + Lowe's (CommerceHub) and
@@ -19,7 +20,8 @@ Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --sequential-lanes to run each phase's two sides one after the other instead of parallel.
 
 Each Inventory Submissions step uses Inventory Submissions\\.venv when present.
-Invoice report uses that project's .venv if present, else py -3.13 on Windows, else the same venv.
+Invoice report picks the first interpreter that can import dotenv, playwright, and pandas:
+``invoice report/.venv``, then Inventory Submissions ``.venv``, then ``sys.executable``.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ LOWES_DIR = ROOT / "Lowe's Tracking Automation"
 _INVOICE_REPORT_FOLDER = "CommerceHub Invoice Report (Depot and Lowe's)"
 _INVOICE_REPORT_FOLDER_IN_REPO = "invoice report"
 _INVOICE_EXPORT_SCRIPT = "commercehub_invoice_export.py"
-_INVOICE_EXPORT_MODES = frozenset({"all", "depot", "lowes", "tractor"})
+_INVOICE_EXPORT_MODES = frozenset({"all", "depot", "lowes", "tractor", "retail"})
 
 
 def discover_invoice_report_directory(cli_dir: Path | None) -> tuple[Path, list[Path]]:
@@ -87,7 +89,7 @@ def discover_invoice_report_directory(cli_dir: Path | None) -> tuple[Path, list[
 
 
 def _normalize_invoice_report_modes(raw: list[str] | None) -> list[str]:
-    """Return exporter argv tokens; if ``all`` appears, run a single ``all`` pass only."""
+    """Return exporter argv tokens; collapse overlapping requests to a single subprocess."""
     if not raw:
         return ["all"]
     out: list[str] = []
@@ -98,30 +100,97 @@ def _normalize_invoice_report_modes(raw: list[str] | None) -> list[str]:
         out.append(ml)
     if "all" in out:
         return ["all"]
+    keys = frozenset(out)
+    if keys == frozenset({"depot", "lowes", "tractor"}):
+        return ["all"]
+    if keys == frozenset({"depot", "lowes"}):
+        return ["retail"]
     return out
 
 
+def _inventory_venv_python() -> Path:
+    if sys.platform == "win32":
+        return INVENTORY_DIR / ".venv" / "Scripts" / "python.exe"
+    return INVENTORY_DIR / ".venv" / "bin" / "python"
+
+
 def resolve_project_python() -> str:
-    if sys.platform == "win32":
-        candidate = INVENTORY_DIR / ".venv" / "Scripts" / "python.exe"
-    else:
-        candidate = INVENTORY_DIR / ".venv" / "bin" / "python"
+    candidate = _inventory_venv_python()
     if candidate.is_file():
-        return str(candidate)
-    return sys.executable
+        return str(candidate.resolve())
+    return str(Path(sys.executable).resolve())
 
 
-def resolve_invoice_report_python(invoice_dir: Path) -> list[str]:
-    """Argv prefix to run commercehub_invoice_export.py (venv, py launcher, or project Python)."""
+def _invoice_report_interpreter_ready(py: Path) -> bool:
+    """True if this interpreter has the imports ``commercehub_invoice_export`` needs at startup."""
+    try:
+        r = subprocess.run(
+            [str(py), "-c", "import dotenv, playwright, pandas"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def resolve_invoice_report_python(invoice_dir: Path) -> tuple[list[str], str | None]:
+    """Pick an interpreter that can import dotenv, playwright, and pandas.
+
+    Tries in order: ``invoice_dir/.venv``, Inventory Submissions ``.venv``,
+    then ``sys.executable``. De-duplicates by resolved path.
+
+    Returns ``(argv_prefix, None)`` on success, or ``([], error_message)`` if none qualify.
+    """
     if sys.platform == "win32":
-        venv_py = invoice_dir / ".venv" / "Scripts" / "python.exe"
+        invoice_venv_py = invoice_dir / ".venv" / "Scripts" / "python.exe"
     else:
-        venv_py = invoice_dir / ".venv" / "bin" / "python"
-    if venv_py.is_file():
-        return [str(venv_py)]
-    if sys.platform == "win32" and shutil.which("py"):
-        return ["py", "-3.13"]
-    return [resolve_project_python()]
+        invoice_venv_py = invoice_dir / ".venv" / "bin" / "python"
+
+    inv_py = _inventory_venv_python()
+    sys_py = Path(sys.executable)
+
+    rows: list[tuple[str, Path, Path]] = [
+        ("invoice report", invoice_venv_py, invoice_dir / "requirements.txt"),
+        ("Inventory Submissions", inv_py, INVENTORY_DIR / "requirements.txt"),
+        ("current Python", sys_py, INVENTORY_DIR / "requirements.txt"),
+    ]
+
+    seen: set[str] = set()
+    for label, py, req_txt in rows:
+        if not py.is_file():
+            continue
+        try:
+            key = str(py.resolve()).lower()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if _invoice_report_interpreter_ready(py):
+            return [str(py.resolve())], None
+
+        pip_exe = py.parent / ("pip.exe" if sys.platform == "win32" else "pip")
+        print(
+            f"NOTE: {label} interpreter is missing dotenv/playwright/pandas — trying another.\n"
+            f'      Fix: "{pip_exe}" install -r "{req_txt}"',
+            flush=True,
+        )
+
+    inv_pip = inv_py.parent / ("pip.exe" if sys.platform == "win32" else "pip")
+    err = (
+        "ERROR: No Python interpreter found with dotenv, playwright, and pandas (required for invoice reports).\n"
+        f'Install into Inventory Submissions (recommended):\n  "{inv_pip}" install -r "{INVENTORY_DIR / "requirements.txt"}"'
+    )
+    if invoice_venv_py.is_file():
+        ip = invoice_venv_py.parent / ("pip.exe" if sys.platform == "win32" else "pip")
+        err += (
+            f'\nOr into invoice report only:\n  "{ip}" install -r "{invoice_dir / "requirements.txt"}"'
+        )
+    return [], err
 
 
 def run_step(title: str, cmd: list[str], cwd: Path) -> tuple[bool, str]:
@@ -325,9 +394,9 @@ def main() -> int:
         default=None,
         metavar="MODE",
         help=(
-            "Modes for commercehub_invoice_export.py: all, depot, lowes, tractor. "
-            "Default when invoices run: all (one run: Depot + Lowe's + Tractor Supply). "
-            "Example: --invoice-report-modes depot lowes (two runs)."
+            "Modes for commercehub_invoice_export.py: all, retail, depot, lowes, tractor. "
+            "Default when invoices run: all (parallel: CommerceHub Depot+Lowe's, SPS Tractor). "
+            "depot+lowes together is normalized to one retail run. depot+lowes+tractor becomes all."
         ),
     )
     parser.add_argument(
@@ -389,14 +458,14 @@ def main() -> int:
         )
 
     python_exe = resolve_project_python()
-    if python_exe == sys.executable:
+    if not _inventory_venv_python().is_file():
         print(
             "NOTE: No venv at Inventory Submissions\\.venv — using the current Python.\n"
             "      Create it and install deps (recommended, from cmd.exe):\n"
             f'      cd /d "{INVENTORY_DIR}"\n'
             "      python -m venv .venv\n"
-            r"      .venv\Scripts\pip install -r requirements.txt" "\n"
-            r"      .venv\Scripts\playwright install chromium"
+            "      .venv\\Scripts\\pip install -r requirements.txt\n"
+            "      .venv\\Scripts\\playwright install chromium"
         )
     else:
         print(f"Using project Python: {python_exe}")
@@ -625,7 +694,8 @@ def main() -> int:
             errors.append(msg)
         else:
             mode_labels = {
-                "all": "All (Depot + Lowe's + Tractor Supply)",
+                "all": "All (parallel: CH Depot+Lowe's + SPS Tractor)",
+                "retail": "Depot + Lowe's (CommerceHub, one browser)",
                 "depot": "Depot",
                 "lowes": "Lowe's",
                 "tractor": "Tractor Supply",
@@ -637,12 +707,33 @@ def main() -> int:
                 + "=" * 60
                 + f"\n  Modes: {', '.join(invoice_modes)}\n"
             )
-            inv_py_parts = resolve_invoice_report_python(invoice_report_dir)
-            for mode in invoice_modes:
-                label = mode_labels.get(mode, mode)
-                cmd = inv_py_parts + [str(export_script), mode]
-                title = f"CommerceHub invoice report — {label}"
-                errors.extend(_run_single(title, cmd, invoice_report_dir))
+            inv_py_parts, invoice_py_err = resolve_invoice_report_python(invoice_report_dir)
+            if invoice_py_err:
+                print(f"\n{invoice_py_err}")
+                errors.append(invoice_py_err)
+            elif not inv_py_parts:
+                msg = "ERROR: Could not resolve an interpreter for invoice reports."
+                print(f"\n{msg}")
+                errors.append(msg)
+            else:
+                for mode in invoice_modes:
+                    label = mode_labels.get(mode, mode)
+                    cmd = inv_py_parts + [str(export_script), mode]
+                    title = f"CommerceHub invoice report — {label}"
+                    errors.extend(_run_single(title, cmd, invoice_report_dir))
+
+    if invoice_modes and errors:
+        print(
+            "\n"
+            + "=" * 60
+            + "\nStopping: CommerceHub invoice reports (Phase 0) did not complete.\n"
+            "Later phases are skipped until this is fixed (e.g. git pull, then Inventory Submissions\\Install-Deps.bat).\n"
+            + "=" * 60
+        )
+        print("\nCompleted with errors:")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
 
     if phase1_left or phase1_right:
         errors.extend(

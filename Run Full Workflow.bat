@@ -11,7 +11,7 @@ if not "%~1"=="" goto RUN
 
 echo.
 echo Which steps to run? ^(keyboard — no Enter needed^)
-echo   1  All Steps ^(invoice all: Depot+Lowe's+Tractor, then CH+SPS inventories parallel, then tracking parallel + Grainger^)
+echo   1  All Steps ^(invoice: CH Depot+Lowe's parallel w/ SPS Tractor; then CH+SPS inventories parallel; tracking + Grainger^)
 echo   2  Depot Tracking and Invoicing
 echo   3  Lowe's Tracking and Invoicing
 echo   4  Commercehub and SPS Inventory + Depot Tracking Invoicing
@@ -26,11 +26,12 @@ echo   C  Grainger ALL
 echo   D  Depot Invoice Report only
 echo   E  Lowe's Invoice Report only
 echo   F  Tractor Supply Invoice Report only
-echo   I  Invoice Reports only ^(all three: Depot + Lowe's + Tractor^)
+echo   I  Invoice Reports only ^(all: parallel CH Depot+Lowe's + SPS Tractor^)
 echo.
 echo Invoice reports need the CommerceHub invoice export project ^(commercehub_invoice_export.py^):
 echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole project there^).
 echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
+echo   Other PC: git pull, then run Inventory Submissions\Install-Deps.bat ^(adds pandas etc. for invoice phase^).
 echo.
 REM Order must match choice string for errorlevels ^(first char = 1, last = 16^).
 choice /C 123456789ABCDEFI /N /M "Press 1-9, A-C, D-F, or I: "

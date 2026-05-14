@@ -419,10 +419,10 @@ def dedupe_po_lines(df: pd.DataFrame) -> pd.DataFrame:
             if n is None:
                 continue
             if n == 1:
-                df.at[ix, line_col] = 1
+                df.at[ix, line_col] = "1"
             else:
-                df.at[ix, line_col] = 0
-                df.at[ix, total_col] = 0
+                df.at[ix, line_col] = "0"
+                df.at[ix, total_col] = "0"
 
     df[line_col] = pd.to_numeric(df[line_col], errors="coerce").fillna(0).astype(int)
     df[total_col] = pd.to_numeric(

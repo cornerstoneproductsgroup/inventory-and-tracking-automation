@@ -1,8 +1,9 @@
 """
 Automate CommerceHub (Rithum) DSM and SPS Commerce (Tractor Supply): invoicing flows with an interactive menu.
 
-On run, choose: (1) All — Depot + Lowe's + Tractor Supply, (2) Depot only, (3) Lowe's only, (4) Tractor Supply (SPS).
-Optional CLI: ``python commercehub_invoice_export.py 2`` or env ``COMMERCEHUB_MENU_CHOICE=1`` for Task Scheduler.
+On run, choose: (1) All — parallel: CommerceHub (Depot + Lowe's, one browser) and SPS Tractor Supply (second browser);
+(2) Depot only, (3) Lowe's only, (4) Tractor Supply (SPS), (5) Depot + Lowe's on CommerceHub only.
+Optional CLI: ``python commercehub_invoice_export.py retail`` or env ``COMMERCEHUB_MENU_CHOICE=1`` (all) / ``5`` (retail).
 
 Requires: pip install -r requirements.txt && playwright install chromium
 
@@ -80,24 +81,25 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-_MENU_KEYS = {"1": "all", "2": "depot", "3": "lowes", "4": "tractor"}
+_MENU_KEYS = {"1": "all", "2": "depot", "3": "lowes", "4": "tractor", "5": "retail"}
 
 
 def prompt_run_menu() -> str:
     print()
     print("Select invoicing run:")
-    print("  1 - Run All Invoicing")
-    print("  2 - Depot Invoicing")
-    print("  3 - Lowe's Invoicing")
-    print("  4 - Tractor Supply Invoicing")
+    print("  1 - All (parallel: CommerceHub Depot+Lowe's, and SPS Tractor)")
+    print("  2 - Depot only (CommerceHub)")
+    print("  3 - Lowe's only (CommerceHub)")
+    print("  4 - Tractor Supply only (SPS Commerce)")
+    print("  5 - Depot + Lowe's only (CommerceHub, one browser)")
     print()
     while True:
-        choice = input("Enter choice (1-4): ").strip().lower()
+        choice = input("Enter choice (1-5): ").strip().lower()
         if choice in _MENU_KEYS:
             return _MENU_KEYS[choice]
-        if choice in ("all", "depot", "lowes", "tractor"):
+        if choice in ("all", "depot", "lowes", "tractor", "retail"):
             return choice
-        print("Invalid choice — enter 1, 2, 3, or 4.", flush=True)
+        print("Invalid choice — enter 1, 2, 3, 4, or 5.", flush=True)
 
 
 def resolve_run_mode(argv: list[str]) -> str:
@@ -108,7 +110,7 @@ def resolve_run_mode(argv: list[str]) -> str:
         return _MENU_KEYS[env_c]
     for a in argv:
         s = a.strip().lower()
-        if s in ("all", "depot", "lowes", "tractor"):
+        if s in ("all", "depot", "lowes", "tractor", "retail"):
             return s
         if s in _MENU_KEYS:
             return _MENU_KEYS[s]
@@ -118,7 +120,12 @@ def resolve_run_mode(argv: list[str]) -> str:
 def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name, default)
     if v is None or v.strip() == "":
-        raise RuntimeError(f"Missing required environment variable: {name}")
+        example = _SCRIPT_DIR / ".env.example"
+        if not _ENV_FILE.is_file():
+            extra = f" Create {_ENV_FILE} (copy from {example})."
+        else:
+            extra = f" Add {name} to {_ENV_FILE} (see {example})."
+        raise RuntimeError(f"Missing required environment variable: {name}.{extra}")
     return v.strip()
 
 
@@ -649,10 +656,81 @@ async def _run_sps_tractor_phase(
     return out
 
 
+async def _run_tractor_standalone_browser(
+    *,
+    download_dir: Path,
+    headless: bool,
+    report_day: date,
+) -> Path | None:
+    """SPS Tractor Supply in its own Chromium instance (parallel with CommerceHub when mode is ``all``)."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=sps_chromium_launch_args(),
+        )
+        context = await browser.new_context(accept_downloads=True)
+        try:
+            return await _run_sps_tractor_phase(
+                context,
+                nav_timeout_ms=NAV_TIMEOUT_MS,
+                report_day=report_day,
+                download_dir=download_dir,
+            )
+        except Exception:
+            await _failure_screenshot(context, None)
+            raise
+        finally:
+            await context.close()
+            await browser.close()
+            _log("SPS Tractor browser closed.")
+
+
+async def _run_commercehub_invoice_browser(
+    *,
+    run_depot: bool,
+    run_lowes: bool,
+    download_dir: Path,
+    headless: bool,
+    report_day: date,
+) -> tuple[Path | None, Path | None]:
+    """One CommerceHub session: optional Depot and/or Lowe's flows on the same ``page``."""
+    if not run_depot and not run_lowes:
+        return None, None
+    username = _env("COMMERCEHUB_USERNAME")
+    password = _env("COMMERCEHUB_PASSWORD")
+    profile_text = os.environ.get("COMMERCEHUB_PROFILE_TEXT", "Cornerstone Products Group")
+    profile_url = (os.environ.get("COMMERCEHUB_PROFILE_URL") or "").strip() or None
+
+    depot_path: Path | None = None
+    lowes_path: Path | None = None
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=sps_chromium_launch_args(),
+        )
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        try:
+            await _login(page, username, password)
+            await _pick_profile(page, profile_text.strip(), profile_url)
+            if run_depot:
+                depot_path = await _run_depot_invoice_flow(page, download_dir, report_day)
+            if run_lowes:
+                lowes_path = await _run_lowes_invoice_flow(page, download_dir, report_day)
+            return depot_path, lowes_path
+        except Exception:
+            await _failure_screenshot(context, page)
+            raise
+        finally:
+            await context.close()
+            await browser.close()
+            _log("CommerceHub browser closed.")
+
+
 async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path | None]:
     load_project_dotenv()
     mode = mode.strip().lower()
-    allowed = frozenset({"all", "depot", "lowes", "tractor"})
+    allowed = frozenset({"all", "depot", "lowes", "tractor", "retail"})
     if mode not in allowed:
         raise ValueError(f"Invalid run mode {mode!r}; expected one of {sorted(allowed)}")
 
@@ -662,79 +740,70 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
         f"LOGIN={LOGIN_TIMEOUT_MS} DOWNLOAD={DOWNLOAD_TIMEOUT_MS} LIST_SETTLE={LIST_SETTLE_MS}"
     )
 
-    run_depot = mode in ("all", "depot")
-    run_lowes = mode in ("all", "lowes")
-    run_sps = mode in ("all", "tractor")
-
     download_dir = Path(os.environ.get("COMMERCEHUB_DOWNLOAD_DIR", "./downloads")).resolve()
     headless = os.environ.get("COMMERCEHUB_HEADLESS", "true").lower() in ("1", "true", "yes")
     report_day = previous_business_day()
 
     if mode == "tractor":
-        tractor_path: Path | None = None
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=sps_chromium_launch_args(),
-            )
-            context = await browser.new_context(accept_downloads=True)
-            try:
-                tractor_path = await _run_sps_tractor_phase(
-                    context,
-                    nav_timeout_ms=NAV_TIMEOUT_MS,
-                    report_day=report_day,
-                    download_dir=download_dir,
-                )
-            except Exception:
-                await _failure_screenshot(context, None)
-                raise
-            finally:
-                await context.close()
-                await browser.close()
-                _log("Browser closed.")
+        tractor_path = await _run_tractor_standalone_browser(
+            download_dir=download_dir,
+            headless=headless,
+            report_day=report_day,
+        )
         return (None, None, tractor_path)
 
-    username = _env("COMMERCEHUB_USERNAME")
-    password = _env("COMMERCEHUB_PASSWORD")
-    profile_text = os.environ.get("COMMERCEHUB_PROFILE_TEXT", "Cornerstone Products Group")
-    profile_url = (os.environ.get("COMMERCEHUB_PROFILE_URL") or "").strip() or None
-
-    depot_path: Path | None = None
-    lowes_path: Path | None = None
-    tractor_path: Path | None = None
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=sps_chromium_launch_args(),
+    if mode == "all":
+        _log(
+            "Parallel: CommerceHub (Depot then Lowe's, one browser) + "
+            "SPS Commerce / Tractor Supply (second browser)."
         )
-        context = await browser.new_context(accept_downloads=True)
-        page = await context.new_page()
+        (depot_path, lowes_path), tractor_path = await asyncio.gather(
+            _run_commercehub_invoice_browser(
+                run_depot=True,
+                run_lowes=True,
+                download_dir=download_dir,
+                headless=headless,
+                report_day=report_day,
+            ),
+            _run_tractor_standalone_browser(
+                download_dir=download_dir,
+                headless=headless,
+                report_day=report_day,
+            ),
+        )
+        return depot_path, lowes_path, tractor_path
 
-        try:
-            await _login(page, username, password)
-            await _pick_profile(page, profile_text.strip(), profile_url)
+    if mode == "retail":
+        d, l = await _run_commercehub_invoice_browser(
+            run_depot=True,
+            run_lowes=True,
+            download_dir=download_dir,
+            headless=headless,
+            report_day=report_day,
+        )
+        return d, l, None
 
-            if run_depot:
-                depot_path = await _run_depot_invoice_flow(page, download_dir, report_day)
-            if run_lowes:
-                lowes_path = await _run_lowes_invoice_flow(page, download_dir, report_day)
-            if run_sps:
-                tractor_path = await _run_sps_tractor_phase(
-                    context,
-                    nav_timeout_ms=NAV_TIMEOUT_MS,
-                    report_day=report_day,
-                    download_dir=download_dir,
-                )
+    if mode == "depot":
+        d, l = await _run_commercehub_invoice_browser(
+            run_depot=True,
+            run_lowes=False,
+            download_dir=download_dir,
+            headless=headless,
+            report_day=report_day,
+        )
+        return d, l, None
 
-            return depot_path, lowes_path, tractor_path
-        except Exception:
-            await _failure_screenshot(context, page)
-            raise
-        finally:
-            await context.close()
-            await browser.close()
-            _log("Browser closed.")
+    if mode == "lowes":
+        d, l = await _run_commercehub_invoice_browser(
+            run_depot=False,
+            run_lowes=True,
+            download_dir=download_dir,
+            headless=headless,
+            report_day=report_day,
+        )
+        return d, l, None
+
+    raise AssertionError(f"unhandled mode {mode!r}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -748,7 +817,7 @@ def main(argv: list[str] | None = None) -> None:
             _log(f"Done Lowe's: {lowes_out}")
         if tractor_out is not None:
             _log(f"Done Tractor Supply: {tractor_out}")
-        elif mode == "tractor":
+        elif mode in ("tractor", "all") and tractor_out is None:
             _log("Tractor Supply (SPS): finished — no invoices for the report day (0 results).")
     except Exception as e:  # noqa: BLE001 — surface any failure to scheduler logs
         _log(f"ERROR: {e}")
