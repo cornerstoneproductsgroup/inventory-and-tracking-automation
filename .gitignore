@@ -1,0 +1,24 @@
+# Python (repo root and subfolders)
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+.env
+
+# SPS Playwright session (machine-specific; never commit)
+**/sps_playwright_storage.json
+
+# Bundled invoice report app — same repo as the rest: commit source + requirements.txt on main;
+# do not commit secrets, venv, or browser session dirs (other PCs: pull once, then local .venv + .env).
+# If this folder ever contains a nested .git from an old copy, delete that .git folder or git will treat it as a submodule.
+invoice report/.env
+invoice report/.venv/
+invoice report/venv/
+invoice report/__pycache__/
+invoice report/.pytest_cache/
+invoice report/downloads/
+invoice report/*.log
+invoice report/playwright/.auth/
+invoice report/debug_*.png

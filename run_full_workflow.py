@@ -2,8 +2,8 @@
 Orchestrates the full daily workflow.
 
 Phases (default):
-  0 — CommerceHub invoice reports (sibling project), first. Default mode is ``all`` (Depot + Lowe's +
-      Tractor Supply in one exporter run). Override with ``--invoice-report-modes depot lowes`` etc.
+  0 — CommerceHub invoice reports first. The exporter folder is auto-detected (see
+      ``discover_invoice_report_directory``): CLI/env, then ``<repo>/invoice report``, then other paths.
   1 — Inventories in parallel when both sides run: Rithum inventory (CommerceHub) and
       Tractor Supply inventory (SPS), each in its own browser.
   2 — Tracking / invoicing in parallel when both sides run: Depot + Lowe's (CommerceHub) and
@@ -35,8 +35,55 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 INVENTORY_DIR = ROOT / "Inventory Submissions"
 LOWES_DIR = ROOT / "Lowe's Tracking Automation"
-DEFAULT_INVOICE_REPORT_DIR = ROOT.parent / "CommerceHub Invoice Report (Depot and Lowe's)"
+_INVOICE_REPORT_FOLDER = "CommerceHub Invoice Report (Depot and Lowe's)"
+_INVOICE_REPORT_FOLDER_IN_REPO = "invoice report"
+_INVOICE_EXPORT_SCRIPT = "commercehub_invoice_export.py"
 _INVOICE_EXPORT_MODES = frozenset({"all", "depot", "lowes", "tractor"})
+
+
+def discover_invoice_report_directory(cli_dir: Path | None) -> tuple[Path, list[Path]]:
+    """
+    Find the folder that contains commercehub_invoice_export.py.
+
+    Tries in order: --invoice-report-dir, COMMERCEHUB_INVOICE_REPORT_DIR,
+    ``<repo>/invoice report`` (copy of the invoice app inside this repo),
+    ``<repo>/CommerceHub Invoice Report (Depot and Lowe's)`` (nested),
+    ``<parent>/CommerceHub Invoice Report (Depot and Lowe's)`` (sibling of repo).
+    """
+    candidates: list[Path] = []
+    if cli_dir is not None:
+        candidates.append(cli_dir.expanduser())
+    env_raw = (os.environ.get("COMMERCEHUB_INVOICE_REPORT_DIR") or "").strip()
+    if env_raw:
+        candidates.append(Path(env_raw).expanduser())
+    candidates.append(ROOT / _INVOICE_REPORT_FOLDER_IN_REPO)
+    candidates.append(ROOT / _INVOICE_REPORT_FOLDER)
+    candidates.append(ROOT.parent / _INVOICE_REPORT_FOLDER)
+
+    seen: set[str] = set()
+    tried_resolved: list[Path] = []
+    for raw in candidates:
+        try:
+            p = raw.expanduser().resolve()
+        except Exception:
+            p = raw.expanduser()
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tried_resolved.append(p)
+        try:
+            if p.is_dir() and (p / _INVOICE_EXPORT_SCRIPT).is_file():
+                return p, tried_resolved
+        except OSError:
+            continue
+
+    fallback = (
+        tried_resolved[0]
+        if tried_resolved
+        else (ROOT / _INVOICE_REPORT_FOLDER_IN_REPO)
+    )
+    return fallback, tried_resolved
 
 
 def _normalize_invoice_report_modes(raw: list[str] | None) -> list[str]:
@@ -266,7 +313,11 @@ def main() -> int:
         "--invoice-report-dir",
         type=Path,
         default=None,
-        help=f"Folder with commercehub_invoice_export.py (default: {DEFAULT_INVOICE_REPORT_DIR}).",
+        help=(
+            "Folder with commercehub_invoice_export.py. If omitted, searches: "
+            "COMMERCEHUB_INVOICE_REPORT_DIR, then <repo>/CommerceHub Invoice Report…, "
+            "then <parent>/CommerceHub Invoice Report…"
+        ),
     )
     parser.add_argument(
         "--invoice-report-modes",
@@ -305,9 +356,7 @@ def main() -> int:
     run_grainger_all = bool(args.run_grainger_all) or grainger_only
     sequential_lanes = bool(args.sequential_lanes)
     skip_invoice_report = bool(args.skip_invoice_report)
-    invoice_report_dir = args.invoice_report_dir or Path(
-        os.environ.get("COMMERCEHUB_INVOICE_REPORT_DIR", str(DEFAULT_INVOICE_REPORT_DIR))
-    )
+    invoice_report_dir, invoice_search_tried = discover_invoice_report_directory(args.invoice_report_dir)
 
     if grainger_only:
         skip_commercehub = True
@@ -561,9 +610,16 @@ def main() -> int:
     if invoice_modes:
         export_script = invoice_report_dir / "commercehub_invoice_export.py"
         if not export_script.is_file():
+            checked = "\n".join(f"  - {p}" for p in invoice_search_tried) if invoice_search_tried else "  (none)"
             msg = (
-                f"Invoice report script not found ({export_script}); "
-                "skipping phase 0. Use --invoice-report-dir or set COMMERCEHUB_INVOICE_REPORT_DIR."
+                f"Invoice report script not found:\n  {export_script}\n"
+                f"Checked locations:\n{checked}\n"
+                "Fix: copy the invoice report project into this repo as \"invoice report\", or use the full folder name:\n"
+                f"  {ROOT / _INVOICE_REPORT_FOLDER_IN_REPO}  (recommended)\n"
+                f"  {ROOT / _INVOICE_REPORT_FOLDER}\n"
+                f"  or next to the repo: {ROOT.parent / _INVOICE_REPORT_FOLDER}\n"
+                "  or set environment variable COMMERCEHUB_INVOICE_REPORT_DIR to that folder, "
+                "or pass --invoice-report-dir on the command line."
             )
             print(f"\nWARN: {msg}")
             errors.append(msg)

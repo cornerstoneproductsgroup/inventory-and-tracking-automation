@@ -1,0 +1,760 @@
+"""
+Automate CommerceHub (Rithum) DSM and SPS Commerce (Tractor Supply): invoicing flows with an interactive menu.
+
+On run, choose: (1) All — Depot + Lowe's + Tractor Supply, (2) Depot only, (3) Lowe's only, (4) Tractor Supply (SPS).
+Optional CLI: ``python commercehub_invoice_export.py 2`` or env ``COMMERCEHUB_MENU_CHOICE=1`` for Task Scheduler.
+
+Requires: pip install -r requirements.txt && playwright install chromium
+
+Secrets: copy .env.example to .env (see python-dotenv).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import sys
+import traceback
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
+
+from commercehub_previous_business_day import format_criteria_datetime, previous_business_day
+from depot_invoice_postprocess import process_invoice_download, save_tractor_supply_csv
+from sps_commerce_flow import (
+    load_sps_env_from_inventory_project,
+    run_sps_tractor_transactions_and_advanced_search,
+    sps_chromium_launch_args,
+)
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_FILE = _SCRIPT_DIR / ".env"
+
+
+def load_project_dotenv() -> None:
+    """Load ``.env`` from this script's folder (not cwd — shortcuts / Task Scheduler often use another cwd)."""
+    load_dotenv(_ENV_FILE)
+
+
+load_project_dotenv()
+
+
+def _ms(env_name: str, default: int) -> int:
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1_000, int(raw))
+    except ValueError:
+        return default
+
+
+# Milliseconds — increase on slow Rithum days via .env (see .env.example).
+NAV_TIMEOUT_MS = _ms("COMMERCEHUB_NAV_TIMEOUT_MS", 240_000)  # full page / Order Search → criteria
+STEP_TIMEOUT_MS = _ms("COMMERCEHUB_STEP_TIMEOUT_MS", 180_000)  # large UI blocks, results, export modal
+LOGIN_TIMEOUT_MS = _ms("COMMERCEHUB_LOGIN_TIMEOUT_MS", 180_000)  # post-password / profile shell
+DOWNLOAD_TIMEOUT_MS = _ms("COMMERCEHUB_DOWNLOAD_TIMEOUT_MS", 600_000)  # generate + download export
+LIST_SETTLE_MS = _ms("COMMERCEHUB_SAVED_SEARCH_LIST_SETTLE_MS", 3_500)  # saved-search list paint delay
+
+HOME_URL = "https://dsm.commercehub.com/dsm/gotoHome.do"
+
+# Lowe's saved search (execute); override with COMMERCEHUB_LOWE_SAVED_SEARCH_URL if id/name differs.
+LOWE_SAVED_SEARCH_URL_DEFAULT = (
+    "https://dsm.commercehub.com/dsm/executeSavedSearch.do?"
+    "standard=false&name=Lowe%26apos%3Bs+Invoice+Batch+Print+by+Date&id=107248005"
+)
+
+_LOG_PATH = Path(__file__).resolve().parent / "commercehub_run.log"
+
+
+def _log(msg: str) -> None:
+    line = f"{datetime.now(timezone.utc).isoformat()} {msg}\n"
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(line)
+    print(msg, flush=True)
+
+
+_MENU_KEYS = {"1": "all", "2": "depot", "3": "lowes", "4": "tractor"}
+
+
+def prompt_run_menu() -> str:
+    print()
+    print("Select invoicing run:")
+    print("  1 - Run All Invoicing")
+    print("  2 - Depot Invoicing")
+    print("  3 - Lowe's Invoicing")
+    print("  4 - Tractor Supply Invoicing")
+    print()
+    while True:
+        choice = input("Enter choice (1-4): ").strip().lower()
+        if choice in _MENU_KEYS:
+            return _MENU_KEYS[choice]
+        if choice in ("all", "depot", "lowes", "tractor"):
+            return choice
+        print("Invalid choice — enter 1, 2, 3, or 4.", flush=True)
+
+
+def resolve_run_mode(argv: list[str]) -> str:
+    """CLI arg, COMMERCEHUB_MENU_CHOICE, or interactive menu."""
+    load_project_dotenv()
+    env_c = (os.environ.get("COMMERCEHUB_MENU_CHOICE") or "").strip()
+    if env_c in _MENU_KEYS:
+        return _MENU_KEYS[env_c]
+    for a in argv:
+        s = a.strip().lower()
+        if s in ("all", "depot", "lowes", "tractor"):
+            return s
+        if s in _MENU_KEYS:
+            return _MENU_KEYS[s]
+    return prompt_run_menu()
+
+
+def _env(name: str, default: str | None = None) -> str:
+    v = os.environ.get(name, default)
+    if v is None or v.strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return v.strip()
+
+
+_POST_LOGIN_SELECTOR = 'a.application-identity-item, [data-test="dsmMenu-orders"]'
+
+
+async def _login(page, username: str, password: str) -> None:
+    _log("Opening CommerceHub login page…")
+    await page.goto(HOME_URL, wait_until="domcontentloaded")
+
+    await page.locator("#username").wait_for(state="visible", timeout=60_000)
+    _log("Entering username…")
+    await page.locator("#username").fill(username)
+    await page.locator("button._button-login-id, button[data-action-button-primary='true']").first.click()
+
+    await page.locator("#password").wait_for(state="visible", timeout=60_000)
+    _log("Entering password…")
+    await page.locator("#password").fill(password)
+    await page.locator("button._button-login-password").click()
+
+    # Full-page redirects here destroy the JS context; do not poll locator.count() mid-navigation.
+    _log("Submitted credentials; waiting for sign-in to finish (profile chooser or home)…")
+    try:
+        await page.wait_for_selector(_POST_LOGIN_SELECTOR, state="visible", timeout=LOGIN_TIMEOUT_MS)
+    except PlaywrightTimeout:
+        snap = Path(__file__).resolve().parent / "debug_login_timeout.png"
+        await page.screenshot(path=str(snap), full_page=True)
+        raise RuntimeError(
+            "Timed out after username/password: never reached home menu or profile chooser. "
+            f"Screenshot: {snap}"
+        ) from None
+
+    home_shell = page.locator('[data-test="dsmMenu-orders"]').first
+    profile_row = page.locator("a.application-identity-item").first
+    try:
+        await profile_row.wait_for(state="visible", timeout=3_000)
+        _log("Sign-in complete: profile chooser is visible.")
+    except PlaywrightTimeout:
+        await home_shell.wait_for(state="visible", timeout=45_000)
+        _log("Sign-in complete: home shell loaded (Orders menu).")
+
+
+async def _pick_profile(page, profile_text: str, profile_url: str | None) -> None:
+    if profile_url:
+        _log("Opening profile via COMMERCEHUB_PROFILE_URL")
+        await page.goto(profile_url, wait_until="domcontentloaded")
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.locator('[data-test="dsmMenu-orders"]').first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        return
+
+    needle = profile_text.strip()
+    if not needle:
+        raise RuntimeError("COMMERCEHUB_PROFILE_TEXT is empty; set it or use COMMERCEHUB_PROFILE_URL.")
+
+    home_shell = page.locator('[data-test="dsmMenu-orders"]').first
+    # Search lives under Orders; the link is often hidden until the menu opens — do not use it as "home ready".
+    # Identity picker uses these anchors (see Rithum / CommerceHub DSM HTML).
+    profile_link = page.locator("a.application-identity-item").filter(
+        has_text=re.compile(re.escape(needle), re.I)
+    )
+
+    _log("Choosing DSM profile (skip if already on home)…")
+    try:
+        await home_shell.wait_for(state="visible", timeout=5_000)
+        _log("Already on home; no profile click needed.")
+        return
+    except PlaywrightTimeout:
+        pass
+
+    try:
+        await profile_link.first.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+    except PlaywrightTimeout:
+        try:
+            await home_shell.wait_for(state="visible", timeout=5_000)
+            _log("Home loaded while waiting for profile row; no profile click needed.")
+            return
+        except PlaywrightTimeout:
+            snap = Path(__file__).resolve().parent / "debug_profile_timeout.png"
+            await page.screenshot(path=str(snap), full_page=True)
+            raise RuntimeError(
+                f"Could not find profile row matching {needle!r}. Screenshot: {snap}. "
+                "Set COMMERCEHUB_PROFILE_URL to the full handleLogin.do?identityKey=… link."
+            ) from None
+
+    _log(f"Clicking profile match for: {needle!r}")
+    try:
+        await profile_link.first.click()
+    except PlaywrightError as e:
+        if "Execution context was destroyed" not in str(e) and "navigation" not in str(e).lower():
+            raise
+        _log("Navigation after profile click; waiting for home…")
+
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await home_shell.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+    _log("Profile selected; DSM home ready.")
+
+
+async def _open_order_search(page) -> None:
+    direct = (os.environ.get("COMMERCEHUB_ORDER_SEARCH_URL") or "").strip()
+    if direct:
+        await page.goto(direct, wait_until="domcontentloaded")
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        return
+
+    _log("Opening Orders menu, then Search…")
+    orders = page.locator('[data-test="dsmMenu-orders"]').first
+    await orders.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    await orders.hover()
+    await asyncio.sleep(0.35)
+
+    search = page.locator('a[data-test="dsmMenu-orders-search"]')
+    try:
+        await search.first.wait_for(state="visible", timeout=5_000)
+    except PlaywrightTimeout:
+        _log("Search not visible after hover; clicking Orders…")
+        await orders.click()
+        await asyncio.sleep(0.35)
+
+    await search.first.wait_for(state="visible", timeout=30_000)
+    await search.first.click()
+    _log("Waiting for Order Search / criteria page after Search click…")
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+
+async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
+    """
+    Orders → Search often opens a saved-search list. Pick the named search before criteria/results.
+    """
+    if (os.environ.get("COMMERCEHUB_SKIP_SAVED_SEARCH_LIST") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        _log("Skipping saved-search list (COMMERCEHUB_SKIP_SAVED_SEARCH_LIST).")
+        return
+
+    name = (saved_search_name or "").strip()
+    if not name:
+        _log("COMMERCEHUB_SAVED_SEARCH_NAME is empty; skip saved-search list step.")
+        return
+
+    _log(f"Waiting {LIST_SETTLE_MS} ms for saved-search list to render…")
+    await asyncio.sleep(LIST_SETTLE_MS / 1000.0)
+
+    op = page.locator("#Operator1")
+    results = page.locator('a[href*="sortSearchResults.do"]')
+    search_btn = page.locator('button[data-test="Search"]')
+
+    try:
+        await op.first.wait_for(state="visible", timeout=5_000)
+        _log("Already on criteria form; no saved search to click.")
+        return
+    except PlaywrightTimeout:
+        pass
+    try:
+        await results.first.wait_for(state="visible", timeout=4_000)
+        _log("Already on search results; no saved search to click.")
+        return
+    except PlaywrightTimeout:
+        pass
+    try:
+        await search_btn.first.wait_for(state="visible", timeout=4_000)
+        _log("Criteria page has Search button; no saved-search list step.")
+        return
+    except PlaywrightTimeout:
+        pass
+
+    _log(f"Selecting saved search matching: {name!r}")
+    rx = re.compile(re.escape(name), re.I)
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        _log(f"Saved-search pick attempt {attempt}/3…")
+        try:
+            by_role = page.get_by_role("link", name=rx)
+            await by_role.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await by_role.first.scroll_into_view_if_needed()
+            await asyncio.sleep(0.35)
+            await by_role.first.click(timeout=STEP_TIMEOUT_MS)
+            last_err = None
+            break
+        except PlaywrightTimeout as e:
+            last_err = e
+        except PlaywrightError as e:
+            last_err = e
+
+        try:
+            row_link = page.locator("tr").filter(has_text=rx).locator("a").first
+            await row_link.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await row_link.scroll_into_view_if_needed()
+            await asyncio.sleep(0.35)
+            await row_link.click(timeout=STEP_TIMEOUT_MS)
+            last_err = None
+            break
+        except PlaywrightTimeout as e:
+            last_err = e
+        except PlaywrightError as e:
+            last_err = e
+
+        try:
+            loose = page.locator("a").filter(has_text=rx).first
+            await loose.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await loose.scroll_into_view_if_needed()
+            await asyncio.sleep(0.35)
+            await loose.click(timeout=STEP_TIMEOUT_MS)
+            last_err = None
+            break
+        except PlaywrightTimeout as e:
+            last_err = e
+        except PlaywrightError as e:
+            last_err = e
+
+        await asyncio.sleep(0.8)
+
+    if last_err is not None:
+        snap = Path(__file__).resolve().parent / "debug_saved_search_list.png"
+        await page.screenshot(path=str(snap), full_page=True)
+        raise RuntimeError(
+            f"Could not click saved search matching {name!r} after 3 tries. Last error: {last_err!r}. "
+            f"Screenshot: {snap}. Set COMMERCEHUB_SAVED_SEARCH_NAME to the exact list label, or "
+            "COMMERCEHUB_ORDER_SEARCH_URL to open this search directly."
+        ) from last_err
+
+    _log("Waiting for selected search to load (criteria or results)…")
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await page.wait_for_selector(
+        '#Operator1, a[href*="sortSearchResults.do"], button[data-test="Search"]',
+        state="visible",
+        timeout=NAV_TIMEOUT_MS,
+    )
+    _log("Saved search is open.")
+
+
+async def _ensure_invoice_criteria_form(page) -> None:
+    """
+    Order Search sometimes resumes on Search Results (no #Operator1). From there,
+    open Search Criteria so date filters can be applied.
+    """
+    op = page.locator("#Operator1")
+    try:
+        await op.wait_for(state="visible", timeout=10_000)
+        _log("Invoice criteria form already open.")
+        return
+    except PlaywrightTimeout:
+        _log("Criteria form (#Operator1) not visible yet; checking for Search Results…")
+
+    results_marker = page.locator('a[href*="sortSearchResults.do"]')
+    on_results = False
+    try:
+        await results_marker.first.wait_for(state="visible", timeout=5_000)
+        on_results = await results_marker.first.is_visible()
+    except PlaywrightTimeout:
+        on_results = False
+
+    if not on_results:
+        _log("No sortSearchResults link; waiting longer for criteria form…")
+        await op.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        return
+
+    _log("On Search Results; navigating to Search Criteria to set dates…")
+    criteria_link = (
+        page.get_by_role("link", name=re.compile(r"search\s+criteria", re.I))
+        .or_(page.locator('a[href*="searchCriteria"]'))
+        .or_(page.locator('a[href*="SearchCriteria"]'))
+        .or_(page.locator('a[href*="displaySearchCriteria"]'))
+        .or_(page.locator('a[href*="editSearch"]'))
+    )
+    try:
+        await criteria_link.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    except PlaywrightTimeout:
+        snap = Path(__file__).resolve().parent / "debug_no_criteria_link.png"
+        await page.screenshot(path=str(snap), full_page=True)
+        raise RuntimeError(
+            "On Search Results but could not find a Search Criteria link to edit filters. "
+            f"Screenshot: {snap}. Set COMMERCEHUB_ORDER_SEARCH_URL to the criteria page URL if needed."
+        ) from None
+
+    await criteria_link.first.click()
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await op.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+    _log("Search Criteria form is open.")
+
+
+async def _set_invoice_criteria(page, report_day) -> None:
+    await _ensure_invoice_criteria_form(page)
+    await page.locator("#Operator1").select_option("DT_GTE")
+    await page.locator("#Operator2").select_option("DT_LTE")
+
+    start_s = format_criteria_datetime(report_day, end_of_day=False)
+    end_s = format_criteria_datetime(report_day, end_of_day=True)
+
+    await page.locator("#Edit1").fill(start_s)
+    await page.locator("#Edit2").fill(end_s)
+
+    # Open end-date calendar and force 11 PM (value 23) per CommerceHub UI.
+    # Prefer DSM's stable id; tr:has(#Edit2) can match both row calendars (strict mode violation).
+    end_cal = page.locator("#Edit2CalendarIcon")
+    if await end_cal.count() == 0:
+        end_cal = page.locator("img.icon-calendar").nth(1)
+    await end_cal.click()
+    await page.locator("#hourSelect").wait_for(state="visible", timeout=25_000)
+    await page.locator("#hourSelect").select_option("23")
+    for label in ("OK", "Done", "Apply", "Set"):
+        btn = page.get_by_role("button", name=re.compile(f"^{label}$", re.I))
+        if await btn.count():
+            await btn.first.click()
+            break
+    else:
+        await page.keyboard.press("Escape")
+
+
+async def _run_search(page) -> None:
+    await page.locator('button[data-test="Search"]').click()
+    _log("Waiting for search results…")
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+
+async def _sort_by_po_number(page) -> None:
+    _log("Sorting results by PO Number (Order)…")
+    link = (
+        page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
+        .filter(has_text=re.compile(r"PO\s+Number", re.I))
+        .first
+    )
+    await link.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    await link.click()
+    await page.wait_for_load_state("domcontentloaded", timeout=STEP_TIMEOUT_MS)
+
+
+async def _open_lowes_saved_search(page) -> None:
+    url = (os.environ.get("COMMERCEHUB_LOWE_SAVED_SEARCH_URL") or "").strip()
+    if not url:
+        url = LOWE_SAVED_SEARCH_URL_DEFAULT
+    _log("Opening Lowe's saved invoice search…")
+    await page.goto(url, wait_until="domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+
+def _frames_main_first(pg) -> list:
+    """Prefer main frame when scanning for export dialog (often in popup or iframe)."""
+    frames = list(pg.frames)
+    mf = pg.main_frame
+    out = [mf] + [f for f in frames if f is not mf]
+    return out
+
+
+async def _frame_with_export_checkbox(pg) -> object:
+    """Return Frame (or Page.main_frame) that contains the export modal fields."""
+    for fr in _frames_main_first(pg):
+        try:
+            await fr.locator('input[name="includeCurrencyCode"]').wait_for(
+                state="visible", timeout=5_000
+            )
+            return fr
+        except PlaywrightTimeout:
+            continue
+    raise RuntimeError(
+        "Export dialog: could not find input[name=includeCurrencyCode] in any frame. "
+        "If CSV opens a new window, ensure popups are allowed for this site."
+    )
+
+
+async def _export_excel(
+    page, download_dir: Path, *, local_filename_stem: str | None = None
+) -> Path:
+    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV").first
+    await csv.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+
+    export_pg = None
+    async with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+        try:
+            async with page.expect_popup(timeout=STEP_TIMEOUT_MS) as pop_ev:
+                await csv.click()
+            export_pg = await pop_ev.value
+            await export_pg.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            _log("Export Search opened in a popup window.")
+        except PlaywrightTimeout:
+            # Click already ran; DSM often uses window.open for Export Search.
+            _log(
+                f"No popup within {STEP_TIMEOUT_MS // 1000}s after CSV click; "
+                "assuming export UI on this tab (iframes checked next)."
+            )
+
+        work_page = export_pg if export_pg is not None else page
+        if export_pg is None:
+            await asyncio.sleep(0.75)
+
+        root = await _frame_with_export_checkbox(work_page)
+
+        include_cc = root.locator('input[name="includeCurrencyCode"]')
+        await include_cc.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+        if await include_cc.is_checked():
+            await include_cc.uncheck()
+
+        excel = root.locator('input[name="excel"]')
+        if not await excel.is_checked():
+            await excel.check()
+
+        await root.locator('input[data-test="form-export-button"]').click()
+
+    download = await dl_info.value
+    download_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(download.suggested_filename).suffix or ".csv"
+    if local_filename_stem:
+        dest = download_dir / f"{local_filename_stem}{suffix}"
+    else:
+        dest = download_dir / download.suggested_filename
+    await download.save_as(str(dest))
+
+    if export_pg is not None:
+        try:
+            if not export_pg.is_closed():
+                await export_pg.close()
+        except Exception:
+            pass
+
+    return dest
+
+
+async def _failure_screenshot(context, page) -> None:
+    snap = Path(__file__).resolve().parent / "debug_failure.png"
+    candidates = []
+    if page is not None:
+        candidates.append(page)
+    for p in context.pages:
+        if p not in candidates:
+            candidates.append(p)
+    for tgt in candidates:
+        try:
+            if tgt.is_closed():
+                continue
+        except Exception:
+            continue
+        try:
+            await tgt.screenshot(path=str(snap), full_page=True)
+            _log(f"Failure screenshot: {snap}")
+            return
+        except Exception:
+            continue
+    _log("Could not capture failure screenshot.")
+
+
+async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path:
+    _log("Depot invoicing: Order Search → saved search → export…")
+    await _open_order_search(page)
+    _default_saved = "Home Depot Invoice Batch Print by Date"
+    if "COMMERCEHUB_SAVED_SEARCH_NAME" in os.environ:
+        saved_name = os.environ["COMMERCEHUB_SAVED_SEARCH_NAME"].strip()
+    else:
+        saved_name = _default_saved
+    await _maybe_select_saved_search(page, saved_name)
+    await _set_invoice_criteria(page, report_day)
+    await _run_search(page)
+    await _sort_by_po_number(page)
+    path = await _export_excel(page, download_dir, local_filename_stem="commercehub_depot")
+    _log(f"Downloaded export: {path}")
+    depot_path = process_invoice_download(path, report_day, "depot")
+    _log(f"Depot workbook: {depot_path}")
+    return depot_path
+
+
+async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path:
+    _log("Lowe's invoicing: Order Search → Lowe's saved search → export…")
+    await _open_order_search(page)
+    await _open_lowes_saved_search(page)
+    lowes_saved = (
+        os.environ.get("COMMERCEHUB_LOWE_SAVED_SEARCH_NAME")
+        or "Lowe's Invoice Batch Print by Date"
+    ).strip()
+    await _maybe_select_saved_search(page, lowes_saved)
+    await _set_invoice_criteria(page, report_day)
+    await _run_search(page)
+    await _sort_by_po_number(page)
+    path_l = await _export_excel(page, download_dir, local_filename_stem="commercehub_lowes")
+    _log(f"Downloaded Lowe's export: {path_l}")
+    lowes_path = process_invoice_download(path_l, report_day, "lowes")
+    _log(f"Lowe's workbook: {lowes_path}")
+    return lowes_path
+
+
+async def _run_sps_tractor_phase(
+    context,
+    *,
+    nav_timeout_ms: int,
+    report_day: date,
+    download_dir: Path,
+) -> Path | None:
+    load_project_dotenv()
+    load_sps_env_from_inventory_project(override=False)
+    sps_user = (os.environ.get("SPS_USERNAME") or "").strip()
+    sps_pass = (os.environ.get("SPS_PASSWORD") or "").strip()
+    _log(
+        f"SPS env check: project .env path={_ENV_FILE} (exists={_ENV_FILE.is_file()}), "
+        f"SPS_USERNAME={'set' if sps_user else 'EMPTY'}, SPS_PASSWORD={'set' if sps_pass else 'EMPTY'}."
+    )
+    if not sps_user or not sps_pass:
+        raise RuntimeError(
+            "SPS_USERNAME or SPS_PASSWORD is still empty after loading env. "
+            f"Put them in {_ENV_FILE} (exact names SPS_USERNAME and SPS_PASSWORD), "
+            "or set COMMERCEHUB_SPS_DOTENV to another .env that contains them."
+        )
+    raw = await run_sps_tractor_transactions_and_advanced_search(
+        context,
+        report_day=report_day,
+        download_dir=download_dir,
+        nav_timeout_ms=nav_timeout_ms,
+        download_timeout_ms=DOWNLOAD_TIMEOUT_MS,
+        log=_log,
+    )
+    if raw is None:
+        _log("Tractor Supply (SPS): no matching invoices for the report day — no report saved.")
+        return None
+    out = save_tractor_supply_csv(raw, report_day)
+    _log(f"Tractor Supply (SPS): saved {out}")
+    try:
+        from depot_excel_print import print_landscape_with_gridlines
+
+        print_landscape_with_gridlines(out)
+    except Exception as e:
+        import traceback
+
+        _log(f"[invoice:tractor] Excel print step failed (workbook was saved): {e}")
+        traceback.print_exc()
+    try:
+        raw.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return out
+
+
+async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path | None]:
+    load_project_dotenv()
+    mode = mode.strip().lower()
+    allowed = frozenset({"all", "depot", "lowes", "tractor"})
+    if mode not in allowed:
+        raise ValueError(f"Invalid run mode {mode!r}; expected one of {sorted(allowed)}")
+
+    _log(f"--- Run start (mode: {mode}) ---")
+    _log(
+        f"Timeouts (ms): NAV={NAV_TIMEOUT_MS} STEP={STEP_TIMEOUT_MS} "
+        f"LOGIN={LOGIN_TIMEOUT_MS} DOWNLOAD={DOWNLOAD_TIMEOUT_MS} LIST_SETTLE={LIST_SETTLE_MS}"
+    )
+
+    run_depot = mode in ("all", "depot")
+    run_lowes = mode in ("all", "lowes")
+    run_sps = mode in ("all", "tractor")
+
+    download_dir = Path(os.environ.get("COMMERCEHUB_DOWNLOAD_DIR", "./downloads")).resolve()
+    headless = os.environ.get("COMMERCEHUB_HEADLESS", "true").lower() in ("1", "true", "yes")
+    report_day = previous_business_day()
+
+    if mode == "tractor":
+        tractor_path: Path | None = None
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=headless,
+                args=sps_chromium_launch_args(),
+            )
+            context = await browser.new_context(accept_downloads=True)
+            try:
+                tractor_path = await _run_sps_tractor_phase(
+                    context,
+                    nav_timeout_ms=NAV_TIMEOUT_MS,
+                    report_day=report_day,
+                    download_dir=download_dir,
+                )
+            except Exception:
+                await _failure_screenshot(context, None)
+                raise
+            finally:
+                await context.close()
+                await browser.close()
+                _log("Browser closed.")
+        return (None, None, tractor_path)
+
+    username = _env("COMMERCEHUB_USERNAME")
+    password = _env("COMMERCEHUB_PASSWORD")
+    profile_text = os.environ.get("COMMERCEHUB_PROFILE_TEXT", "Cornerstone Products Group")
+    profile_url = (os.environ.get("COMMERCEHUB_PROFILE_URL") or "").strip() or None
+
+    depot_path: Path | None = None
+    lowes_path: Path | None = None
+    tractor_path: Path | None = None
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=sps_chromium_launch_args(),
+        )
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            await _login(page, username, password)
+            await _pick_profile(page, profile_text.strip(), profile_url)
+
+            if run_depot:
+                depot_path = await _run_depot_invoice_flow(page, download_dir, report_day)
+            if run_lowes:
+                lowes_path = await _run_lowes_invoice_flow(page, download_dir, report_day)
+            if run_sps:
+                tractor_path = await _run_sps_tractor_phase(
+                    context,
+                    nav_timeout_ms=NAV_TIMEOUT_MS,
+                    report_day=report_day,
+                    download_dir=download_dir,
+                )
+
+            return depot_path, lowes_path, tractor_path
+        except Exception:
+            await _failure_screenshot(context, page)
+            raise
+        finally:
+            await context.close()
+            await browser.close()
+            _log("Browser closed.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    try:
+        mode = resolve_run_mode(argv)
+        depot_out, lowes_out, tractor_out = asyncio.run(run_export(mode))
+        if depot_out is not None:
+            _log(f"Done Depot: {depot_out}")
+        if lowes_out is not None:
+            _log(f"Done Lowe's: {lowes_out}")
+        if tractor_out is not None:
+            _log(f"Done Tractor Supply: {tractor_out}")
+        elif mode == "tractor":
+            _log("Tractor Supply (SPS): finished — no invoices for the report day (0 results).")
+    except Exception as e:  # noqa: BLE001 — surface any failure to scheduler logs
+        _log(f"ERROR: {e}")
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

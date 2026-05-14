@@ -28,6 +28,10 @@ echo   E  Lowe's Invoice Report only
 echo   F  Tractor Supply Invoice Report only
 echo   I  Invoice Reports only ^(all three: Depot + Lowe's + Tractor^)
 echo.
+echo Invoice reports need the CommerceHub invoice export project ^(commercehub_invoice_export.py^):
+echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole project there^).
+echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
+echo.
 REM Order must match choice string for errorlevels ^(first char = 1, last = 16^).
 choice /C 123456789ABCDEFI /N /M "Press 1-9, A-C, D-F, or I: "
 if errorlevel 16 goto OPT_INVOICE_ALL
