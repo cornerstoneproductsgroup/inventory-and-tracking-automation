@@ -4,7 +4,7 @@ from pathlib import Path
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from automation.config import load_settings
+from automation.config import load_sps_settings
 
 # Same path as run_sps_tracking.py (reuse session after inventory).
 _SPS_PLAYWRIGHT_STORAGE = Path(__file__).resolve().parent.parent / "sps_playwright_storage.json"
@@ -88,7 +88,7 @@ def _perform_sps_login(page, username: str, password: str, timeout_ms: int) -> N
 
 
 def run_sps_inventory_update() -> None:
-    settings = load_settings()
+    settings = load_sps_settings()
     today = datetime.now().strftime("%m/%d/%Y")
 
     with sync_playwright() as p:

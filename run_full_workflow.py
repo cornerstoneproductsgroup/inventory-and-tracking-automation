@@ -744,6 +744,18 @@ def main() -> int:
                 sequential=sequential_lanes,
             )
         )
+        sps_inventory_failed = any(
+            "SPS Commerce — Tractor Supply inventory" in e for e in errors
+        )
+        if sps_inventory_failed and sps_tracking_steps:
+            for idx, (title, cmd, cwd) in enumerate(sps_tracking_steps):
+                if "run_sps_tracking.py" not in cmd or "--interactive-login" in cmd:
+                    continue
+                sps_tracking_steps[idx] = (title, [*cmd, "--interactive-login"], cwd)
+            print(
+                "\nNOTE: SPS inventory did not complete — tracking will open sign-in "
+                "(saved session was not refreshed by inventory).\n"
+            )
 
     if phase2_left or sps_tracking_steps:
         errors.extend(

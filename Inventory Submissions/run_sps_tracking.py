@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError, sync_playwright
-from automation.config import load_settings
+from automation.config import load_sps_settings
 
 
 CSV_PATH = Path(
@@ -556,20 +556,71 @@ def wait_for_transactions_page_ready(page: Page, *, timeout_ms: int = 45_000) ->
 
 
 def _load_sps_login_settings() -> tuple[str, str, str, int]:
-    start_url = (os.environ.get("SPS_URL") or "").strip() or "https://commerce.spscommerce.com"
-    username = ""
-    password = ""
-    timeout_ms = 30_000
     try:
-        settings = load_settings()
-        if (settings.sps_url or "").strip():
-            start_url = settings.sps_url.strip()
-        username = (settings.sps_username or "").strip()
-        password = (settings.sps_password or "").strip()
-        timeout_ms = int(settings.timeout_ms)
+        settings = load_sps_settings()
+        start_url = (settings.sps_url or "").strip() or "https://commerce.spscommerce.com"
+        return (
+            start_url,
+            (settings.sps_username or "").strip(),
+            (settings.sps_password or "").strip(),
+            int(settings.timeout_ms),
+        )
+    except ValueError as exc:
+        print(f"WARN: {exc}")
+        start_url = (os.environ.get("SPS_URL") or "").strip() or "https://commerce.spscommerce.com"
+        return start_url, "", "", 30_000
+
+
+def _session_ready_for_workflow(page: Page) -> bool:
+    """True only when transactions UI is reachable (not just a stale cookie on the landing page)."""
+    if not _looks_authenticated_sps(page) or _is_login_page_visible(page):
+        return False
+    try:
+        page.goto(TRANSACTIONS_LIST_URL, wait_until="domcontentloaded", timeout=120_000)
+        page.wait_for_timeout(600)
+        wait_for_transactions_page_ready(page, timeout_ms=30_000)
+        return True
     except Exception:
-        pass
-    return start_url, username, password, timeout_ms
+        return False
+
+
+def ensure_sps_session(
+    page: Page,
+    context: BrowserContext,
+    storage_path: Path,
+    *,
+    headless: bool,
+    allow_manual: bool = True,
+) -> None:
+    """Confirm SPS is signed in; refresh storage_path via .env login and/or manual sign-in."""
+    start_url, _, _, _timeout_ms = _load_sps_login_settings()
+    for probe_url in (DASHBOARD_URL, TRANSACTIONS_LIST_URL, start_url):
+        try:
+            page.goto(probe_url, wait_until="domcontentloaded", timeout=120_000)
+            page.wait_for_timeout(700)
+        except Exception:
+            continue
+        if _session_ready_for_workflow(page):
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(storage_path))
+            print(f"SPS session OK; refreshed storage: {storage_path}")
+            return
+
+    if not headless and allow_manual:
+        if login_with_env_credentials_then_save(page, context, storage_path):
+            return
+        interactive_login_then_save(page, context, storage_path)
+        return
+
+    if login_with_env_credentials_then_save(page, context, storage_path):
+        return
+
+    raise RuntimeError(
+        "SPS Commerce is not signed in and automatic login could not complete. "
+        f"Set SPS_USERNAME and SPS_PASSWORD in {DEFAULT_STORAGE_STATE.parent / '.env'}, "
+        "then re-run with a visible browser (HEADLESS=false) so you can complete MFA if needed. "
+        "Or run once with --interactive-login to save a session file."
+    )
 
 
 def _perform_sps_login(page: Page, username: str, password: str, timeout_ms: int) -> bool:
@@ -4263,7 +4314,11 @@ def main() -> int:
                 context = browser.new_context()
             elif state_path.is_file():
                 print(f"Using Playwright storage state: {state_path}")
-                context = browser.new_context(storage_state=str(state_path))
+                try:
+                    context = browser.new_context(storage_state=str(state_path))
+                except Exception as ex:
+                    print(f"WARN: Could not load storage state ({ex}); starting a fresh browser profile.")
+                    context = browser.new_context()
             else:
                 print(
                     "NOTE: No storage state file — starting a fresh browser profile (not logged in to SPS).\n"
@@ -4275,21 +4330,18 @@ def main() -> int:
             did_auto_interactive_login = False
             try:
                 print("STEP 1: Open SPS transactions and apply Advanced Search workflow filter...")
-                # Proactive login preflight: if saved session is stale, prompt login before workflow steps.
-                if not args.headless and not args.interactive_login:
-                    try:
-                        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60_000)
-                        page.wait_for_timeout(400)
-                    except Exception:
-                        pass
-                    if _is_login_page_visible(page):
-                        print("Detected SPS sign-in page during preflight; attempting .env auto-login first.")
-                        if not login_with_env_credentials_then_save(page, context, state_path):
-                            print("Auto-login did not complete; opening interactive login.")
-                            interactive_login_then_save(page, context, state_path)
-                        did_auto_interactive_login = True
                 if args.interactive_login:
                     interactive_login_then_save(page, context, state_path)
+                    did_auto_interactive_login = True
+                else:
+                    ensure_sps_session(
+                        page,
+                        context,
+                        state_path,
+                        headless=bool(args.headless),
+                        allow_manual=not bool(args.headless),
+                    )
+                    did_auto_interactive_login = True
                 open_ready_for_shipment(page, partner_name=args.partner)
                 print(f"After Transactions/Advanced Search: {page.url}")
                 print("STEP 2: Process each PO individually (Shipment then Invoice from ASN)...")

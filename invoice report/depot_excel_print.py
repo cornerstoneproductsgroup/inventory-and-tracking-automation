@@ -1,7 +1,7 @@
 """
 Print workbooks via Excel COM (Windows): Page Layout → Print gridlines; landscape; print header
 (file name) and footer (``Page n of m``); chosen printer. Depot, Lowe's, and Tractor Supply use the
-same landscape print path.
+same landscape print path (Depot, Lowe's, Tractor, Amazon).
 
 Requires Microsoft Excel and: pip install pywin32
 """
@@ -22,19 +22,17 @@ def _excel_print_enabled() -> bool:
     return v not in ("0", "false", "no", "")
 
 
-def _resolve_active_printer_string() -> str | None:
-    """
-    Excel's ActivePrinter must match the machine's installed name (often includes ' on Ne00:').
-    Set COMMERCEHUB_EXCEL_PRINTER to the exact string (run in Excel VBA: ?Application.ActivePrinter).
-    Otherwise we try to find a printer whose name contains 3515 and SVR01A.
-    """
-    explicit = (os.environ.get("COMMERCEHUB_EXCEL_PRINTER") or "").strip()
-    if explicit:
-        return explicit
+def _allow_default_printer_fallback() -> bool:
+    """If false (default), never print when the Toshiba/target printer cannot be set."""
+    v = (os.environ.get("COMMERCEHUB_EXCEL_PRINT_ALLOW_DEFAULT") or "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _enum_installed_printer_names() -> list[str]:
     try:
         import win32print
     except ImportError:
-        return None
+        return []
 
     flags = win32print.PRINTER_ENUM_LOCAL
     if hasattr(win32print, "PRINTER_ENUM_CONNECTIONS"):
@@ -42,8 +40,9 @@ def _resolve_active_printer_string() -> str | None:
     try:
         printers = win32print.EnumPrinters(flags, None, 2)
     except Exception:
-        return None
+        return []
 
+    names: list[str] = []
     for p in printers:
         if isinstance(p, dict):
             name = (p.get("pPrinterName") or "").strip()
@@ -51,11 +50,63 @@ def _resolve_active_printer_string() -> str | None:
             name = str(p[2]).strip()
         else:
             continue
-        if not name:
-            continue
+        if name:
+            names.append(name)
+    return names
+
+
+def _find_toshiba_win32_name(names: list[str]) -> str | None:
+    for name in names:
         u = name.upper().replace("/", "\\")
         if "3515" in u and "SVR01A" in u:
             return name
+    return None
+
+
+def _active_printer_candidates() -> list[str]:
+    """
+  Build ordered candidates for Excel's ``ActivePrinter`` (not always equal to Windows name).
+
+  Set ``COMMERCEHUB_EXCEL_PRINTER`` per PC from Excel VBA: ``?Application.ActivePrinter``.
+  """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(raw: str) -> None:
+        s = (raw or "").strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    explicit = (os.environ.get("COMMERCEHUB_EXCEL_PRINTER") or "").strip()
+    if explicit:
+        add(explicit)
+
+    win32_names = _enum_installed_printer_names()
+    toshiba = _find_toshiba_win32_name(win32_names)
+    if toshiba:
+        add(toshiba)
+        # Model name without trailing " on svr01a" / " on Ne04:" (Excel may want either form).
+        base = toshiba.rsplit(" on ", 1)[0].strip() if " on " in toshiba else toshiba
+        for server in ("svr01a", "SVR01A"):
+            add(f"\\\\{server}\\{base}")
+            add(f"\\\\{server}\\{base} on {server}")
+        if " on Ne" not in toshiba.upper():
+            for port in range(0, 16):
+                add(f"{base} on Ne{port:02d}:")
+                add(f"\\\\SVR01A\\{base} on Ne{port:02d}:")
+
+    return out
+
+
+def _try_set_excel_active_printer(xl, candidates: list[str]) -> str | None:
+    for name in candidates:
+        try:
+            xl.ActivePrinter = name
+            return name
+        except Exception:
+            continue
     return None
 
 
@@ -112,20 +163,34 @@ def _print_workbook_with_gridlines(
         ps.CenterHeader = "&F"
         ps.CenterFooter = "Page &P of &N"
 
-        printer = _resolve_active_printer_string()
-        if printer:
-            try:
-                xl.ActivePrinter = printer
-                _post_log(f"Excel ActivePrinter set to: {printer!r}")
-            except Exception as ex:
-                _post_log(
-                    f"Could not set ActivePrinter to {printer!r} ({ex}); "
-                    "set COMMERCEHUB_EXCEL_PRINTER to the exact value from Excel VBA "
-                    "(?Application.ActivePrinter). Printing with current default."
-                )
-
-        ws.PrintOut(Collate=True)
-        _post_log("Print job sent to Excel.")
+        candidates = _active_printer_candidates()
+        chosen = _try_set_excel_active_printer(xl, candidates) if candidates else None
+        if chosen:
+            _post_log(f"Excel ActivePrinter set to: {chosen!r}")
+        elif _allow_default_printer_fallback():
+            _post_log(
+                "WARNING: Could not set invoice printer — printing to Windows default. "
+                "Set COMMERCEHUB_EXCEL_PRINTER in invoice report\\.env on this PC."
+            )
+            ws.PrintOut(Collate=True)
+            _post_log("Print job sent to Excel (default printer).")
+        else:
+            installed = _enum_installed_printer_names()
+            hint = (
+                "Set COMMERCEHUB_EXCEL_PRINTER in invoice report\\.env to the exact string from "
+                "Excel on THIS computer (Alt+F11 → Immediate → ?Application.ActivePrinter). "
+                "Each PC often differs by ' on Ne04:' port. "
+                "To allow default printer anyway: COMMERCEHUB_EXCEL_PRINT_ALLOW_DEFAULT=true"
+            )
+            raise RuntimeError(
+                "Invoice print aborted: could not set Toshiba/target printer for Excel.\n"
+                f"  Tried: {candidates!r}\n"
+                f"  Installed printers: {installed!r}\n"
+                f"  {hint}"
+            )
+        if chosen:
+            ws.PrintOut(Collate=True)
+            _post_log("Print job sent to Excel.")
 
         wb.Close(SaveChanges=save_changes)
         wb = None

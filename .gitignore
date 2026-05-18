@@ -22,3 +22,6 @@ invoice report/downloads/
 invoice report/*.log
 invoice report/playwright/.auth/
 invoice report/debug_*.png
+invoice report/.amazon_invoice_processed.json
+# Also on share: Amazon/.amazon_invoice_processed.json (not in repo)
+invoice report/amazon_watcher.log
