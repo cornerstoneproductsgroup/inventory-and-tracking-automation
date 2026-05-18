@@ -584,6 +584,29 @@ def _session_ready_for_workflow(page: Page) -> bool:
         return False
 
 
+def _invalidate_stale_sps_session(context: BrowserContext, storage_path: Path) -> None:
+    """Drop saved cookies/file so the next login attempt is not fooled by an expired session."""
+    try:
+        context.clear_cookies()
+    except Exception:
+        pass
+    if storage_path.is_file():
+        try:
+            storage_path.unlink()
+            print(f"Removed stale SPS session file: {storage_path}")
+        except OSError as exc:
+            print(f"Warning: could not remove stale session file ({storage_path}): {exc}")
+
+
+def _save_sps_session_if_ready(page: Page, context: BrowserContext, storage_path: Path, *, label: str) -> bool:
+    if not _session_ready_for_workflow(page):
+        return False
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(storage_path))
+    print(f"{label}: {storage_path}")
+    return True
+
+
 def ensure_sps_session(
     page: Page,
     context: BrowserContext,
@@ -601,10 +624,11 @@ def ensure_sps_session(
         except Exception:
             continue
         if _session_ready_for_workflow(page):
-            storage_path.parent.mkdir(parents=True, exist_ok=True)
-            context.storage_state(path=str(storage_path))
-            print(f"SPS session OK; refreshed storage: {storage_path}")
+            _save_sps_session_if_ready(page, context, storage_path, label="SPS session OK; refreshed storage")
             return
+
+    print("SPS session is not valid for transactions — clearing stale cookies and re-authenticating.")
+    _invalidate_stale_sps_session(context, storage_path)
 
     if not headless and allow_manual:
         if login_with_env_credentials_then_save(page, context, storage_path):
@@ -661,7 +685,7 @@ def _perform_sps_login(page: Page, username: str, password: str, timeout_ms: int
                 pwd.press("Enter", timeout=2_000)
 
             page.wait_for_load_state("domcontentloaded", timeout=per_attempt_timeout)
-            if _looks_authenticated_sps(page) or not _is_login_page_visible(page):
+            if _session_ready_for_workflow(page):
                 if attempt > 1:
                     print(f"SPS credential submit succeeded on attempt {attempt}.")
                 return True
@@ -698,18 +722,19 @@ def interactive_login_then_save(page: Page, context: BrowserContext, storage_pat
     else:
         print(">>> Could not complete SPS login from .env automatically; waiting for manual sign-in.")
 
-    if not _wait_for_authenticated_sps(page, timeout_ms=180_000):
+    if not _session_ready_for_workflow(page):
         print(
             ">>> Complete SPS sign-in in the browser (including MFA if prompted), then press Enter."
         )
         input(">>> Press Enter once SPS is fully logged in...\n")
-        if not _wait_for_authenticated_sps(page, timeout_ms=30_000):
-            raise RuntimeError("SPS login was not detected after manual sign-in.")
+        if not _session_ready_for_workflow(page):
+            raise RuntimeError(
+                "SPS login was not detected after manual sign-in (transactions page did not load)."
+            )
 
-    page.goto(TRANSACTIONS_LIST_URL, wait_until="domcontentloaded", timeout=120_000)
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(storage_path))
-    print(f">>> Saved session file: {storage_path}\n")
+    if not _save_sps_session_if_ready(page, context, storage_path, label=">>> Saved session file"):
+        raise RuntimeError("SPS sign-in looked complete but transactions page is still not reachable.")
+    print()
 
 
 def login_with_env_credentials_then_save(
@@ -728,26 +753,16 @@ def login_with_env_credentials_then_save(
         print(f"Could not open SPS login URL for auto-login: {ex}")
         return False
 
-    # If session is already authenticated, don't force username/password submit.
-    if _wait_for_authenticated_sps(page, timeout_ms=10_000):
-        page.goto(TRANSACTIONS_LIST_URL, wait_until="domcontentloaded", timeout=120_000)
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        context.storage_state(path=str(storage_path))
-        print(f"SPS session already authenticated; saved session: {storage_path}")
+    if _save_sps_session_if_ready(page, context, storage_path, label="SPS session already valid; saved session"):
         return True
 
     if not _perform_sps_login(page, username, password, effective_timeout):
         print("SPS auto-login could not complete username/password submit from .env.")
         return False
-    if not _wait_for_authenticated_sps(page, timeout_ms=120_000):
-        print("SPS auto-login did not reach authenticated state (MFA/SSO may still be required).")
-        return False
-
-    page.goto(TRANSACTIONS_LIST_URL, wait_until="domcontentloaded", timeout=120_000)
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(storage_path))
-    print(f"SPS auto-login succeeded; saved session: {storage_path}")
-    return True
+    if _save_sps_session_if_ready(page, context, storage_path, label="SPS auto-login succeeded; saved session"):
+        return True
+    print("SPS auto-login did not reach the transactions page (MFA/SSO may still be required).")
+    return False
 
 
 def goto_dashboard(page: Page) -> None:
@@ -4282,6 +4297,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    print("SPS tracking: session validation v2 (transactions page must load before continuing).")
     if args.headless and args.interactive_login:
         print("ERROR: --interactive-login needs a visible browser. Omit --headless.")
         return 1
@@ -4311,6 +4327,12 @@ def main() -> int:
                     "Interactive login: opening SPS — sign in in the browser first; "
                     "session will be saved for next runs."
                 )
+                if state_path.is_file():
+                    try:
+                        state_path.unlink()
+                        print(f"Removed old session file before interactive login: {state_path}")
+                    except OSError as exc:
+                        print(f"Warning: could not remove old session file: {exc}")
                 context = browser.new_context()
             elif state_path.is_file():
                 print(f"Using Playwright storage state: {state_path}")
@@ -4341,7 +4363,6 @@ def main() -> int:
                         headless=bool(args.headless),
                         allow_manual=not bool(args.headless),
                     )
-                    did_auto_interactive_login = True
                 open_ready_for_shipment(page, partner_name=args.partner)
                 print(f"After Transactions/Advanced Search: {page.url}")
                 print("STEP 2: Process each PO individually (Shipment then Invoice from ASN)...")
@@ -4364,14 +4385,14 @@ def main() -> int:
                     auth_issue
                     and not args.headless
                     and not args.interactive_login
-                    and not did_auto_interactive_login
                 )
-                if can_retry_interactive:
+                if can_retry_interactive and not did_auto_interactive_login:
                     did_auto_interactive_login = True
                     print(
                         "Detected expired/missing SPS login session. "
-                        "Retrying once with .env auto-login, then interactive login if needed..."
+                        "Clearing stale session and retrying sign-in..."
                     )
+                    _invalidate_stale_sps_session(context, state_path)
                     if not login_with_env_credentials_then_save(page, context, state_path):
                         interactive_login_then_save(page, context, state_path)
                     open_ready_for_shipment(page, partner_name=args.partner)

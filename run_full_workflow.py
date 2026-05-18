@@ -513,9 +513,15 @@ def main() -> int:
             INVENTORY_DIR,
         )
 
+    sps_tracking_only = (
+        run_sps_tracking
+        and skip_sps_inventory
+        and skip_commercehub
+        and not grainger_only
+    )
     if run_sps_tracking and tracking_script.is_file():
         tracking_cmd = [python_exe, "run_sps_tracking.py", "--submit"]
-        need_interactive = args.force_sps_interactive_login or (
+        need_interactive = args.force_sps_interactive_login or sps_tracking_only or (
             not sps_storage_json.is_file()
             and os.environ.get("SPS_TRACKING_NON_INTERACTIVE", "").strip().lower()
             not in ("1", "true", "yes", "y", "on")
@@ -526,6 +532,12 @@ def main() -> int:
                 print(
                     "\nNOTE: Forcing interactive SPS login before tracking to refresh saved session.\n"
                     f"      Session file target: {sps_storage_json}\n"
+                )
+            elif sps_tracking_only:
+                print(
+                    "\nNOTE: SPS tracking-only run — browser will open for sign-in if the saved session "
+                    "is missing or expired (menu B / tracking-only).\n"
+                    f"      Session file: {sps_storage_json}\n"
                 )
             else:
                 print(

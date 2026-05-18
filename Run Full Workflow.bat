@@ -10,7 +10,7 @@ set "EXTRA_ARGS="
 if not "%~1"=="" goto RUN
 
 echo.
-echo Which steps to run? ^(keyboard — no Enter needed^)
+echo Which steps to run? ^(press a menu key — no Enter needed^)
 echo   1  All Steps ^(invoice: CH Depot+Lowe's parallel w/ SPS Tractor; then CH+SPS inventories parallel; tracking + Grainger^)
 echo   2  Depot Tracking and Invoicing
 echo   3  Lowe's Tracking and Invoicing
@@ -68,7 +68,7 @@ goto RUN
 set "EXTRA_ARGS=--grainger-only"
 goto RUN
 :OPT_B
-set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub --skip-sps-inventory"
+set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub --skip-sps-inventory --force-sps-interactive-login"
 goto RUN
 :OPT_A
 set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only"
