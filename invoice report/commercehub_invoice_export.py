@@ -443,6 +443,37 @@ async def _run_search(page) -> None:
     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
 
+async def _search_results_empty(page) -> bool:
+    """True when the search finished but there is nothing to sort or export."""
+    no_msg = page.get_by_text(
+        re.compile(
+            r"no\s+(records|results|orders|matching)|0\s+record|did\s+not\s+match",
+            re.I,
+        )
+    )
+    try:
+        if await no_msg.count() and await no_msg.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+
+    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV")
+    try:
+        await csv.first.wait_for(state="visible", timeout=8_000)
+        return False
+    except PlaywrightTimeout:
+        pass
+
+    po_sort = page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
+    if await po_sort.count() == 0:
+        return True
+    try:
+        await po_sort.first.wait_for(state="visible", timeout=5_000)
+        return False
+    except PlaywrightTimeout:
+        return True
+
+
 async def _sort_by_po_number(page) -> None:
     _log("Sorting results by PO Number (Order)…")
     link = (
@@ -568,7 +599,7 @@ async def _failure_screenshot(context, page) -> None:
     _log("Could not capture failure screenshot.")
 
 
-async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path:
+async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Depot invoicing: Order Search → saved search → export…")
     await _open_order_search(page)
     _default_saved = "Home Depot Invoice Batch Print by Date"
@@ -579,6 +610,9 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path:
     await _maybe_select_saved_search(page, saved_name)
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
+    if await _search_results_empty(page):
+        _log(f"Depot: no invoices for {report_day} — skipping export and print.")
+        return None
     await _sort_by_po_number(page)
     path = await _export_excel(page, download_dir, local_filename_stem="commercehub_depot")
     _log(f"Downloaded export: {path}")
@@ -587,7 +621,7 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path:
     return depot_path
 
 
-async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path:
+async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Lowe's invoicing: Order Search → Lowe's saved search → export…")
     await _open_order_search(page)
     await _open_lowes_saved_search(page)
@@ -598,6 +632,9 @@ async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path:
     await _maybe_select_saved_search(page, lowes_saved)
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
+    if await _search_results_empty(page):
+        _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
+        return None
     await _sort_by_po_number(page)
     path_l = await _export_excel(page, download_dir, local_filename_stem="commercehub_lowes")
     _log(f"Downloaded Lowe's export: {path_l}")
@@ -813,8 +850,12 @@ def main(argv: list[str] | None = None) -> None:
         depot_out, lowes_out, tractor_out = asyncio.run(run_export(mode))
         if depot_out is not None:
             _log(f"Done Depot: {depot_out}")
+        elif mode in ("depot", "retail", "all"):
+            _log("Depot: finished — no invoices for the report day (0 results).")
         if lowes_out is not None:
             _log(f"Done Lowe's: {lowes_out}")
+        elif mode in ("lowes", "retail", "all"):
+            _log("Lowe's: finished — no invoices for the report day (0 results).")
         if tractor_out is not None:
             _log(f"Done Tractor Supply: {tractor_out}")
         elif mode in ("tractor", "all") and tractor_out is None:

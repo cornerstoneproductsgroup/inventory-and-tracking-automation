@@ -15,6 +15,9 @@ and any SPS step is enabled (two separate logins to CommerceHub).
 
 Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 --skip-depot, --skip-lowes, --skip-invoice-report.
+
+If any step fails (e.g. no invoices for a closed day), later phases still run; errors are
+summarized at the end.
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --sequential-lanes to run each phase's two sides one after the other instead of parallel.
@@ -738,14 +741,9 @@ def main() -> int:
         print(
             "\n"
             + "=" * 60
-            + "\nStopping: CommerceHub invoice reports (Phase 0) did not complete.\n"
-            "Later phases are skipped until this is fixed (e.g. git pull, then Inventory Submissions\\Install-Deps.bat).\n"
+            + "\nWARN: CommerceHub invoice reports (Phase 0) had issues — continuing with later phases.\n"
             + "=" * 60
         )
-        print("\nCompleted with errors:")
-        for e in errors:
-            print(f"  - {e}")
-        return 1
 
     if phase1_left or phase1_right:
         errors.extend(
