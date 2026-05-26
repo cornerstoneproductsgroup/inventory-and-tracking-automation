@@ -17,15 +17,19 @@ echo   3  All Inventory ^(CommerceHub + SPS inventory only^)
 echo   4  All Invoice Reports ^(Depot, Lowe's, Tractor Supply — previous business day^)
 echo   5  CommerceHub ALL ^(Depot+Lowe's invoice reports, inventory, tracking/invoicing^)
 echo   6  SPS Commerce ALL ^(Tractor invoice report, inventory, tracking/invoicing + Grainger^)
-echo   7  Custom Invoice Report Date ^(Depot, Lowe's, Tractor Supply for a date you enter^)
+echo   7  CommerceHub Tracking/Invoicing ^(Depot and Lowe's only^)
+echo   8  SPS Commerce Tracking/Invoicing ^(Tractor Supply and Grainger^)
+echo   9  Custom Invoice Report Date ^(Depot, Lowe's, Tractor Supply for a date you enter^)
 echo.
 echo Invoice reports need the CommerceHub invoice export project ^(commercehub_invoice_export.py^):
 echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole project there^).
 echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
 echo   Other PC: git pull, then run Inventory Submissions\Install-Deps.bat ^(adds pandas etc. for invoice phase^).
 echo.
-choice /C 1234567 /N /M "Press 1-7: "
-if errorlevel 7 goto OPT_CUSTOM_DATE
+choice /C 123456789 /N /M "Press 1-9: "
+if errorlevel 9 goto OPT_CUSTOM_DATE
+if errorlevel 8 goto OPT_8
+if errorlevel 7 goto OPT_7
 if errorlevel 6 goto OPT_6
 if errorlevel 5 goto OPT_5
 if errorlevel 4 goto OPT_4
@@ -42,6 +46,12 @@ if not defined INVOICE_DATE (
   exit /b 1
 )
 set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes all --invoice-report-date %INVOICE_DATE%"
+goto RUN
+:OPT_8
+set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub --skip-sps-inventory --run-grainger-all"
+goto RUN
+:OPT_7
+set "EXTRA_ARGS=--skip-invoice-report --skip-sps-inventory --skip-sps-tracking --skip-inventory"
 goto RUN
 :OPT_6
 set "EXTRA_ARGS=--invoice-report-modes tractor --skip-commercehub --run-grainger-all"

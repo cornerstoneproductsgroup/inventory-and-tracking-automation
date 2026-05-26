@@ -1,13 +1,18 @@
 """
 Post-process Amazon transaction exports from the Cornerstone share: trim header junk,
-filter by run-day rules, keep Order rows only, format columns, save, and print (landscape + gridlines).
+filter by run-day rules, keep Order rows only, merge duplicate PO+SKU lines (sum qty and sales),
+format columns, save, and print (landscape + gridlines).
 
 Drop a new raw .csv/.xlsx into the Amazon **Input** share folder. Formatted output is saved to
 **Output** as ``{same base name} Output.xlsx`` (then printed).
 
-Date rules (by run date = today unless overridden):
-  Tue–Fri: keep transactions dated yesterday only.
-  Monday: keep Friday, Saturday, and Sunday (three calendar days before the run).
+Date rules (by run date = today unless overridden) — **calendar date only**; time of day is ignored:
+  Tue–Fri: keep Order rows whose date/time column is **yesterday's calendar date** (any time).
+  Monday: keep Order rows on the previous **Friday, Saturday, and Sunday** (any time).
+
+  Optional (default on): also include the **prior settlement calendar day** (Tue–Fri only).
+  Amazon often labels many of yesterday's sales with the previous date in the export; disable with
+  ``AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY=false`` if you only want the strict yesterday date.
 """
 
 from __future__ import annotations
@@ -41,7 +46,8 @@ DEFAULT_AMAZON_OUTPUT_DIR = DEFAULT_AMAZON_BASE_DIR + r"\Output"
 _RAW_COL_INDICES: tuple[int, ...] = (0, 2, 3, 4, 6, 13)  # A, C, D, E, G, N
 
 _AMAZON_TXN_RE = re.compile(
-    r"^(?P<dt>[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)",
+    r"^(?P<dt>[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)"
+    r"(?:\s+[A-Z]{2,5})?",
     re.IGNORECASE,
 )
 _OUTPUT_STEM_SUFFIX = " Output"
@@ -74,17 +80,35 @@ def output_path_for_source(source: Path, output_dir: Path | None = None) -> Path
     return out_dir / f"{source.stem}{_OUTPUT_STEM_SUFFIX}.xlsx"
 
 
+def _include_prior_settlement_day() -> bool:
+    """Default true — see module docstring."""
+    v = (os.environ.get("AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY") or "true").strip().lower()
+    return v not in ("0", "false", "no", "")
+
+
 def transaction_dates_to_keep(run_day: date | None = None) -> set[date]:
-    """Tue–Fri: yesterday only. Monday: previous Fri/Sat/Sun."""
+    """
+    Calendar dates to keep (time of day is not used).
+
+    Tue–Fri: yesterday; also day-before-yesterday when ``AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY`` is true.
+    Monday: previous Fri, Sat, and Sun.
+    """
     d = run_day or date.today()
     if d.weekday() == 0:
         return {d - timedelta(days=3), d - timedelta(days=2), d - timedelta(days=1)}
-    return {d - timedelta(days=1)}
+    days = {d - timedelta(days=1)}
+    if _include_prior_settlement_day():
+        days.add(d - timedelta(days=2))
+    return days
 
 
-def parse_amazon_transaction_date(value: object) -> date | None:
+def parse_amazon_transaction_datetime(value: object) -> datetime | None:
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
     s = str(value).strip()
     if not s:
         return None
@@ -92,9 +116,21 @@ def parse_amazon_transaction_date(value: object) -> date | None:
     if not m:
         return None
     try:
-        return datetime.strptime(m.group("dt"), "%b %d, %Y %I:%M:%S %p").date()
+        return datetime.strptime(m.group("dt"), "%b %d, %Y %I:%M:%S %p")
     except ValueError:
         return None
+
+
+def parse_amazon_transaction_date(value: object) -> date | None:
+    """Calendar date from the date/time cell; ignores time and timezone suffix."""
+    dt = parse_amazon_transaction_datetime(value)
+    return dt.date() if dt else None
+
+
+def _row_matches_keep_dates(row: tuple, keep_dates: set[date]) -> bool:
+    """True when the row's calendar date is in *keep_dates* (any time on that day counts)."""
+    tx_date = parse_amazon_transaction_date(row[0] if row else None)
+    return tx_date is not None and tx_date in keep_dates
 
 
 def _row_width(row: tuple) -> int:
@@ -287,6 +323,27 @@ def _type_column_index(headers: list[str]) -> int:
     return 1  # raw column C → output B
 
 
+def _forward_fill_transaction_dates(rows: list[tuple]) -> list[tuple]:
+    """Amazon exports often leave date/time blank on continuation lines under a settlement group."""
+    filled: list[tuple] = []
+    last_date_cell: object = None
+    for row in rows:
+        if not row:
+            filled.append(row)
+            continue
+        cell = row[0]
+        if cell is not None and str(cell).strip():
+            last_date_cell = cell
+            filled.append(row)
+        elif last_date_cell is not None:
+            mutable = list(row)
+            mutable[0] = last_date_cell
+            filled.append(tuple(mutable))
+        else:
+            filled.append(row)
+    return filled
+
+
 def _filter_rows(
     headers: list[str],
     rows: list[tuple],
@@ -296,14 +353,154 @@ def _filter_rows(
     type_ix = _type_column_index(headers)
     kept: list[tuple] = []
     for row in rows:
-        tx_date = parse_amazon_transaction_date(row[0] if row else None)
-        if tx_date is None or tx_date not in keep_dates:
-            continue
         type_val = "" if type_ix >= len(row) or row[type_ix] is None else str(row[type_ix]).strip()
-        if type_val.lower() == "refund":
+        if type_val.lower() != "order":
+            continue
+        if not _row_matches_keep_dates(row, keep_dates):
             continue
         kept.append(row)
     return kept
+
+
+def _sort_rows_by_transaction_datetime(rows: list[tuple]) -> list[tuple]:
+    def sort_key(row: tuple) -> tuple[bool, datetime]:
+        dt = parse_amazon_transaction_datetime(row[0] if row else None)
+        return (dt is None, dt or datetime.max)
+
+    return sorted(rows, key=sort_key)
+
+
+_COL_PO = 2  # output C
+_COL_SKU = 3  # output D
+_COL_QTY = 4  # output E
+_COL_AMT = 5  # output F
+
+
+def _cell_key(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_quantity(value: object) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace(",", "")
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _parse_amount_for_sum(value: object) -> float:
+    coerced = _coerce_accounting_cell_value(value)
+    if isinstance(coerced, (int, float)):
+        return float(coerced)
+    return 0.0
+
+
+def _quantity_output_value(total: float) -> int | float:
+    if total == int(total):
+        return int(total)
+    return total
+
+
+def _consolidate_rows_by_po_and_sku(rows: list[tuple]) -> list[tuple]:
+    """
+    Merge duplicate Order lines that share the same PO (column C) and SKU (column D).
+
+    New Amazon exports often emit one row per unit; this sums quantity (E) and sales (F)
+    so the printed report matches the older one-row-per-PO-per-SKU layout.
+    """
+    if not rows:
+        return rows
+
+    groups: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+
+    for row in rows:
+        padded = tuple(row) + (None,) * max(0, _COL_AMT + 1 - len(row))
+        key = (_cell_key(padded[_COL_PO]), _cell_key(padded[_COL_SKU]))
+        qty = _parse_quantity(padded[_COL_QTY])
+        amt = _parse_amount_for_sum(padded[_COL_AMT])
+
+        if key not in groups:
+            groups[key] = {"row": padded, "qty": 0.0, "amt": 0.0}
+            order.append(key)
+        groups[key]["qty"] += qty
+        groups[key]["amt"] += amt
+
+    merged: list[tuple] = []
+    for key in order:
+        g = groups[key]
+        row = list(g["row"])
+        while len(row) <= _COL_AMT:
+            row.append(None)
+        row[_COL_QTY] = _quantity_output_value(g["qty"])
+        row[_COL_AMT] = g["amt"]
+        merged.append(tuple(row))
+    return merged
+
+
+def _order_rows_by_calendar_date(
+    rows: list[tuple],
+    headers: list[str],
+) -> dict[date, list[datetime]]:
+    """Count Order rows per settlement calendar date in the raw export (for logging)."""
+    type_ix = _type_column_index(headers)
+    by_date: dict[date, list[datetime]] = {}
+    for row in rows:
+        type_val = "" if type_ix >= len(row) or row[type_ix] is None else str(row[type_ix]).strip()
+        if type_val.lower() != "order":
+            continue
+        tx_date = parse_amazon_transaction_date(row[0] if row else None)
+        tx_dt = parse_amazon_transaction_datetime(row[0] if row else None)
+        if tx_date is None or tx_dt is None:
+            continue
+        by_date.setdefault(tx_date, []).append(tx_dt)
+    return by_date
+
+
+def _log_source_date_coverage(
+    rows: list[tuple],
+    headers: list[str],
+    keep_dates: set[date],
+    run_day: date,
+) -> None:
+    """Explain what Amazon actually exported for each keep-day (e.g. last time is not a script cut-off)."""
+    by_date = _order_rows_by_calendar_date(rows, headers)
+    for d in sorted(keep_dates):
+        times = sorted(by_date.get(d, []))
+        if not times:
+            print(f"[amazon]   Source export: 0 Order rows dated {d.isoformat()}", flush=True)
+            continue
+        print(
+            f"[amazon]   Source export: {len(times)} Order row(s) dated {d.isoformat()} "
+            f"(times {times[0].strftime('%I:%M:%S %p')} – {times[-1].strftime('%I:%M:%S %p')}; "
+            f"all times on that calendar date are kept)",
+            flush=True,
+        )
+
+    if run_day.weekday() == 0 or _include_prior_settlement_day():
+        return
+    yesterday = run_day - timedelta(days=1)
+    prior = run_day - timedelta(days=2)
+    y_count = len(by_date.get(yesterday, []))
+    p_count = len(by_date.get(prior, []))
+    if p_count > y_count:
+        print(
+            f"[amazon] NOTE: This file has {p_count} Order rows dated {prior.isoformat()} but only "
+            f"{y_count} dated {yesterday.isoformat()}. Amazon often assigns yesterday's sales to the "
+            f"prior settlement date. Set AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY=true (default) to include "
+            f"{prior.isoformat()}, or download a newer transaction report after settlements finish.",
+            flush=True,
+        )
 
 
 def _coerce_accounting_cell_value(value: object) -> float | str | None:
@@ -376,8 +573,8 @@ def process_amazon_export(
 ) -> Path:
     load_project_dotenv()
     run_day = run_day or date.today()
-    keep_dates = transaction_dates_to_keep(run_day)
     source = source.resolve()
+    keep_dates = transaction_dates_to_keep(run_day)
 
     rows = _load_rows(source)
     header_i = find_header_row_index(rows)
@@ -385,20 +582,33 @@ def process_amazon_export(
     body = rows[header_i + 1 :]
 
     headers, selected = _select_columns(header, body)
+    selected = _forward_fill_transaction_dates(selected)
+    print(f"[amazon] Date filter (calendar days only): {', '.join(sorted(d.isoformat() for d in keep_dates))}", flush=True)
+    _log_source_date_coverage(selected, headers, keep_dates, run_day)
     filtered = _filter_rows(headers, selected, keep_dates=keep_dates)
+    filtered = _sort_rows_by_transaction_datetime(filtered)
+    line_count = len(filtered)
+    consolidated = _consolidate_rows_by_po_and_sku(filtered)
+    if len(consolidated) < line_count:
+        print(
+            f"[amazon] Consolidated {line_count} Order line(s) -> {len(consolidated)} "
+            f"by matching PO (column C) and SKU (column D); summed quantity (E) and sales (F).",
+            flush=True,
+        )
 
     out_dir = (output_dir or resolve_amazon_output_dir()).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_path_for_source(source, out_dir)
 
-    saved = write_amazon_workbook(headers, filtered, out_path)
+    saved = write_amazon_workbook(headers, consolidated, out_path)
     date_list = ", ".join(sorted(d.isoformat() for d in keep_dates))
     print(
-        f"[amazon] {source.name}: kept {len(filtered)} Order row(s) for {date_list} -> {saved}",
+        f"[amazon] {source.name}: {len(selected)} data row(s) in export -> "
+        f"kept {line_count} Order row(s) for {date_list} -> {len(consolidated)} output row(s) -> {saved}",
         flush=True,
     )
 
-    if not filtered:
+    if not consolidated:
         print(
             f"[amazon] WARNING: No rows matched the date filter ({date_list}). "
             "Report saved with headers only; print skipped. "
