@@ -11,40 +11,21 @@ if not "%~1"=="" goto RUN
 
 echo.
 echo Which steps to run? ^(press a menu key — no Enter needed^)
-echo   1  All Steps ^(invoice: CH Depot+Lowe's parallel w/ SPS Tractor; then CH+SPS inventories parallel; tracking + Grainger^)
-echo   2  Depot Tracking and Invoicing
-echo   3  Lowe's Tracking and Invoicing
-echo   4  Commercehub and SPS Inventory + Depot Tracking Invoicing
-echo   5  Commercehub and SPS Inventory + Lowe's Tracking Invoicing
-echo   6  Commercehub and SPS Inventory + Depot and Lowe's Tracking Invoicing
-echo   7  SPS Full ^(SPS Inventory and Tracking^)
-echo   8  Commercehub Inventory
-echo   9  SPS Inventory
-echo   A  All Tracking and Invoicing ^(No Inventory^)
-echo   B  SPS Tracking
-echo   C  Grainger ALL
-echo   D  Depot Invoice Report only
-echo   E  Lowe's Invoice Report only
-echo   F  Tractor Supply Invoice Report only
-echo   I  Invoice Reports only ^(all: parallel CH Depot+Lowe's + SPS Tractor^)
+echo   1  All Steps ^(invoice reports, CH+SPS inventories, tracking/invoicing + Grainger^)
+echo   2  All Tracking and Invoicing ^(no inventory, no invoice reports^)
+echo   3  All Inventory ^(CommerceHub + SPS inventory only^)
+echo   4  All Invoice Reports ^(Depot, Lowe's, Tractor Supply — previous business day^)
+echo   5  CommerceHub ALL ^(Depot+Lowe's invoice reports, inventory, tracking/invoicing^)
+echo   6  SPS Commerce ALL ^(Tractor invoice report, inventory, tracking/invoicing + Grainger^)
+echo   7  Custom Invoice Report Date ^(Depot, Lowe's, Tractor Supply for a date you enter^)
 echo.
 echo Invoice reports need the CommerceHub invoice export project ^(commercehub_invoice_export.py^):
 echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole project there^).
 echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
 echo   Other PC: git pull, then run Inventory Submissions\Install-Deps.bat ^(adds pandas etc. for invoice phase^).
 echo.
-REM Order must match choice string for errorlevels ^(first char = 1, last = 16^).
-choice /C 123456789ABCDEFI /N /M "Press 1-9, A-C, D-F, or I: "
-if errorlevel 16 goto OPT_INVOICE_ALL
-if errorlevel 15 goto OPT_INV_TRACTOR
-if errorlevel 14 goto OPT_INV_LOWES
-if errorlevel 13 goto OPT_INV_DEPOT
-if errorlevel 12 goto OPT_GRAINGER
-if errorlevel 11 goto OPT_B
-if errorlevel 10 goto OPT_A
-if errorlevel 9 goto OPT_9
-if errorlevel 8 goto OPT_8
-if errorlevel 7 goto OPT_7
+choice /C 1234567 /N /M "Press 1-7: "
+if errorlevel 7 goto OPT_CUSTOM_DATE
 if errorlevel 6 goto OPT_6
 if errorlevel 5 goto OPT_5
 if errorlevel 4 goto OPT_4
@@ -52,50 +33,30 @@ if errorlevel 3 goto OPT_3
 if errorlevel 2 goto OPT_2
 if errorlevel 1 goto OPT_1
 
-:OPT_INVOICE_ALL
-set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes all"
-goto RUN
-:OPT_INV_TRACTOR
-set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes tractor"
-goto RUN
-:OPT_INV_LOWES
-set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes lowes"
-goto RUN
-:OPT_INV_DEPOT
-set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes depot"
-goto RUN
-:OPT_GRAINGER
-set "EXTRA_ARGS=--grainger-only"
-goto RUN
-:OPT_B
-set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub --skip-sps-inventory --force-sps-interactive-login"
-goto RUN
-:OPT_A
-set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only"
-goto RUN
-:OPT_9
-set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub --skip-sps-tracking"
-goto RUN
-:OPT_8
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-inventory --skip-sps-tracking --skip-depot --skip-lowes"
-goto RUN
-:OPT_7
-set "EXTRA_ARGS=--skip-invoice-report --skip-commercehub"
+:OPT_CUSTOM_DATE
+echo.
+set /p INVOICE_DATE="Enter invoice date (MM/DD/YYYY or YYYY-MM-DD): "
+if not defined INVOICE_DATE (
+  echo No date entered — cancelled.
+  pause
+  exit /b 1
+)
+set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes all --invoice-report-date %INVOICE_DATE%"
 goto RUN
 :OPT_6
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-tracking"
+set "EXTRA_ARGS=--invoice-report-modes tractor --skip-commercehub --run-grainger-all"
 goto RUN
 :OPT_5
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-tracking --skip-depot"
+set "EXTRA_ARGS=--invoice-report-modes retail --skip-sps-inventory --skip-sps-tracking"
 goto RUN
 :OPT_4
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-tracking --skip-lowes"
+set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes all"
 goto RUN
 :OPT_3
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-inventory --skip-sps-tracking --skip-inventory --skip-depot"
+set "EXTRA_ARGS=--skip-invoice-report --skip-sps-tracking --skip-depot --skip-lowes"
 goto RUN
 :OPT_2
-set "EXTRA_ARGS=--skip-invoice-report --skip-sps-inventory --skip-sps-tracking --skip-inventory --skip-lowes"
+set "EXTRA_ARGS=--skip-invoice-report --tracking-invoicing-only"
 goto RUN
 :OPT_1
 set "EXTRA_ARGS=--invoice-report-modes all --run-grainger-all"

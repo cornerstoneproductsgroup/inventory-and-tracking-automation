@@ -4,6 +4,7 @@ Automate CommerceHub (Rithum) DSM and SPS Commerce (Tractor Supply): invoicing f
 On run, choose: (1) All — parallel: CommerceHub (Depot + Lowe's, one browser) and SPS Tractor Supply (second browser);
 (2) Depot only, (3) Lowe's only, (4) Tractor Supply (SPS), (5) Depot + Lowe's on CommerceHub only.
 Optional CLI: ``python commercehub_invoice_export.py retail`` or env ``COMMERCEHUB_MENU_CHOICE=1`` (all) / ``5`` (retail).
+Custom date: ``python commercehub_invoice_export.py all --date 2026-05-23`` or env ``COMMERCEHUB_REPORT_DATE=5/23/2026``.
 
 Requires: pip install -r requirements.txt && playwright install chromium
 
@@ -25,7 +26,11 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from playwright.async_api import async_playwright
 
-from commercehub_previous_business_day import format_criteria_datetime, previous_business_day
+from commercehub_previous_business_day import (
+    format_criteria_datetime,
+    parse_report_date,
+    previous_business_day,
+)
 from depot_invoice_postprocess import process_invoice_download, save_tractor_supply_csv
 from sps_commerce_flow import (
     load_sps_env_from_inventory_project,
@@ -100,6 +105,35 @@ def prompt_run_menu() -> str:
         if choice in ("all", "depot", "lowes", "tractor", "retail"):
             return choice
         print("Invalid choice — enter 1, 2, 3, 4, or 5.", flush=True)
+
+
+def peel_report_date_args(argv: list[str]) -> tuple[list[str], date | None]:
+    """Remove ``--date`` / ``--report-date`` and return remaining argv plus optional custom day."""
+    remaining: list[str] = []
+    report_day: date | None = None
+    i = 0
+    while i < len(argv):
+        token = argv[i].strip()
+        if token in ("--date", "--report-date"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{token} requires a date (YYYY-MM-DD or MM/DD/YYYY).")
+            report_day = parse_report_date(argv[i + 1])
+            i += 2
+            continue
+        remaining.append(argv[i])
+        i += 1
+    return remaining, report_day
+
+
+def resolve_report_day(argv: list[str]) -> tuple[list[str], date | None]:
+    """Custom report day from CLI flags or COMMERCEHUB_REPORT_DATE env."""
+    argv, report_day = peel_report_date_args(argv)
+    if report_day is not None:
+        return argv, report_day
+    env_raw = (os.environ.get("COMMERCEHUB_REPORT_DATE") or "").strip()
+    if env_raw:
+        return argv, parse_report_date(env_raw)
+    return argv, None
 
 
 def resolve_run_mode(argv: list[str]) -> str:
@@ -764,7 +798,9 @@ async def _run_commercehub_invoice_browser(
             _log("CommerceHub browser closed.")
 
 
-async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path | None]:
+async def run_export(
+    mode: str = "all", *, report_day: date | None = None
+) -> tuple[Path | None, Path | None, Path | None]:
     load_project_dotenv()
     mode = mode.strip().lower()
     allowed = frozenset({"all", "depot", "lowes", "tractor", "retail"})
@@ -779,13 +815,17 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
 
     download_dir = Path(os.environ.get("COMMERCEHUB_DOWNLOAD_DIR", "./downloads")).resolve()
     headless = os.environ.get("COMMERCEHUB_HEADLESS", "true").lower() in ("1", "true", "yes")
-    report_day = previous_business_day()
+    day = report_day if report_day is not None else previous_business_day()
+    if report_day is not None:
+        _log(f"Report day: {day.isoformat()} (custom date)")
+    else:
+        _log(f"Report day: {day.isoformat()} (previous business day)")
 
     if mode == "tractor":
         tractor_path = await _run_tractor_standalone_browser(
             download_dir=download_dir,
             headless=headless,
-            report_day=report_day,
+            report_day=day,
         )
         return (None, None, tractor_path)
 
@@ -800,12 +840,12 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
                 run_lowes=True,
                 download_dir=download_dir,
                 headless=headless,
-                report_day=report_day,
+                report_day=day,
             ),
             _run_tractor_standalone_browser(
                 download_dir=download_dir,
                 headless=headless,
-                report_day=report_day,
+                report_day=day,
             ),
         )
         return depot_path, lowes_path, tractor_path
@@ -816,7 +856,7 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
             run_lowes=True,
             download_dir=download_dir,
             headless=headless,
-            report_day=report_day,
+            report_day=day,
         )
         return d, l, None
 
@@ -826,7 +866,7 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
             run_lowes=False,
             download_dir=download_dir,
             headless=headless,
-            report_day=report_day,
+            report_day=day,
         )
         return d, l, None
 
@@ -836,7 +876,7 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
             run_lowes=True,
             download_dir=download_dir,
             headless=headless,
-            report_day=report_day,
+            report_day=day,
         )
         return d, l, None
 
@@ -846,8 +886,9 @@ async def run_export(mode: str = "all") -> tuple[Path | None, Path | None, Path 
 def main(argv: list[str] | None = None) -> None:
     argv = list(argv if argv is not None else sys.argv[1:])
     try:
+        argv, report_day = resolve_report_day(argv)
         mode = resolve_run_mode(argv)
-        depot_out, lowes_out, tractor_out = asyncio.run(run_export(mode))
+        depot_out, lowes_out, tractor_out = asyncio.run(run_export(mode, report_day=report_day))
         if depot_out is not None:
             _log(f"Done Depot: {depot_out}")
         elif mode in ("depot", "retail", "all"):

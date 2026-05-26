@@ -19,6 +19,7 @@ Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 If any step fails (e.g. no invoices for a closed day), later phases still run; errors are
 summarized at the end.
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
+Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --sequential-lanes to run each phase's two sides one after the other instead of parallel.
 
@@ -35,6 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -109,6 +111,22 @@ def _normalize_invoice_report_modes(raw: list[str] | None) -> list[str]:
     if keys == frozenset({"depot", "lowes"}):
         return ["retail"]
     return out
+
+
+def parse_invoice_report_date(raw: str, invoice_dir: Path) -> date:
+    """Parse a custom invoice date using the invoice report module."""
+    invoice_dir = invoice_dir.resolve()
+    inserted = False
+    if str(invoice_dir) not in sys.path:
+        sys.path.insert(0, str(invoice_dir))
+        inserted = True
+    try:
+        from commercehub_previous_business_day import parse_report_date
+
+        return parse_report_date(raw)
+    finally:
+        if inserted:
+            sys.path.remove(str(invoice_dir))
 
 
 def _inventory_venv_python() -> Path:
@@ -407,6 +425,15 @@ def main() -> int:
         action="store_true",
         help="Run only invoice report phase(s) and exit (no CommerceHub chain, no SPS).",
     )
+    parser.add_argument(
+        "--invoice-report-date",
+        metavar="DATE",
+        default=None,
+        help=(
+            "Custom calendar date for invoice reports (Depot, Lowe's, Tractor Supply). "
+            "Formats: YYYY-MM-DD or MM/DD/YYYY. Default is previous business day."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -429,6 +456,15 @@ def main() -> int:
     sequential_lanes = bool(args.sequential_lanes)
     skip_invoice_report = bool(args.skip_invoice_report)
     invoice_report_dir, invoice_search_tried = discover_invoice_report_directory(args.invoice_report_dir)
+    invoice_report_date: date | None = None
+    if args.invoice_report_date:
+        try:
+            invoice_report_date = parse_invoice_report_date(
+                args.invoice_report_date.strip(), invoice_report_dir
+            )
+        except ValueError as exc:
+            print(f"\nERROR: {exc}")
+            return 1
 
     if grainger_only:
         skip_commercehub = True
@@ -721,6 +757,11 @@ def main() -> int:
                 + "\nPhase 0 — CommerceHub invoice reports\n"
                 + "=" * 60
                 + f"\n  Modes: {', '.join(invoice_modes)}\n"
+                + (
+                    f"  Report date: {invoice_report_date.isoformat()} (custom)\n"
+                    if invoice_report_date is not None
+                    else "  Report date: previous business day (default)\n"
+                )
             )
             inv_py_parts, invoice_py_err = resolve_invoice_report_python(invoice_report_dir)
             if invoice_py_err:
@@ -734,6 +775,8 @@ def main() -> int:
                 for mode in invoice_modes:
                     label = mode_labels.get(mode, mode)
                     cmd = inv_py_parts + [str(export_script), mode]
+                    if invoice_report_date is not None:
+                        cmd.extend(["--date", invoice_report_date.isoformat()])
                     title = f"CommerceHub invoice report — {label}"
                     errors.extend(_run_single(title, cmd, invoice_report_dir))
 

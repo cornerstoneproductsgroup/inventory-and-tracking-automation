@@ -2742,24 +2742,20 @@ def _create_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> bo
         raise RuntimeError("Could not click Create New for Shipment.")
     wait_for_asn_form_ready(page, timeout_ms=90_000)
     fill_asn_date(page)
+    # For Tractor Supply, ASNs can be single-SKU (one pack page) or multi-SKU
+    # where the tracking field lives under an Order tab with internal paging.
+    # Always switch to the first Order tab and walk all packInfo pages,
+    # filling the same tracking number on each page until the next-page
+    # arrow is disabled / no further pages are found.
+    try:
+        _click_asn_order_tab(page, 0)
+    except Exception:
+        # Some layouts may already default to the Order tab; continue best-effort.
+        pass
 
-    tracking_filled = False
-    for ctx in _contexts(page):
-        inputs = ctx.locator("input[data-testid*='trackingNumber-input__input'], input[aria-label='Carrier Tracking #']")
-        for i in range(inputs.count()):
-            inp = inputs.nth(i)
-            try:
-                if not inp.is_visible():
-                    continue
-            except Exception:
-                continue
-            if _fill_tracking_input(inp, tracking):
-                tracking_filled = True
-                break
-        if tracking_filled:
-            break
-    if not tracking_filled:
-        raise RuntimeError("Could not fill ASN tracking input for current order.")
+    filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
+    if filled_pages <= 0:
+        raise RuntimeError("Could not fill ASN tracking input(s) for current order (no pack pages updated).")
 
     if submit:
         send_documents(page)
