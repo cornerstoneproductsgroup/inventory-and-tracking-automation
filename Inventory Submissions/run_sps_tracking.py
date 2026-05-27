@@ -2753,9 +2753,38 @@ def _create_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> bo
         # Some layouts may already default to the Order tab; continue best-effort.
         pass
 
+    fill_path = "pack-pages-primary"
     filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
     if filled_pages <= 0:
+        # Fallback for alternate ASN layouts: use context-scoped deterministic filler.
+        fill_path = "order-index-fallback"
+        for ctx in _contexts(page):
+            try:
+                filled_pages = max(filled_pages, _fill_tracking_for_order_index(ctx, 0, tracking))
+            except Exception:
+                continue
+    if filled_pages <= 0:
+        # Last fallback: card-scoped fill that uses tab/panel relationships.
+        fill_path = "card-fallback"
+        for ctx in _contexts(page):
+            try:
+                cards = ctx.locator(
+                    "xpath=//*[.//span[normalize-space()='Order'] and "
+                    "(.//input[contains(@data-testid,'trackingNumber-input__input')] "
+                    "or .//input[@aria-label='Carrier Tracking #'])]"
+                )
+                n_cards = cards.count()
+                for i in range(min(n_cards, 4)):
+                    filled_pages = max(filled_pages, _fill_tracking_for_card(cards.nth(i), tracking))
+            except Exception:
+                continue
+    if filled_pages <= 0:
         raise RuntimeError("Could not fill ASN tracking input(s) for current order (no pack pages updated).")
+    asn_shape = "single-page" if filled_pages == 1 else "multi-page"
+    print(
+        f"ASN tracking: {asn_shape}, filled {filled_pages} pack page(s) "
+        f"for current order via {fill_path}."
+    )
 
     if submit:
         send_documents(page)
@@ -3381,25 +3410,36 @@ def wait_for_asn_form_ready(page: Page, timeout_ms: int = 90_000) -> None:
 def _click_asn_order_tab(page: Page, order_idx: int) -> None:
     """For multi-SKU cards, switch from Header -> Order tab for the given ASN row."""
     for ctx in _contexts(page):
-        tab = ctx.locator("[data-testid='tab-asn_order']").nth(order_idx)
-        if tab.count() == 0:
-            continue
-        try:
-            tab.scroll_into_view_if_needed()
-        except Exception:
-            pass
-        try:
-            tab.click(timeout=2000)
-            page.wait_for_timeout(200)
-            return
-        except Exception:
-            clear_click_blockers(page)
+        for sel in (
+            "[data-testid='tab-asn_order']",
+            "div[role='tab'][data-key='order']",
+            "div[role='tab']:has-text('Order')",
+            "span:has-text('Order')",
+        ):
+            tab = ctx.locator(sel).nth(order_idx)
+            if tab.count() == 0:
+                continue
             try:
-                tab.click(timeout=2000, force=True)
+                tab.scroll_into_view_if_needed()
+            except Exception:
+                pass
+            try:
+                tab.click(timeout=2000)
                 page.wait_for_timeout(200)
                 return
             except Exception:
-                continue
+                clear_click_blockers(page)
+                try:
+                    tab.click(timeout=2000, force=True)
+                    page.wait_for_timeout(200)
+                    return
+                except Exception:
+                    try:
+                        tab.evaluate("el => el.click()")
+                        page.wait_for_timeout(200)
+                        return
+                    except Exception:
+                        continue
 
 
 def _fill_tracking_input(input_loc, tracking: str) -> bool:
@@ -3496,7 +3536,13 @@ def _fill_pack_pages_for_order(page: Page, order_idx: int, tracking: str) -> int
                 continue
 
         # If next index is not attached yet, try paging forward inside the ASN order card.
-        next_btns = page.locator("button[aria-label='Go to Next Page'][title='Go to Next Page']")
+        next_btns = page.locator(
+            "button[aria-label='Go to Next Page'][title='Go to Next Page'], "
+            "button[aria-label='Go to Next Page'], "
+            "button[title='Go to Next Page'], "
+            "button:has(i.sps-icon-chevron-right), "
+            "[role='button']:has(i.sps-icon-chevron-right)"
+        )
         moved = False
         for b in range(next_btns.count()):
             btn = next_btns.nth(b)
