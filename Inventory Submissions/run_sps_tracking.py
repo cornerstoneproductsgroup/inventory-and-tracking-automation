@@ -3450,6 +3450,19 @@ def _click_asn_order_tab(page: Page, order_idx: int) -> None:
                         return
                     except Exception:
                         continue
+    # Global fallback: any tab with accessible name "Order".
+    try:
+        clear_click_blockers(page)
+        order_tab = page.get_by_role("tab", name=re.compile(r"\border\b", re.I)).first
+        if order_tab.count() > 0:
+            try:
+                order_tab.click(timeout=2000)
+            except Exception:
+                order_tab.click(timeout=2000, force=True)
+            page.wait_for_timeout(200)
+            return
+    except Exception:
+        return
 
 
 def _fill_tracking_input(input_loc, tracking: str) -> bool:
