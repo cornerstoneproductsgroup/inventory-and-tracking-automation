@@ -2742,83 +2742,39 @@ def _create_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> bo
         raise RuntimeError("Could not click Create New for Shipment.")
     wait_for_asn_form_ready(page, timeout_ms=90_000)
     fill_asn_date(page)
-    # For Tractor Supply, ASNs can be single-SKU (one pack page) or multi-SKU
-    # where the tracking field lives under an Order tab with internal paging.
-    # Robustly switch to the Order tab before filling tracking so multi-SKU
-    # cards expose the packInfo pages and Carrier Tracking # inputs.
-    order_tab_clicked = False
-    for _ in range(3):
-        clear_click_blockers(page)
-        for ctx in _contexts(page):
-            tab = ctx.locator(
-                "div[role='tab'][data-key='order'], "
-                "[data-testid='tab-asn_order'] span:has-text('Order'), "
-                "span:has-text('Order')"
-            ).first
+    page.wait_for_timeout(300)
+
+    # Single-SKU: tracking may be visible on Header. Multi-SKU: tracking is on Order tab only.
+    filled_pages = 0
+    fill_path = "header-visible"
+    for ctx in _contexts(page):
+        loc = ctx.locator(
+            "input[data-testid^='asn.order.0.packInfo.'][data-testid$='trackingNumber-input__input']"
+        )
+        for i in range(loc.count()):
+            inp = loc.nth(i)
             try:
-                if tab.count() == 0 or not tab.is_visible():
-                    continue
+                if inp.is_visible() and _fill_tracking_input(inp, tracking):
+                    filled_pages = 1
+                    print("ASN: single-page tracking filled on current tab (Header).")
+                    break
             except Exception:
                 continue
-            try:
-                tab.click(timeout=2000)
-            except Exception:
-                try:
-                    tab.click(timeout=2000, force=True)
-                except Exception:
-                    try:
-                        tab.evaluate("el => el.click()")
-                    except Exception:
-                        continue
-            page.wait_for_timeout(260)
-            order_tab_clicked = True
+        if filled_pages > 0:
             break
-        if order_tab_clicked:
-            break
-        page.wait_for_timeout(200)
-    if not order_tab_clicked:
-        try:
-            _click_asn_order_tab(page, 0)
-            order_tab_clicked = True
-        except Exception:
-            # Some layouts may already default to the Order tab; continue best-effort.
-            pass
 
-    fill_path = "pack-pages-primary"
-    filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
-    best_pages = filled_pages
-    best_path = fill_path
-
-    # Always run the order-index filler too; on some SPS layouts page 1 fills fine
-    # but extra pages only become reachable through this path's next-page handling.
-    for ctx in _contexts(page):
-        try:
-            n = _fill_tracking_for_order_index(ctx, 0, tracking)
-            if n > best_pages:
-                best_pages = n
-                best_path = "order-index-fallback"
-        except Exception:
-            continue
-
-    # Card-scoped fallback for tab/panel variants.
-    for ctx in _contexts(page):
-        try:
-            cards = ctx.locator(
-                "xpath=//*[.//span[normalize-space()='Order'] and "
-                "(.//input[contains(@data-testid,'trackingNumber-input__input')] "
-                "or .//input[@aria-label='Carrier Tracking #'])]"
+    if filled_pages <= 0:
+        fill_path = "order-tab-pack-pages"
+        if not _ensure_asn_order_tab_selected(page, 0):
+            raise RuntimeError(
+                "ASN ship date was set but Order tab could not be selected for tracking entry."
             )
-            n_cards = cards.count()
-            for i in range(min(n_cards, 4)):
-                n = _fill_tracking_for_card(cards.nth(i), tracking)
-                if n > best_pages:
-                    best_pages = n
-                    best_path = "card-fallback"
-        except Exception:
-            continue
+        filled_pages = _fill_tractor_asn_tracking_all_pack_pages(page, 0, tracking)
+        if filled_pages <= 0:
+            filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
+            if filled_pages > 0:
+                fill_path = "order-tab-pack-pages-fallback"
 
-    filled_pages = best_pages
-    fill_path = best_path
     if filled_pages <= 0:
         raise RuntimeError("Could not fill ASN tracking input(s) for current order (no pack pages updated).")
     asn_shape = "single-page" if filled_pages == 1 else "multi-page"
@@ -3448,52 +3404,97 @@ def wait_for_asn_form_ready(page: Page, timeout_ms: int = 90_000) -> None:
     raise RuntimeError("ASN page did not become ready for ship date / tracking entry in time.")
 
 
-def _click_asn_order_tab(page: Page, order_idx: int) -> None:
-    """For multi-SKU cards, switch from Header -> Order tab for the given ASN row."""
+def _asn_order_tab_locator(ctx, order_idx: int = 0):
+    """SPS ASN Order tab: div[role=tab][data-key=order] wrapping data-testid=tab-asn_order."""
+    tab = ctx.locator("div[role='tab'][data-key='order']").nth(order_idx)
+    if tab.count() > 0:
+        return tab
+    return ctx.locator("[data-testid='tab-asn_order']").nth(order_idx).locator(
+        "xpath=ancestor::*[@role='tab' and @data-key='order'][1]"
+    )
+
+
+def _asn_order_tab_is_selected(page: Page, order_idx: int = 0) -> bool:
     for ctx in _contexts(page):
-        for sel in (
-            "[data-testid='tab-asn_order']",
-            "div[role='tab'][data-key='order']",
-            "div[role='tab']:has-text('Order')",
-            "span:has-text('Order')",
-        ):
-            tab = ctx.locator(sel).nth(order_idx)
+        tab = _asn_order_tab_locator(ctx, order_idx)
+        if tab.count() == 0:
+            continue
+        try:
+            if (tab.get_attribute("aria-selected") or "").lower() == "true":
+                return True
+            if "active" in (tab.get_attribute("class") or "").lower():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _ensure_asn_order_tab_selected(page: Page, order_idx: int = 0, *, timeout_ms: int = 20_000) -> bool:
+    """Click Order tab (Header -> Order) and wait for pack tracking inputs to appear."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if _asn_order_tab_is_selected(page, order_idx):
+            for ctx in _contexts(page):
+                trk = ctx.locator(
+                    f"input[data-testid^='asn.order.{order_idx}.packInfo.']"
+                    "[data-testid$='trackingNumber-input__input']"
+                ).first
+                try:
+                    if trk.count() > 0 and trk.is_visible():
+                        return True
+                except Exception:
+                    pass
+        clear_click_blockers(page)
+        clicked = False
+        for ctx in _contexts(page):
+            tab = _asn_order_tab_locator(ctx, order_idx)
             if tab.count() == 0:
                 continue
             try:
                 tab.scroll_into_view_if_needed()
             except Exception:
                 pass
-            try:
-                tab.click(timeout=2000)
-                page.wait_for_timeout(200)
-                return
-            except Exception:
-                clear_click_blockers(page)
+            for click_fn in (
+                lambda t: t.click(timeout=2500),
+                lambda t: t.click(timeout=2500, force=True),
+                lambda t: t.evaluate("el => el.click()"),
+            ):
                 try:
-                    tab.click(timeout=2000, force=True)
-                    page.wait_for_timeout(200)
-                    return
+                    click_fn(tab)
+                    clicked = True
+                    break
                 except Exception:
-                    try:
-                        tab.evaluate("el => el.click()")
-                        page.wait_for_timeout(200)
-                        return
-                    except Exception:
-                        continue
-    # Global fallback: any tab with accessible name "Order".
-    try:
-        clear_click_blockers(page)
-        order_tab = page.get_by_role("tab", name=re.compile(r"\border\b", re.I)).first
-        if order_tab.count() > 0:
+                    continue
+            if clicked:
+                break
+        if not clicked:
             try:
-                order_tab.click(timeout=2000)
+                page.get_by_role("tab", name=re.compile(r"^Order$", re.I)).first.click(timeout=2500)
+                clicked = True
             except Exception:
-                order_tab.click(timeout=2000, force=True)
-            page.wait_for_timeout(200)
-            return
-    except Exception:
-        return
+                pass
+        page.wait_for_timeout(400)
+        if _asn_order_tab_is_selected(page, order_idx):
+            for ctx in _contexts(page):
+                trk = ctx.locator(
+                    f"input[data-testid^='asn.order.{order_idx}.packInfo.']"
+                    "[data-testid$='trackingNumber-input__input']"
+                ).first
+                try:
+                    if trk.count() > 0 and trk.is_visible():
+                        print("ASN: Order tab selected; pack tracking field visible.")
+                        return True
+                except Exception:
+                    pass
+        page.wait_for_timeout(250)
+    print("WARN: ASN Order tab or pack tracking field did not become ready in time.")
+    return False
+
+
+def _click_asn_order_tab(page: Page, order_idx: int) -> None:
+    """For multi-SKU cards, switch from Header -> Order tab for the given ASN row."""
+    if not _ensure_asn_order_tab_selected(page, order_idx):
+        raise RuntimeError("Could not select ASN Order tab.")
 
 
 def _fill_tracking_input(input_loc, tracking: str) -> bool:
@@ -3533,6 +3534,126 @@ def _fill_tracking_input(input_loc, tracking: str) -> bool:
                 return False
         except Exception:
             return False
+
+
+def _pack_info_next_page_button(page: Page, order_idx: int = 0):
+    """
+    Next-page chevron inside PACK INFO (1, 2, >), not footer list pagination.
+    Scoped from the visible Carrier Tracking # input for this order.
+    """
+    for ctx in _contexts(page):
+        inputs = ctx.locator(
+            f"input[data-testid^='asn.order.{order_idx}.packInfo.']"
+            "[data-testid$='trackingNumber-input__input'], "
+            "input[aria-label='Carrier Tracking #']"
+        )
+        for i in range(min(inputs.count(), 8)):
+            inp = inputs.nth(i)
+            try:
+                if not inp.is_visible():
+                    continue
+            except Exception:
+                continue
+            section = inp.locator(
+                "xpath=ancestor::*["
+                ".//button[@aria-label='Go to Next Page' or @title='Go to Next Page']"
+                " or .//i[contains(@class,'chevron-right')]"
+                "][1]"
+            )
+            for sel in (
+                "button[aria-label='Go to Next Page'][title='Go to Next Page']",
+                "button.sps-button__clickable-element:has(i.sps-icon-chevron-right)",
+                "button:has(i.sps-icon-chevron-right)",
+            ):
+                btn = section.locator(sel).first
+                if btn.count() > 0:
+                    return btn
+    return page.locator("button.sps-button__clickable-element:has(i.sps-icon-chevron-right)").first
+
+
+def _pack_info_next_page_enabled(btn) -> bool:
+    try:
+        if btn.count() == 0 or not btn.is_visible():
+            return False
+        if not btn.is_enabled():
+            return False
+        disabled = (btn.get_attribute("disabled") or "").strip().lower()
+        if disabled in ("", "false"):
+            pass
+        else:
+            return False
+        cls = (btn.get_attribute("class") or "").lower()
+        if "disabled" in cls:
+            return False
+        icon = btn.locator("i.sps-icon-chevron-right").first
+        if icon.count() > 0:
+            icls = (icon.get_attribute("class") or "").lower()
+            if "disabled" in icls:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _fill_tractor_asn_tracking_all_pack_pages(page: Page, order_idx: int, tracking: str) -> int:
+    """
+    On the Order tab: fill Carrier Tracking # on page 1, click >, fill page 2, repeat until
+    the pack-info next arrow is disabled (last page).
+    """
+    filled_pages = 0
+    visited_pack: set[int] = set()
+    max_steps = 30
+
+    for step in range(max_steps):
+        clear_click_blockers(page)
+        filled_this_round = False
+
+        for ctx in _contexts(page):
+            loc = ctx.locator(
+                f"input[data-testid^='asn.order.{order_idx}.packInfo.']"
+                "[data-testid$='trackingNumber-input__input']"
+            )
+            for i in range(loc.count()):
+                inp = loc.nth(i)
+                try:
+                    if not inp.is_visible():
+                        continue
+                except Exception:
+                    continue
+                testid = inp.get_attribute("data-testid") or ""
+                m = re.search(rf"packInfo\.(\d+)\.", testid)
+                pack_idx = int(m.group(1)) if m else i
+                if pack_idx in visited_pack:
+                    continue
+                if _fill_tracking_input(inp, tracking):
+                    visited_pack.add(pack_idx)
+                    filled_pages += 1
+                    filled_this_round = True
+                    print(f"ASN pack page {pack_idx + 1}: filled tracking.")
+                break
+            if filled_this_round:
+                break
+
+        next_btn = _pack_info_next_page_button(page, order_idx)
+        if not _pack_info_next_page_enabled(next_btn):
+            break
+        try:
+            next_btn.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            next_btn.click(timeout=2000)
+        except Exception:
+            try:
+                next_btn.evaluate("el => el.click()")
+            except Exception:
+                try:
+                    next_btn.click(timeout=2000, force=True)
+                except Exception:
+                    break
+        page.wait_for_timeout(350)
+
+    return filled_pages
 
 
 def _fill_pack_pages_for_order(page: Page, order_idx: int, tracking: str) -> int:
