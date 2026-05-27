@@ -2744,14 +2744,45 @@ def _create_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> bo
     fill_asn_date(page)
     # For Tractor Supply, ASNs can be single-SKU (one pack page) or multi-SKU
     # where the tracking field lives under an Order tab with internal paging.
-    # Always switch to the first Order tab and walk all packInfo pages,
-    # filling the same tracking number on each page until the next-page
-    # arrow is disabled / no further pages are found.
-    try:
-        _click_asn_order_tab(page, 0)
-    except Exception:
-        # Some layouts may already default to the Order tab; continue best-effort.
-        pass
+    # Robustly switch to the Order tab before filling tracking so multi-SKU
+    # cards expose the packInfo pages and Carrier Tracking # inputs.
+    order_tab_clicked = False
+    for _ in range(3):
+        clear_click_blockers(page)
+        for ctx in _contexts(page):
+            tab = ctx.locator(
+                "div[role='tab'][data-key='order'], "
+                "[data-testid='tab-asn_order'] span:has-text('Order'), "
+                "span:has-text('Order')"
+            ).first
+            try:
+                if tab.count() == 0 or not tab.is_visible():
+                    continue
+            except Exception:
+                continue
+            try:
+                tab.click(timeout=2000)
+            except Exception:
+                try:
+                    tab.click(timeout=2000, force=True)
+                except Exception:
+                    try:
+                        tab.evaluate("el => el.click()")
+                    except Exception:
+                        continue
+            page.wait_for_timeout(260)
+            order_tab_clicked = True
+            break
+        if order_tab_clicked:
+            break
+        page.wait_for_timeout(200)
+    if not order_tab_clicked:
+        try:
+            _click_asn_order_tab(page, 0)
+            order_tab_clicked = True
+        except Exception:
+            # Some layouts may already default to the Order tab; continue best-effort.
+            pass
 
     fill_path = "pack-pages-primary"
     filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
