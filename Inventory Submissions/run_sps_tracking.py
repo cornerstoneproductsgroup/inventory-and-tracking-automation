@@ -2755,29 +2755,39 @@ def _create_asn_for_open_order(page: Page, tracking: str, *, submit: bool) -> bo
 
     fill_path = "pack-pages-primary"
     filled_pages = _fill_pack_pages_for_order(page, 0, tracking)
-    if filled_pages <= 0:
-        # Fallback for alternate ASN layouts: use context-scoped deterministic filler.
-        fill_path = "order-index-fallback"
-        for ctx in _contexts(page):
-            try:
-                filled_pages = max(filled_pages, _fill_tracking_for_order_index(ctx, 0, tracking))
-            except Exception:
-                continue
-    if filled_pages <= 0:
-        # Last fallback: card-scoped fill that uses tab/panel relationships.
-        fill_path = "card-fallback"
-        for ctx in _contexts(page):
-            try:
-                cards = ctx.locator(
-                    "xpath=//*[.//span[normalize-space()='Order'] and "
-                    "(.//input[contains(@data-testid,'trackingNumber-input__input')] "
-                    "or .//input[@aria-label='Carrier Tracking #'])]"
-                )
-                n_cards = cards.count()
-                for i in range(min(n_cards, 4)):
-                    filled_pages = max(filled_pages, _fill_tracking_for_card(cards.nth(i), tracking))
-            except Exception:
-                continue
+    best_pages = filled_pages
+    best_path = fill_path
+
+    # Always run the order-index filler too; on some SPS layouts page 1 fills fine
+    # but extra pages only become reachable through this path's next-page handling.
+    for ctx in _contexts(page):
+        try:
+            n = _fill_tracking_for_order_index(ctx, 0, tracking)
+            if n > best_pages:
+                best_pages = n
+                best_path = "order-index-fallback"
+        except Exception:
+            continue
+
+    # Card-scoped fallback for tab/panel variants.
+    for ctx in _contexts(page):
+        try:
+            cards = ctx.locator(
+                "xpath=//*[.//span[normalize-space()='Order'] and "
+                "(.//input[contains(@data-testid,'trackingNumber-input__input')] "
+                "or .//input[@aria-label='Carrier Tracking #'])]"
+            )
+            n_cards = cards.count()
+            for i in range(min(n_cards, 4)):
+                n = _fill_tracking_for_card(cards.nth(i), tracking)
+                if n > best_pages:
+                    best_pages = n
+                    best_path = "card-fallback"
+        except Exception:
+            continue
+
+    filled_pages = best_pages
+    fill_path = best_path
     if filled_pages <= 0:
         raise RuntimeError("Could not fill ASN tracking input(s) for current order (no pack pages updated).")
     asn_shape = "single-page" if filled_pages == 1 else "multi-page"
@@ -3541,7 +3551,9 @@ def _fill_pack_pages_for_order(page: Page, order_idx: int, tracking: str) -> int
             "button[aria-label='Go to Next Page'], "
             "button[title='Go to Next Page'], "
             "button:has(i.sps-icon-chevron-right), "
-            "[role='button']:has(i.sps-icon-chevron-right)"
+            "[role='button']:has(i.sps-icon-chevron-right), "
+            "button.sps-btn-icon:has(i.sps-icon-chevron-right), "
+            "i.sps-icon-chevron-right"
         )
         moved = False
         for b in range(next_btns.count()):
