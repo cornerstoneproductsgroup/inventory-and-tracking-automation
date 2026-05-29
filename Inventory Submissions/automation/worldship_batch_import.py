@@ -681,19 +681,32 @@ def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 5.0) -> None
     raise RuntimeError(f"Could not set checkbox {label!r}: {last_err}")
 
 
-def _enum_visible_modal_hwnds() -> list[tuple[int, str]]:
+@dataclass(frozen=True)
+class ModalDialog:
+    hwnd: int
+    title: str
+
+    @property
+    def handle(self) -> int:
+        return self.hwnd
+
+
+def _enum_visible_modal_hwnds(*, title_hint: str = "") -> list[tuple[int, str]]:
     import win32gui
 
+    hint = title_hint.lower()
     out: list[tuple[int, str]] = []
 
     def _cb(hwnd, _):
         try:
             if not win32gui.IsWindowVisible(hwnd):
                 return True
-            if win32gui.GetClassName(hwnd) != "#32770":
-                return True
+            cls = win32gui.GetClassName(hwnd) or ""
             title = (win32gui.GetWindowText(hwnd) or "").strip()
-            out.append((hwnd, title))
+            if not title and cls != "#32770":
+                return True
+            if cls == "#32770" or (hint and hint in title.lower()):
+                out.append((hwnd, title))
         except Exception:
             pass
         return True
@@ -703,6 +716,30 @@ def _enum_visible_modal_hwnds() -> list[tuple[int, str]]:
     except Exception:
         pass
     return out
+
+
+def _find_modal_dialog(title_hint: str, *, timeout_s: float = 90) -> ModalDialog:
+    """Wait for a visible modal by Win32 title (UIA often misses WorldShip dialogs)."""
+    import win32gui
+
+    hint = title_hint.lower()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for hwnd, title in _enum_visible_modal_hwnds(title_hint=title_hint):
+            if hint not in title.lower():
+                continue
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            _log(f"Found dialog: {title!r}")
+            return ModalDialog(hwnd=hwnd, title=title)
+        time.sleep(0.15)
+    visible = [t for _, t in _enum_visible_modal_hwnds()]
+    raise TimeoutError(
+        f"Timed out waiting for dialog containing {title_hint!r} ({timeout_s:.0f}s). "
+        f"Visible dialogs: {visible or '(none)'}"
+    )
 
 
 def _click_button_win32(hwnd: int, button_text: str) -> bool:
@@ -754,7 +791,7 @@ def _click_dialog_button(
     hint = title_hint.lower()
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        modals = _enum_visible_modal_hwnds()
+        modals = _enum_visible_modal_hwnds(title_hint=title_hint)
         if hint:
             modals = sorted(
                 modals,
@@ -764,11 +801,14 @@ def _click_dialog_button(
             if _click_button_win32(hwnd, title):
                 return
         try:
-            handle = dlg.handle
+            handle = _dialog_hwnd(dlg)
             if handle and _click_button_win32(handle, title):
                 return
         except Exception:
             pass
+        if isinstance(dlg, ModalDialog):
+            time.sleep(0.05)
+            continue
         for target in _matching_controls(dlg, title=title, control_types=("Button",)):
             try:
                 if target.is_visible() and target.is_enabled():
@@ -785,6 +825,11 @@ def _click_dialog_button(
 
 
 def _find_dialog(app, title: str, *, timeout_s: float = 90):
+    """Find a modal dialog — Win32 first, UIA fallback."""
+    try:
+        return _find_modal_dialog(title, timeout_s=min(timeout_s, 15.0))
+    except TimeoutError:
+        pass
     dlg = app.window(title=title)
     dlg.wait("visible", timeout=int(timeout_s))
     try:
@@ -794,14 +839,21 @@ def _find_dialog(app, title: str, *, timeout_s: float = 90):
     return dlg
 
 
-def _read_preview_text(preview) -> str:
+def _dialog_hwnd(dlg) -> int | None:
+    if isinstance(dlg, ModalDialog):
+        return dlg.hwnd
     try:
-        hwnd = preview.handle
+        return int(dlg.handle)
+    except Exception:
+        return None
+
+
+def _read_preview_text(preview) -> str:
+    hwnd = _dialog_hwnd(preview)
+    if hwnd:
         parts = _safe_enum_child_text(hwnd)
         if parts:
             return "\n".join(parts)
-    except Exception:
-        pass
     try:
         edit = preview.child_window(control_type="Edit", found_index=0)
         if edit.exists(timeout=0.15):
@@ -940,7 +992,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _click_dialog_button(wizard, "Next", title_hint="Batch Import", timeout_s=4)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
-    preview = _find_dialog(app, PREVIEW_DIALOG_TITLE, timeout_s=120)
+    preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=120)
     preview_text = _read_preview_text(preview)
     record_count, import_source = _parse_preview(preview_text)
     if import_source:
@@ -950,7 +1002,8 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         _log("WARN: zero records — continuing with Next as configured.")
 
     _log("Clicking Next (Import/Export Preview)…")
-    _click_dialog_button(preview, "Next", title_hint=PREVIEW_DIALOG_TITLE, timeout_s=5)
+    if not _click_button_win32(preview.hwnd, "Next"):
+        _click_dialog_button(preview, "Next", title_hint=PREVIEW_DIALOG_TITLE, timeout_s=5)
 
     labels_saved = 0
     if record_count > 0:
