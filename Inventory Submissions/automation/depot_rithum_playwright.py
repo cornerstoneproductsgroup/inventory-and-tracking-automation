@@ -33,6 +33,10 @@ SPECIAL_ORDER_QUICKSHIP_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
     "&tabContext=web_quickship&status=open&substatus=accepted&merchant=thdso"
 )
+SPECIAL_ORDER_QUICKINVOICE_URL = (
+    "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickinvoice"
+    "&tabContext=web_quickinvoice&merchant=thdso"
+)
 SPECIAL_ORDER_CONTACT_NAME = "Joey"
 SPECIAL_ORDER_SHIPPING_VALUE = "UG"  # UPS Ground
 
@@ -506,6 +510,214 @@ def run_depot_special_order_tracking_with_page(
         page.wait_for_timeout(POST_SUBMIT_MS)
     else:
         print(f"Depot Special Orders: stopped after {MAX_SHIP_PAGES} batches (safety cap).")
+
+
+def _wait_for_special_order_invoice_page_ready(page: Page, timeout_ms: int) -> bool:
+    deadline = time.monotonic() + max(1000, timeout_ms) / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+        try:
+            if page.locator("input[name$='.invoicenumber.autofill']").count() > 0:
+                return True
+            if page.locator("select[name$='.termstypecode']").count() > 0:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(400 if _chain_fast() else 700)
+    return False
+
+
+def _open_depot_special_order_quickinvoice(page: Page) -> bool:
+    """Navigate to thdso Needs Invoicing queue. Returns False when queue is empty."""
+    print("Depot Special Orders: opening Needs Invoicing queue...")
+    page.goto(SPECIAL_ORDER_QUICKINVOICE_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(250 if _chain_fast() else 500)
+    if _wait_for_special_order_invoice_page_ready(page, 15_000):
+        return True
+
+    page.goto(SPECIAL_ORDER_SUMMARY_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(300 if _chain_fast() else 600)
+    needs_inv = page.locator(
+        "a[href*='merchant=thdso'][href*='web_quickinvoice'], "
+        "a[href*='gotoOrderRealmForm.do?action=web_quickinvoice'][href*='merchant=thdso']"
+    ).filter(has_text=re.compile(r"needs\s+invoicing", re.I)).first
+    if needs_inv.count() == 0:
+        needs_inv = page.get_by_role("link", name=re.compile(r"needs\s+invoicing", re.I)).first
+    if needs_inv.count() == 0:
+        print("Depot Special Orders invoicing: no Needs Invoicing link; skipping.")
+        return False
+    try:
+        needs_inv.click()
+        page.wait_for_load_state("domcontentloaded")
+    except Exception as exc:
+        print(f"Depot Special Orders invoicing: could not open queue ({exc}); skipping.")
+        return False
+
+    if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+        print("Depot Special Orders invoicing: queue empty or not ready; skipping.")
+        return False
+    return True
+
+
+def _special_order_invoice_order_ids(page: Page) -> list[str]:
+    """Hub order ids present on the current Needs Invoicing page."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for sel in (
+        "input[name$='.invoicenumber.autofill']",
+        "select[name$='.termstypecode']",
+    ):
+        loc = page.locator(sel)
+        for i in range(loc.count()):
+            node = loc.nth(i)
+            token = (node.get_attribute("name") or node.get_attribute("id") or "").strip()
+            match = re.search(r"order\((\d+)\)", token)
+            if not match:
+                continue
+            oid = match.group(1)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            ids.append(oid)
+    return ids
+
+
+def _fill_special_order_invoice_order(page: Page, order_id: str) -> bool:
+    """Fill terms + Auto Fill invoice number for one Special Order on the invoice page."""
+    touched = False
+
+    terms_type = page.locator(f"[id='order({order_id}).termstypecode']")
+    if terms_type.count() > 0 and not _filled_select(page, f"[id='order({order_id}).termstypecode']"):
+        try:
+            terms_type.select_option(value="01")
+        except Exception:
+            terms_type.select_option(label="01: Basic")
+        touched = True
+
+    disc_pct = page.locator(f"[id='order({order_id}).termsdiscountpercent']")
+    if disc_pct.count() > 0 and not _filled_input(page, f"[id='order({order_id}).termsdiscountpercent']"):
+        disc_pct.fill("")
+        disc_pct.fill("1")
+        touched = True
+
+    net_days = page.locator(f"[id='order({order_id}).termsnetdaysdue']")
+    if net_days.count() > 0 and not _filled_input(page, f"[id='order({order_id}).termsnetdaysdue']"):
+        net_days.fill("")
+        net_days.fill("30")
+        touched = True
+
+    autofill = page.locator(f"[id='order({order_id}).invoicenumber.autofill']")
+    if autofill.count() > 0:
+        try:
+            autofill.click()
+            touched = True
+        except Exception:
+            pass
+
+    basis = page.locator(f"[id='order({order_id}).termsBasisDateCode']")
+    if basis.count() > 0 and not _filled_select(page, f"[id='order({order_id}).termsBasisDateCode']"):
+        try:
+            basis.select_option(value="3")
+        except Exception:
+            basis.select_option(label="3: Invoice Date")
+        touched = True
+
+    disc_days = page.locator(f"[id='order({order_id}).termsdiscountdaysdue']")
+    if disc_days.count() > 0 and not _filled_input(page, f"[id='order({order_id}).termsdiscountdaysdue']"):
+        disc_days.fill("")
+        disc_days.fill("29")
+        touched = True
+
+    return touched
+
+
+def _fill_special_order_invoice_quantities(page: Page) -> int:
+    """Copy invoiceable qty into invoiced fields for all orders on the page."""
+    filled = 0
+    cells = page.locator("td[id$='.invoiceable']")
+    for i in range(cells.count()):
+        try:
+            cell = cells.nth(i)
+            qty = (cell.inner_text() or "").strip()
+            if not qty.isdigit():
+                continue
+            cid = cell.get_attribute("id") or ""
+            input_id = cid.replace("cell.line.", "").replace(".invoiceable", ".invoiced")
+            box = page.locator(f"[id='{input_id}']")
+            if box.count() == 0:
+                continue
+            try:
+                if (box.input_value() or "").strip():
+                    continue
+            except Exception:
+                pass
+            box.fill("")
+            box.fill(qty)
+            filled += 1
+        except Exception:
+            continue
+    return filled
+
+
+def _process_depot_special_order_invoice_page(page: Page) -> bool:
+    if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+        print("Depot Special Orders invoicing: timed out waiting for invoice page; moving on.")
+        return False
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(SCROLL_WAIT_MS)
+
+    order_ids = _special_order_invoice_order_ids(page)
+    if not order_ids:
+        print("Depot Special Orders invoicing: no orders on page; moving on.")
+        return False
+
+    touched = False
+    for order_id in order_ids:
+        if _fill_special_order_invoice_order(page, order_id):
+            touched = True
+            print(f"Depot Special Orders invoicing: prepared order {order_id}.")
+
+    qty_filled = _fill_special_order_invoice_quantities(page)
+    if qty_filled > 0:
+        touched = True
+        print(f"Depot Special Orders invoicing: filled invoice qty on {qty_filled} line(s).")
+
+    if not touched:
+        print("Depot Special Orders invoicing: orders already filled; submitting batch...")
+
+    print("Depot Special Orders invoicing: submitting...")
+    try:
+        page.locator("#confirmbtn").click(no_wait_after=True, timeout=120000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=120000)
+        except Exception:
+            pass
+        if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
+            return False
+        page.wait_for_timeout(500 if _chain_fast() else 900)
+        return True
+    except Exception as exc:
+        print(f"Depot Special Orders invoicing: submit failed: {exc}")
+        return False
+
+
+def run_depot_special_order_invoicing_with_page(page: Page) -> None:
+    """Home Depot Special Orders (thdso): Needs Invoicing; skips quietly when queue is empty."""
+    if not _open_depot_special_order_quickinvoice(page):
+        return
+
+    for batch in range(1, MAX_INVOICE_PAGES + 1):
+        if not _process_depot_special_order_invoice_page(page):
+            print("Depot Special Orders invoicing: finished.")
+            break
+        print(f"Depot Special Orders invoicing: submitted batch {batch}.")
+        page.wait_for_timeout(POST_SUBMIT_MS)
+    else:
+        print(f"Depot Special Orders invoicing: stopped after {MAX_INVOICE_PAGES} batches (safety cap).")
 
 
 def _wait_invoice_form_frame(page: Page, timeout_ms: int) -> Frame | None:
