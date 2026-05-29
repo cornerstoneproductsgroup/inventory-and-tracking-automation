@@ -323,20 +323,19 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
     if _blocking_dialog_visible():
         return False
     win_timeout = 0.4 if fast else min(3.0, timeout_s)
-    tab_timeout = 0.3 if fast else min(2.0, timeout_s)
     try:
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         if not win.exists(timeout=win_timeout):
             return False
-        tab = win.child_window(title="Import-Export", control_type="TabItem")
-        if not tab.exists(timeout=tab_timeout):
-            return False
-        if not tab.is_enabled():
-            return False
-        try:
-            return tab.is_visible()
-        except Exception:
-            return True
+        for tab in _matching_controls(
+            win, title="Import-Export", control_types=("TabItem", "Button")
+        ):
+            try:
+                if tab.is_enabled() and tab.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
 
@@ -510,6 +509,31 @@ def _connect_or_start(app_factory, *, startup_timeout_s: float) -> tuple[object,
     return app, cold
 
 
+def _matching_controls(
+    win,
+    *,
+    title: str | None = None,
+    title_re: str | None = None,
+    control_types: tuple[str, ...],
+    max_index: int = 12,
+):
+    """Yield controls when WorldShip exposes duplicate UIA nodes for one ribbon item."""
+    for ctrl in control_types:
+        for i in range(max_index):
+            try:
+                kwargs: dict = {"control_type": ctrl, "found_index": i}
+                if title is not None:
+                    kwargs["title"] = title
+                if title_re is not None:
+                    kwargs["title_re"] = title_re
+                target = win.child_window(**kwargs)
+                if not target.exists(timeout=0.1):
+                    break
+                yield target
+            except Exception:
+                break
+
+
 def _click_when_ready(
     win,
     *,
@@ -517,14 +541,13 @@ def _click_when_ready(
     control_types: tuple[str, ...] = ("Button", "TabItem"),
     timeout_s: float = 5.0,
 ) -> None:
-    """Poll quickly and click as soon as the control is enabled."""
+    """Poll quickly and click the first visible, enabled match."""
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        for ctrl in control_types:
+        for target in _matching_controls(win, title=title, control_types=control_types):
             try:
-                target = win.child_window(title=title, control_type=ctrl)
-                if not target.exists(timeout=0.15):
+                if not target.is_visible():
                     continue
                 if not target.is_enabled():
                     continue
@@ -532,13 +555,20 @@ def _click_when_ready(
                 return
             except Exception as exc:
                 last_err = exc
-        try:
-            target = win.child_window(title_re=f"^{re.escape(title)}$")
-            if target.exists(timeout=0.15) and target.is_enabled():
+        for target in _matching_controls(
+            win,
+            title_re=f"^{re.escape(title)}$",
+            control_types=control_types,
+        ):
+            try:
+                if not target.is_visible():
+                    continue
+                if not target.is_enabled():
+                    continue
                 target.click_input()
                 return
-        except Exception as exc:
-            last_err = exc
+            except Exception as exc:
+                last_err = exc
         time.sleep(0.08)
     raise RuntimeError(f"Could not click {title!r}: {last_err}")
 
@@ -571,17 +601,18 @@ def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 8.0) -> None
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        for ctrl in ("CheckBox", "RadioButton"):
+        for target in _matching_controls(
+            dlg, title=label, control_types=("CheckBox", "RadioButton")
+        ):
             try:
-                box = dlg.child_window(title=label, control_type=ctrl)
-                if not box.exists(timeout=0.15):
+                if not target.is_visible():
                     continue
                 try:
-                    state = box.get_toggle_state()
+                    state = target.get_toggle_state()
                     if state != 1:
-                        box.click_input()
+                        target.click_input()
                 except Exception:
-                    box.click_input()
+                    target.click_input()
                 return
             except Exception as exc:
                 last_err = exc
@@ -593,13 +624,16 @@ def _click_button(dlg, title: str, *, timeout_s: float = 10.0) -> None:
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        try:
-            btn = dlg.child_window(title=title, control_type="Button")
-            if btn.exists(timeout=0.15) and btn.is_enabled():
-                btn.click_input()
+        for target in _matching_controls(dlg, title=title, control_types=("Button",)):
+            try:
+                if not target.is_visible():
+                    continue
+                if not target.is_enabled():
+                    continue
+                target.click_input()
                 return
-        except Exception as exc:
-            last_err = exc
+            except Exception as exc:
+                last_err = exc
         time.sleep(0.08)
     raise RuntimeError(f"Could not click button {title!r}: {last_err}")
 
