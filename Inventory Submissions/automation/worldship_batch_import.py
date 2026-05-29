@@ -327,11 +327,17 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         if not win.exists(timeout=win_timeout):
             return False
+        if _ribbon_action_available(
+            win, "Batch Import", ("Button", "MenuItem", "SplitButton")
+        ):
+            return True
         for tab in _matching_controls(
             win, title="Import-Export", control_types=("TabItem", "Button")
         ):
             try:
                 if tab.is_enabled() and tab.is_visible():
+                    return True
+                if _is_tab_selected(tab):
                     return True
             except Exception:
                 continue
@@ -535,6 +541,52 @@ def _matching_controls(
                 break
 
 
+def _is_tab_selected(target) -> bool:
+    try:
+        if target.is_selected():
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(target.get_toggle_state())
+    except Exception:
+        pass
+    return False
+
+
+def _ribbon_action_available(
+    win,
+    title: str,
+    control_types: tuple[str, ...],
+) -> bool:
+    for target in _matching_controls(win, title=title, control_types=control_types):
+        try:
+            if not target.is_visible():
+                continue
+            if target.is_enabled():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _ensure_import_export_tab(main) -> None:
+    """Open Import-Export ribbon; skip click if that tab is already active."""
+    if _ribbon_action_available(
+        main, "Batch Import", ("Button", "MenuItem", "SplitButton")
+    ):
+        _log("Import-Export tab already active — skipping tab click.")
+        return
+    for target in _matching_controls(main, title="Import-Export", control_types=("TabItem",)):
+        try:
+            if _is_tab_selected(target):
+                _log("Import-Export tab already selected — skipping tab click.")
+                return
+        except Exception:
+            continue
+    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
+
+
 _RIBBON_POLL_S = 0.03
 
 
@@ -548,13 +600,17 @@ def _click_when_ready(
     """Poll quickly and click the first visible, enabled match."""
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
+    saw_any = False
     while time.monotonic() < deadline:
         clicked = False
         for target in _matching_controls(win, title=title, control_types=control_types):
+            saw_any = True
             try:
                 if not target.is_visible():
                     continue
                 if not target.is_enabled():
+                    if title == "Import-Export" and _is_tab_selected(target):
+                        return
                     continue
                 target.click_input()
                 clicked = True
@@ -564,7 +620,13 @@ def _click_when_ready(
         if clicked:
             return
         time.sleep(_RIBBON_POLL_S)
-    raise RuntimeError(f"Could not click {title!r}: {last_err}")
+    if title == "Import-Export" and _ribbon_action_available(
+        win, "Batch Import", ("Button", "MenuItem", "SplitButton")
+    ):
+        _log("Import-Export ribbon is active — continuing without tab click.")
+        return
+    hint = "no matching controls found" if not saw_any else "controls not clickable"
+    raise RuntimeError(f"Could not click {title!r}: {last_err or hint}")
 
 
 def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 8.0):
@@ -694,7 +756,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     _log("Clicking Import-Export tab…")
     tab_clicked_at = time.monotonic()
-    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
+    _ensure_import_export_tab(main)
 
     _log("Clicking Batch Import…")
     _click_when_ready(
