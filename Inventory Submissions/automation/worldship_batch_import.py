@@ -159,6 +159,14 @@ def _ready_timeout_s(*, cold_start: bool) -> float:
         return 300.0 if cold_start else 5.0
 
 
+def _step_wait_s(env_key: str, default: float) -> float:
+    raw = (os.environ.get(env_key) or str(default)).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
 STARTUP_OK_TEXT_HINTS = (
     "did not shut down normally",
     "database will now be checked",
@@ -653,6 +661,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     main = _resolve_main_window(app, cold_start=cold_start)
 
     _log("Clicking Import-Export tab…")
+    tab_clicked_at = time.monotonic()
     _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=4)
 
     _log("Clicking Batch Import…")
@@ -660,17 +669,29 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         main,
         title="Batch Import",
         control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=4,
+        timeout_s=8,
     )
 
     _log("Waiting for Batch Import wizard…")
-    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=15)
+    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=20)
+
+    before_checkbox_s = _step_wait_s("WORLDSHIP_BEFORE_CHECKBOX_WAIT_S", 5.0)
+    elapsed_since_tab = time.monotonic() - tab_clicked_at
+    remaining = before_checkbox_s - elapsed_since_tab
+    if remaining > 0:
+        _log(f"Waiting {remaining:.0f}s before auto-process checkbox (5s from Import-Export tab)…")
+        time.sleep(remaining)
 
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
-    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=8)
+    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=15)
+
+    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 2.0)
+    if before_next_s > 0:
+        _log(f"Waiting {before_next_s:.0f}s before Next…")
+        time.sleep(before_next_s)
 
     _log("Clicking Next (wizard step 1)…")
-    _click_button(wizard, "Next", timeout_s=8)
+    _click_button(wizard, "Next", timeout_s=15)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
     preview = _find_dialog(app, PREVIEW_DIALOG_TITLE, timeout_s=120)
