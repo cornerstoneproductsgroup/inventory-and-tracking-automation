@@ -84,6 +84,15 @@ def main() -> int:
 
         automation = LowesTrackingAutomation(config)
         automation.load_csv_index()
+        step_errors: list[str] = []
+
+        def _run_step(title: str, fn) -> None:
+            try:
+                fn()
+            except Exception as exc:
+                msg = f"{title}: {exc}"
+                print(f"WARN: {msg}")
+                step_errors.append(msg)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=settings.headless, slow_mo=0)
@@ -97,25 +106,31 @@ def main() -> int:
                     print("\n=== Rithum inventory skipped (--skip-inventory) ===")
                 else:
                     print("\n=== Rithum inventory (Lowe's + Home Depot) ===")
-                    run_rithum_inventory_on_authenticated_page(page, settings)
+                    _run_step(
+                        "Rithum inventory",
+                        lambda: run_rithum_inventory_on_authenticated_page(page, settings),
+                    )
 
                 if args.skip_depot:
                     print("\n=== Home Depot tracking/invoicing skipped (--skip-depot) ===")
                 else:
                     print("\n=== Home Depot tracking ===")
-                    run_depot_tracking_with_page(page)
+                    _run_step("Depot tracking", lambda: run_depot_tracking_with_page(page))
 
                     print("\n=== Home Depot invoicing ===")
-                    run_depot_invoicing_with_page(page)
+                    _run_step("Depot invoicing", lambda: run_depot_invoicing_with_page(page))
 
                 if args.skip_lowes:
                     print("\n=== Lowe's workflows skipped (--skip-lowes) ===")
                 else:
                     print("\n=== Lowe's workflows (all) ===")
-                    automation.run_workflows_after_login(
-                        page,
-                        do_submit=bool(args.submit),
-                        workflow_filter="all",
+                    _run_step(
+                        "Lowe's workflows",
+                        lambda: automation.run_workflows_after_login(
+                            page,
+                            do_submit=bool(args.submit),
+                            workflow_filter="all",
+                        ),
                     )
 
                 print("\n=== Home Depot Special Orders tracking ===")
@@ -124,13 +139,20 @@ def main() -> int:
                         "Depot Special Orders: skipped (Depot and Lowe's tracking both disabled)."
                     )
                 else:
-                    run_depot_special_order_tracking_with_page(page)
+                    _run_step(
+                        "Depot Special Orders tracking",
+                        lambda: run_depot_special_order_tracking_with_page(page),
+                    )
             finally:
                 context.close()
                 browser.close()
 
         print("\nCommerceHub chain complete.")
         print(json.dumps(automation.stats, indent=2))
+        if step_errors:
+            print("\nCommerceHub completed with warnings:")
+            for err in step_errors:
+                print(f"  - {err}")
         return 0
     except Exception as exc:
         print(f"CommerceHub chain error: {exc}")

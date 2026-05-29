@@ -443,8 +443,51 @@ class LowesTrackingAutomation:
             except Exception:
                 # Continue if profile selector does not appear for this login.
                 pass
-        page.locator(selectors["logged_in_ready"]).wait_for(timeout=30000)
+        self._wait_for_commercehub_logged_in(page, selectors)
         print("Logged into Rithum.")
+
+    def _wait_for_commercehub_logged_in(self, page: Page, selectors: Dict) -> None:
+        """
+        Confirm CommerceHub login without requiring a Lowe's-only dashboard link.
+        When Lowe's has no open orders the PID=lowes link may not appear; Depot-only
+        days should still proceed to Depot / Special Orders workflows.
+        """
+        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+        per_try_ms = 6000 if _fast else 10000
+        candidates: list[str] = []
+        primary = (selectors.get("logged_in_ready") or "").strip()
+        if primary:
+            candidates.append(primary)
+        candidates.extend(
+            [
+                "a[href*='gotoOpenOrders.do?PID=lowes']",
+                "a[href*='gotoOpenOrders.do?PID=thehomedepot']",
+                "a[href*='gotoOpenOrders.do?PID=thdso']",
+                "a[href*='gotoOpenOrders.do?PID=']",
+                "a[href*='gotoOrderRealmForm.do']",
+                "a[href*='gotoHome.do']",
+            ]
+        )
+        seen: set[str] = set()
+        last_err: Exception | None = None
+        for sel in candidates:
+            if not sel or sel in seen:
+                continue
+            seen.add(sel)
+            try:
+                page.locator(sel).first.wait_for(state="visible", timeout=per_try_ms)
+                return
+            except Exception as exc:
+                last_err = exc
+                continue
+        url = (page.url or "").lower()
+        if "commercehub.com" in url and not any(
+            x in url for x in ("login", "signin", "okta", "auth0", "microsoftonline")
+        ):
+            return
+        if last_err is not None:
+            raise last_err
+        raise TimeoutError("Could not confirm CommerceHub login.")
 
     def get_order_links(self, page: Page, workflow_name: str, workflow_cfg: Dict, selectors: Dict) -> List[str]:
         orders_url = workflow_cfg.get("orders_url") or self.config["rithum"].get("orders_url")
@@ -452,7 +495,13 @@ class LowesTrackingAutomation:
             raise ValueError(f"Missing orders_url for workflow '{workflow_name}'")
         max_orders = int(self.config["automation"].get("max_orders", 50))
         page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
-        page.locator(selectors["order_links"]).first.wait_for(timeout=30000)
+        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+        link_timeout_ms = 6000 if _fast else 15000
+        try:
+            page.locator(selectors["order_links"]).first.wait_for(timeout=link_timeout_ms)
+        except Exception:
+            print(f"[{workflow_name}] No order links on orders page; skipping workflow.")
+            return []
 
         handles = page.locator(selectors["order_links"])
         total = handles.count()
