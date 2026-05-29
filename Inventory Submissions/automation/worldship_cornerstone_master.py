@@ -20,6 +20,22 @@ from automation.worldship_label_config import (
     retailer_merchant_to_key,
 )
 
+SKU_HEADER_HINTS = ("sku",)
+PO_HEADER_HINTS = (
+    "purchase_order_number",
+    "purchase_order",
+    "purchaseordernumber",
+    "po_number",
+    "ponumber",
+    "customer_po",
+)
+RETAILER_HEADER_HINTS = (
+    "merchant_id",
+    "merchantid",
+    "merchant",
+    "retailer",
+)
+
 
 def _log(msg: str) -> None:
     print(f"[worldship] {msg}", flush=True)
@@ -89,33 +105,78 @@ def _norm_header(name: str) -> str:
 
 
 def _header_index(header: list[str], hints: tuple[str, ...]) -> int | None:
-    for i, raw in enumerate(header):
-        norm = _norm_header(raw)
-        for hint in hints:
-            h = _norm_header(hint)
-            if norm == h or h in norm or norm in h:
+    """Match column by exact header name first; avoid short hints like 'po' in SHPTO_*."""
+    normalized = [(i, _norm_header(raw)) for i, raw in enumerate(header)]
+    for hint in hints:
+        h = _norm_header(hint)
+        for i, norm in normalized:
+            if norm == h:
+                return i
+    for hint in hints:
+        h = _norm_header(hint)
+        if len(h) < 5:
+            continue
+        for i, norm in normalized:
+            if h in norm or norm in h:
                 return i
     return None
 
 
 def _column_indices(header: list[str]) -> tuple[int, int, int]:
-    """SKU, PO, retailer column indices (0-based). Prefer CSV header names."""
-    sku_i = _header_index(header, ("sku",))
-    po_i = _header_index(
-        header,
-        ("purchase_order_number", "purchase_order", "po_number", "po", "po#"),
-    )
-    retailer_i = _header_index(
-        header,
-        ("merchant_id", "merchant", "retailer", "merchantid"),
-    )
+    """SKU, PO, retailer column indices (0-based). Prefer named CSV headers."""
+    sku_i = _header_index(header, SKU_HEADER_HINTS)
+    po_i = _header_index(header, PO_HEADER_HINTS)
+    retailer_i = _header_index(header, RETAILER_HEADER_HINTS)
     if sku_i is not None and po_i is not None and retailer_i is not None:
         return sku_i, po_i, retailer_i
+    _log(
+        "WARN: CornerstoneMaster header names not recognized — "
+        f"using Excel columns {COL_SKU}/{COL_PO}/{COL_RETAILER}."
+    )
     return (
         column_index_from_string(COL_SKU) - 1,
         column_index_from_string(COL_PO) - 1,
         column_index_from_string(COL_RETAILER) - 1,
     )
+
+
+def _find_header_row_index(all_rows: list[list[str]]) -> int:
+    """Locate the header row (WorldShip CSV may use row 1)."""
+    for idx, row in enumerate(all_rows[:15]):
+        header = [str(c).strip() for c in row]
+        if not any(header):
+            continue
+        if _header_index(header, SKU_HEADER_HINTS) is None:
+            continue
+        if _header_index(header, PO_HEADER_HINTS) is None:
+            continue
+        if _header_index(header, RETAILER_HEADER_HINTS) is None:
+            continue
+        return idx
+    return 0
+
+
+def _read_csv_rows(path: Path) -> list[list[str]]:
+    raw = path.read_bytes()
+    text: str | None = None
+    for enc in ("utf-8-sig", "utf-8", "latin1", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError(f"Could not decode CSV: {path}")
+
+    delimiter = ","
+    try:
+        dialect = csv.Sniffer().sniff(text[:8192], delimiters=",\t;|")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        if text.count("\t") > text.count(","):
+            delimiter = "\t"
+
+    return list(csv.reader(text.splitlines(), delimiter=delimiter))
 
 
 def _append_order_row(
@@ -126,13 +187,17 @@ def _append_order_row(
     sku_i: int,
     po_i: int,
     retailer_i: int,
-) -> bool:
-    """Append one order; return False when data rows are exhausted."""
-    if not row:
-        return False
+) -> str:
+    """
+    Append one order row.
+
+    Returns 'added', 'skip' (blank line), or 'stop' (end of data).
+    """
+    if not row or not any(_cell_str(c) for c in row):
+        return "stop"
     sku = _cell_str(row[sku_i] if len(row) > sku_i else "")
     if not sku:
-        return False
+        return "skip"
     po = _cell_str(row[po_i] if len(row) > po_i else "")
     retailer_raw = _cell_str(row[retailer_i] if len(row) > retailer_i else "")
     if not po:
@@ -148,36 +213,38 @@ def _append_order_row(
             retailer_raw=retailer_raw,
         )
     )
-    return True
+    return "added"
 
 
 def _load_csv(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
-    rows: list[CornerstoneOrderRow] = []
-    for enc in ("utf-8-sig", "latin1"):
-        try:
-            with path.open(newline="", encoding=enc) as fh:
-                reader = csv.reader(fh)
-                all_rows = list(reader)
-            break
-        except UnicodeDecodeError:
-            all_rows = None
+    all_rows = _read_csv_rows(path)
     if not all_rows:
-        raise ValueError(f"Could not read CSV: {path}")
+        raise ValueError(f"CSV is empty: {path}")
 
-    header = [str(c).strip() for c in all_rows[0]]
+    header_idx = _find_header_row_index(all_rows)
+    header = [str(c).strip() for c in all_rows[header_idx]]
     sku_i, po_i, retailer_i = _column_indices(header)
-    data_rows = all_rows[DATA_START_ROW - 1 :]
-    for offset, row in enumerate(data_rows, start=DATA_START_ROW):
+    _log(
+        "CornerstoneMaster columns: "
+        f"SKU={header[sku_i]!r} (col {sku_i + 1}), "
+        f"PO={header[po_i]!r} (col {po_i + 1}), "
+        f"retailer={header[retailer_i]!r} (col {retailer_i + 1})"
+    )
+
+    rows: list[CornerstoneOrderRow] = []
+    data_start = max(header_idx + 1, DATA_START_ROW - 1)
+    for offset, row in enumerate(all_rows[data_start:], start=data_start + 1):
         if limit is not None and len(rows) >= limit:
             break
-        if not _append_order_row(
+        result = _append_order_row(
             rows,
             row_idx=offset,
             row=row,
             sku_i=sku_i,
             po_i=po_i,
             retailer_i=retailer_i,
-        ):
+        )
+        if result == "stop":
             break
     return rows
 
@@ -189,9 +256,9 @@ def _load_xlsx(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
         ws = wb.active
         first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
         header = [str(c or "").strip() for c in (first_row or ())]
-        if header and _header_index(header, ("sku",)) is not None:
+        if _header_index(header, SKU_HEADER_HINTS) is not None:
             sku_i, po_i, retailer_i = _column_indices(header)
-            start_row = DATA_START_ROW
+            start_row = 2
         else:
             sku_i, po_i, retailer_i = _column_indices([])
             start_row = DATA_START_ROW
@@ -202,14 +269,15 @@ def _load_xlsx(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
         ):
             if limit is not None and len(rows) >= limit:
                 break
-            if not _append_order_row(
+            result = _append_order_row(
                 rows,
                 row_idx=row_idx,
                 row=row,
                 sku_i=sku_i,
                 po_i=po_i,
                 retailer_i=retailer_i,
-            ):
+            )
+            if result == "stop":
                 break
     finally:
         wb.close()
@@ -231,6 +299,9 @@ def load_cornerstone_orders(
         raise ValueError(f"Unsupported CornerstoneMaster format: {path}")
 
     if not rows:
-        raise ValueError(f"No order rows found in {path} starting at row {DATA_START_ROW}.")
+        raise ValueError(
+            f"No order rows found in {path}. "
+            "Expected headers SKU, PURCHASE_ORDER_NUMBER, and MERCHANT_ID with data below."
+        )
     _log(f"Loaded {len(rows)} CornerstoneMaster row(s) from {path.name}.")
     return rows

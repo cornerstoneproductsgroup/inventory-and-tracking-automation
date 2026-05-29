@@ -818,18 +818,6 @@ def _click_preview_next(preview: ModalDialog) -> None:
         raise RuntimeError(f"Could not click Next on Import/Export Preview: {exc}") from exc
 
 
-def _resolve_record_count() -> tuple[int, str | None]:
-    """Optional record count from CornerstoneMaster (used only for processing timeout estimate)."""
-    try:
-        from automation.worldship_cornerstone_master import load_cornerstone_orders
-
-        orders = load_cornerstone_orders()
-        return len(orders), None
-    except Exception as exc:
-        _log(f"WARN: Could not pre-read CornerstoneMaster ({exc}) — using default processing timeout.")
-        return 0, None
-
-
 def _parse_progress_stats(hwnd: int) -> dict[str, int]:
     import re
 
@@ -847,14 +835,16 @@ def _parse_progress_stats(hwnd: int) -> dict[str, int]:
     return stats
 
 
-def _click_smart_pickup_yes(*, timeout_s: float = 45.0) -> bool:
+def _click_smart_pickup_yes(*, timeout_s: float = 90.0) -> bool:
     """Click Yes on the UPS Smart Pickup scheduling prompt."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        for hwnd, _title in _enum_visible_modal_hwnds():
+        for hwnd, title in _enum_visible_modal_hwnds():
             blob = " ".join(_safe_enum_child_text(hwnd)).lower()
-            if "smart pickup" not in blob:
-                continue
+            title_low = title.lower()
+            if "smart pickup" not in blob and "smart pickup" not in title_low:
+                if title_low != "ups worldship" or "pickup" not in blob:
+                    continue
             if _click_button_win32(hwnd, "Yes"):
                 _log("Clicked Yes on UPS Smart Pickup prompt.")
                 return True
@@ -1199,13 +1189,12 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _click_preview_next(preview)
 
     _log("Waiting for UPS Smart Pickup prompt…")
-    if not _click_smart_pickup_yes(timeout_s=45.0):
+    if not _click_smart_pickup_yes(timeout_s=90.0):
         _log("WARN: Smart Pickup prompt not found — continuing.")
 
-    est_count, _ = _resolve_record_count()
     from automation.worldship_label_config import processing_timeout_s
 
-    proc_timeout = processing_timeout_s(order_count=est_count or None)
+    proc_timeout = processing_timeout_s(order_count=4)
     _wait_for_automatic_processing(timeout_s=proc_timeout)
 
     labels_saved = _save_shipping_labels()
