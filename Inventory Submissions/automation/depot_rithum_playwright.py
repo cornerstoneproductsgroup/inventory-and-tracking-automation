@@ -5,8 +5,10 @@ Home Depot quickship / quickinvoice on CommerceHub using an existing Playwright 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 from playwright.sync_api import Frame, Page
@@ -26,6 +28,13 @@ INVOICE_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickinvoice"
     "&tabContext=web_quickinvoice&merchant=thehomedepot"
 )
+SPECIAL_ORDER_SUMMARY_URL = "https://dsm.commercehub.com/dsm/gotoOpenOrders.do?PID=thdso"
+SPECIAL_ORDER_QUICKSHIP_URL = (
+    "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
+    "&tabContext=web_quickship&status=open&substatus=accepted&merchant=thdso"
+)
+SPECIAL_ORDER_CONTACT_NAME = "Joey"
+SPECIAL_ORDER_SHIPPING_VALUE = "UG"  # UPS Ground
 
 
 def _chain_fast() -> bool:
@@ -267,6 +276,236 @@ def run_depot_tracking_with_page(page: Page, tracking_csv_path: str | None = Non
         page.wait_for_timeout(POST_SUBMIT_MS)
     else:
         print(f"Depot tracking: stopped after {MAX_SHIP_PAGES} batches (safety cap).")
+
+
+def _special_order_estimated_delivery_date() -> str:
+    """Today + 5 calendar days, MM/DD/YYYY (e.g. May 29 -> June 3)."""
+    return (date.today() + timedelta(days=5)).strftime("%m/%d/%Y")
+
+
+def _lookup_special_order_tracking(tracking_dict: dict[str, str], po_raw: str) -> str | None:
+    po = (po_raw or "").strip()
+    if not po:
+        return None
+    candidates = {po, po.upper(), po.lower(), po.replace(" ", "")}
+    if po.isdigit():
+        candidates.add(po.zfill(9))
+    for key in candidates:
+        hit = tracking_dict.get(key)
+        if hit:
+            return hit
+    return None
+
+
+def _wait_for_special_order_page_ready(page: Page, timeout_ms: int) -> bool:
+    deadline = time.monotonic() + max(1000, timeout_ms) / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+        try:
+            if page.locator("a[href*='gotoOrderDetail']").count() > 0:
+                return True
+            if page.locator("select[name*='.shippingmethod']").count() > 0:
+                return True
+            body = (page.inner_text("body") or "").lower()
+            if "special orders" in body and "no orders" in body:
+                return False
+        except Exception:
+            pass
+        page.wait_for_timeout(400 if _chain_fast() else 700)
+    return False
+
+
+def _open_depot_special_order_quickship(page: Page) -> bool:
+    """Navigate to thdso Open/Accepted quickship. Returns False when queue is empty."""
+    print("Depot Special Orders: opening Open/Accepted quickship queue...")
+    page.goto(SPECIAL_ORDER_QUICKSHIP_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(250 if _chain_fast() else 500)
+    if _wait_for_special_order_page_ready(page, 15_000):
+        return True
+
+    page.goto(SPECIAL_ORDER_SUMMARY_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(300 if _chain_fast() else 600)
+    summary_link = page.locator("a[href*='gotoOpenOrders.do?PID=thdso']").first
+    try:
+        if summary_link.count() > 0:
+            txt = (summary_link.inner_text() or "").strip()
+            if txt.isdigit() and int(txt) == 0:
+                print("Depot Special Orders: summary shows 0 orders; skipping.")
+                return False
+    except Exception:
+        pass
+
+    open_accepted = page.locator(
+        "a[href*='merchant=thdso'][href*='web_quickship'], "
+        "a[href*='merchant=thdso'][href*='substatus=accepted']"
+    ).filter(has_text=re.compile(r"open\s*/\s*accepted", re.I)).first
+    if open_accepted.count() == 0:
+        open_accepted = page.get_by_role("link", name=re.compile(r"open\s*/\s*accepted", re.I)).first
+    if open_accepted.count() == 0:
+        print("Depot Special Orders: no Open/Accepted link; skipping.")
+        return False
+    try:
+        open_accepted.click()
+        page.wait_for_load_state("domcontentloaded")
+    except Exception as exc:
+        print(f"Depot Special Orders: could not open Accepted queue ({exc}); skipping.")
+        return False
+
+    if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+        print("Depot Special Orders: queue empty or not ready; skipping.")
+        return False
+    return True
+
+
+def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str]) -> bool:
+    if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+        print("Depot Special Orders: timed out waiting for order list; moving on.")
+        return False
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(SCROLL_WAIT_MS)
+
+    po_links = page.locator("a.simple_link[href*='gotoOrderDetail'], a[href*='gotoOrderDetail']")
+    n = po_links.count()
+    if n == 0:
+        print("Depot Special Orders: no PO rows on page; moving on.")
+        return False
+
+    est_date = _special_order_estimated_delivery_date()
+    touched = False
+    matched_po_count = 0
+
+    for i in range(n):
+        po_elem = po_links.nth(i)
+        try:
+            po = (po_elem.inner_text() or "").strip()
+            tracking = _lookup_special_order_tracking(tracking_dict, po)
+            if not tracking:
+                continue
+            matched_po_count += 1
+            href = po_elem.get_attribute("href") or ""
+            if "Hub_PO=" not in href:
+                continue
+            order_id = href.split("Hub_PO=")[-1].split("&")[0]
+
+            track_sel = f"[id='order({order_id}).box(1).trackingnumber']"
+            bol_sel = f"[id='order({order_id}).box(1).billOfLading']"
+            contact_sel = f"[id='order({order_id}).contactInfo']"
+            ship_sel = f"[id='order({order_id}).box(1).shippingmethod']"
+
+            qty_inputs = page.locator(
+                f"input[name^='order({order_id}).box(1).item'][name$='.shipped']"
+            )
+            for j in range(qty_inputs.count()):
+                qty_box = qty_inputs.nth(j)
+                try:
+                    if (qty_box.input_value() or "").strip():
+                        continue
+                except Exception:
+                    pass
+                remaining = page.locator(
+                    f"xpath=//td[contains(@id, 'order({order_id}).box(1).item') "
+                    f"and contains(@id, '.remaining')]"
+                ).nth(j)
+                try:
+                    qty = (remaining.inner_text() or "").strip()
+                    if qty.replace(".", "", 1).isdigit():
+                        qty_box.fill("")
+                        qty_box.fill(qty.split(".")[0] if "." in qty else qty)
+                        touched = True
+                except Exception:
+                    continue
+
+            if not _filled_select(page, ship_sel):
+                try:
+                    page.locator(ship_sel).select_option(value=SPECIAL_ORDER_SHIPPING_VALUE)
+                except Exception:
+                    try:
+                        page.locator(ship_sel).select_option(label="UPS Ground")
+                    except Exception:
+                        page.locator(ship_sel).fill("UPS Ground")
+                touched = True
+
+            contact = page.locator(contact_sel).first
+            if contact.count() > 0 and not _filled_input(page, contact_sel):
+                contact.fill("")
+                contact.fill(SPECIAL_ORDER_CONTACT_NAME)
+                touched = True
+
+            if not _filled_input(page, track_sel):
+                page.locator(track_sel).fill("")
+                page.locator(track_sel).fill(tracking)
+                touched = True
+
+            if not _filled_input(page, bol_sel):
+                page.locator(bol_sel).fill("")
+                page.locator(bol_sel).fill(tracking)
+                touched = True
+
+            est_inputs = page.locator(
+                f"input[name^='order({order_id}).box(1).item'][name$='.estimatedDeliveryDate']"
+            )
+            for j in range(est_inputs.count()):
+                est = est_inputs.nth(j)
+                try:
+                    if (est.input_value() or "").strip():
+                        continue
+                except Exception:
+                    pass
+                est.fill("")
+                est.fill(est_date)
+                touched = True
+        except Exception as exc:
+            print(f"Depot Special Orders: error on PO {po!r}: {exc}")
+
+    if matched_po_count == 0:
+        print("Depot Special Orders: no PO matches in CSV on this page; moving on.")
+        return False
+
+    if not touched:
+        print("Depot Special Orders: matched PO(s) already filled; submitting batch...")
+    else:
+        print("Depot Special Orders: submitting batch...")
+
+    try:
+        page.locator("#confirmbtn").click(no_wait_after=True, timeout=120000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=120000)
+        except Exception:
+            pass
+        if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+            return False
+        page.wait_for_timeout(500 if _chain_fast() else 900)
+        return True
+    except Exception as exc:
+        print(f"Depot Special Orders: submit failed: {exc}")
+        return False
+
+
+def run_depot_special_order_tracking_with_page(
+    page: Page, tracking_csv_path: str | None = None
+) -> None:
+    """Home Depot Special Orders (thdso): tracking only; skips quietly when queue is empty."""
+    path = tracking_csv_path or TRACKING_CSV
+    tracking_dict = load_tracking_csv(str(path))
+    if not tracking_dict:
+        print(f"Depot Special Orders: no tracking rows loaded from {path}; skipping.")
+        return
+
+    if not _open_depot_special_order_quickship(page):
+        return
+
+    for batch in range(1, MAX_SHIP_PAGES + 1):
+        if not _process_depot_special_order_page(page, tracking_dict):
+            print("Depot Special Orders: finished.")
+            break
+        print(f"Depot Special Orders: submitted batch {batch}.")
+        page.wait_for_timeout(POST_SUBMIT_MS)
+    else:
+        print(f"Depot Special Orders: stopped after {MAX_SHIP_PAGES} batches (safety cap).")
 
 
 def _wait_invoice_form_frame(page: Page, timeout_ms: int) -> Frame | None:
