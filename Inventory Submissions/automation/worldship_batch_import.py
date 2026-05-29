@@ -718,26 +718,96 @@ def _enum_visible_modal_hwnds(*, title_hint: str = "") -> list[tuple[int, str]]:
     return out
 
 
-def _find_modal_dialog(title_hint: str, *, timeout_s: float = 90) -> ModalDialog:
-    """Wait for a visible modal by Win32 title (UIA often misses WorldShip dialogs)."""
+def _get_control_text(hwnd: int) -> str:
+    import win32con
     import win32gui
 
-    hint = title_hint.lower()
+    try:
+        t = (win32gui.GetWindowText(hwnd) or "").strip()
+        if t:
+            return t
+        n = win32gui.SendMessage(hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+        if n <= 0:
+            return ""
+        n += 1
+        buf = win32gui.PyMakeBuffer(n * 2)
+        win32gui.SendMessage(hwnd, win32con.WM_GETTEXT, n, buf)
+        return buf.tobytes().decode("utf-16-le", errors="ignore").split("\0")[0].strip()
+    except Exception:
+        return ""
+
+
+def _read_preview_text_from_hwnd(hwnd: int) -> str:
+    import win32gui
+
+    edit_texts: list[str] = []
+
+    def _cb(child, _):
+        try:
+            cls = win32gui.GetClassName(child) or ""
+            if cls in ("Edit", "Static"):
+                t = _get_control_text(child)
+                if t and "record" in t.lower():
+                    edit_texts.append(t)
+                elif cls == "Edit" and t:
+                    edit_texts.append(t)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+    except Exception:
+        pass
+    if edit_texts:
+        return "\n".join(edit_texts)
+
+    skip = {"next", "cancel", "help"}
+    parts = [
+        p
+        for p in _safe_enum_child_text(hwnd)
+        if p.lower().replace("&", "") not in skip
+    ]
+    return "\n".join(parts)
+
+
+def _preview_content_ready(hwnd: int) -> str | None:
+    text = _read_preview_text_from_hwnd(hwnd)
+    if text and RECORD_COUNT_RE.search(text):
+        return text
+    return None
+
+
+def _wait_for_import_export_preview(*, timeout_s: float = 120) -> tuple[ModalDialog, str]:
+    """Wait until Import/Export Preview dialog shows the record count."""
+    import win32gui
+
+    hint = PREVIEW_DIALOG_TITLE.lower()
     deadline = time.monotonic() + timeout_s
+    seen_dialog = False
     while time.monotonic() < deadline:
-        for hwnd, title in _enum_visible_modal_hwnds(title_hint=title_hint):
+        for hwnd, title in _enum_visible_modal_hwnds(title_hint=PREVIEW_DIALOG_TITLE):
             if hint not in title.lower():
                 continue
+            if not seen_dialog:
+                _log(f"Found dialog: {title!r} — waiting for preview text…")
+                seen_dialog = True
             try:
                 win32gui.SetForegroundWindow(hwnd)
             except Exception:
                 pass
-            _log(f"Found dialog: {title!r}")
-            return ModalDialog(hwnd=hwnd, title=title)
-        time.sleep(0.15)
+            content = _preview_content_ready(hwnd)
+            if content:
+                _log("Import/Export Preview content is ready.")
+                return ModalDialog(hwnd=hwnd, title=title), content
+        time.sleep(0.2)
+    if seen_dialog:
+        raise TimeoutError(
+            f"Import/Export Preview opened but record count did not appear within {timeout_s:.0f}s."
+        )
     visible = [t for _, t in _enum_visible_modal_hwnds()]
     raise TimeoutError(
-        f"Timed out waiting for dialog containing {title_hint!r} ({timeout_s:.0f}s). "
+        f"Timed out waiting for {PREVIEW_DIALOG_TITLE!r} ({timeout_s:.0f}s). "
         f"Visible dialogs: {visible or '(none)'}"
     )
 
@@ -824,6 +894,30 @@ def _click_dialog_button(
     )
 
 
+def _find_modal_dialog(title_hint: str, *, timeout_s: float = 90) -> ModalDialog:
+    """Wait for a visible modal by Win32 title (UIA often misses WorldShip dialogs)."""
+    import win32gui
+
+    hint = title_hint.lower()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for hwnd, title in _enum_visible_modal_hwnds(title_hint=title_hint):
+            if hint not in title.lower():
+                continue
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            _log(f"Found dialog: {title!r}")
+            return ModalDialog(hwnd=hwnd, title=title)
+        time.sleep(0.15)
+    visible = [t for _, t in _enum_visible_modal_hwnds()]
+    raise TimeoutError(
+        f"Timed out waiting for dialog containing {title_hint!r} ({timeout_s:.0f}s). "
+        f"Visible dialogs: {visible or '(none)'}"
+    )
+
+
 def _find_dialog(app, title: str, *, timeout_s: float = 90):
     """Find a modal dialog — Win32 first, UIA fallback."""
     try:
@@ -851,9 +945,7 @@ def _dialog_hwnd(dlg) -> int | None:
 def _read_preview_text(preview) -> str:
     hwnd = _dialog_hwnd(preview)
     if hwnd:
-        parts = _safe_enum_child_text(hwnd)
-        if parts:
-            return "\n".join(parts)
+        return _read_preview_text_from_hwnd(hwnd)
     try:
         edit = preview.child_window(control_type="Edit", found_index=0)
         if edit.exists(timeout=0.15):
@@ -992,14 +1084,18 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _click_dialog_button(wizard, "Next", title_hint="Batch Import", timeout_s=4)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
-    preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=120)
-    preview_text = _read_preview_text(preview)
+    preview, preview_text = _wait_for_import_export_preview(timeout_s=120)
     record_count, import_source = _parse_preview(preview_text)
     if import_source:
         _log(f"Import source: {import_source}")
     _log(f"There are {record_count} record(s) to be imported.")
     if record_count == 0:
         _log("WARN: zero records — continuing with Next as configured.")
+
+    before_preview_next_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 0.5)
+    if before_preview_next_s > 0:
+        _log(f"Waiting {before_preview_next_s:.1f}s before preview Next…")
+        time.sleep(before_preview_next_s)
 
     _log("Clicking Next (Import/Export Preview)…")
     if not _click_button_win32(preview.hwnd, "Next"):
