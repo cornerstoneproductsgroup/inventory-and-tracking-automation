@@ -515,9 +515,10 @@ def _matching_controls(
     title: str | None = None,
     title_re: str | None = None,
     control_types: tuple[str, ...],
-    max_index: int = 12,
+    max_index: int = 3,
 ):
     """Yield controls when WorldShip exposes duplicate UIA nodes for one ribbon item."""
+    exist_ms = 30
     for ctrl in control_types:
         for i in range(max_index):
             try:
@@ -527,11 +528,14 @@ def _matching_controls(
                 if title_re is not None:
                     kwargs["title_re"] = title_re
                 target = win.child_window(**kwargs)
-                if not target.exists(timeout=0.1):
+                if not target.exists(timeout=exist_ms / 1000.0):
                     break
                 yield target
             except Exception:
                 break
+
+
+_RIBBON_POLL_S = 0.03
 
 
 def _click_when_ready(
@@ -539,12 +543,13 @@ def _click_when_ready(
     *,
     title: str,
     control_types: tuple[str, ...] = ("Button", "TabItem"),
-    timeout_s: float = 5.0,
+    timeout_s: float = 3.0,
 ) -> None:
     """Poll quickly and click the first visible, enabled match."""
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
+        clicked = False
         for target in _matching_controls(win, title=title, control_types=control_types):
             try:
                 if not target.is_visible():
@@ -552,52 +557,45 @@ def _click_when_ready(
                 if not target.is_enabled():
                     continue
                 target.click_input()
-                return
+                clicked = True
+                break
             except Exception as exc:
                 last_err = exc
-        for target in _matching_controls(
-            win,
-            title_re=f"^{re.escape(title)}$",
-            control_types=control_types,
-        ):
-            try:
-                if not target.is_visible():
-                    continue
-                if not target.is_enabled():
-                    continue
-                target.click_input()
-                return
-            except Exception as exc:
-                last_err = exc
-        time.sleep(0.08)
+        if clicked:
+            return
+        time.sleep(_RIBBON_POLL_S)
     raise RuntimeError(f"Could not click {title!r}: {last_err}")
 
 
-def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 15.0):
+def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 8.0):
     """Return the wizard host as soon as the auto-process checkbox appears."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        for title_re in (".*Batch Import.*", ".*Import.*Export.*", ".*Import.*"):
+        for title_re in (".*Batch Import.*", ".*Import.*Export.*"):
             try:
                 cand = app.window(title_re=title_re)
-                if not cand.exists(timeout=0.15):
+                if not cand.exists(timeout=0.03):
                     continue
-                box = cand.child_window(title=AUTO_PROCESS_LABEL, control_type="CheckBox")
-                if box.exists(timeout=0.15):
-                    return cand
+                for box in _matching_controls(
+                    cand, title=AUTO_PROCESS_LABEL, control_types=("CheckBox",)
+                ):
+                    if box.is_visible():
+                        return cand
             except Exception:
                 continue
-        try:
-            box = main.child_window(title=AUTO_PROCESS_LABEL, control_type="CheckBox")
-            if box.exists(timeout=0.15):
-                return main
-        except Exception:
-            pass
-        time.sleep(0.1)
+        for box in _matching_controls(
+            main, title=AUTO_PROCESS_LABEL, control_types=("CheckBox",)
+        ):
+            try:
+                if box.is_visible():
+                    return main
+            except Exception:
+                continue
+        time.sleep(_RIBBON_POLL_S)
     return main
 
 
-def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 8.0) -> None:
+def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 5.0) -> None:
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
@@ -616,11 +614,11 @@ def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 8.0) -> None
                 return
             except Exception as exc:
                 last_err = exc
-        time.sleep(0.08)
+        time.sleep(_RIBBON_POLL_S)
     raise RuntimeError(f"Could not set checkbox {label!r}: {last_err}")
 
 
-def _click_button(dlg, title: str, *, timeout_s: float = 10.0) -> None:
+def _click_button(dlg, title: str, *, timeout_s: float = 5.0) -> None:
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
@@ -634,7 +632,7 @@ def _click_button(dlg, title: str, *, timeout_s: float = 10.0) -> None:
                 return
             except Exception as exc:
                 last_err = exc
-        time.sleep(0.08)
+        time.sleep(_RIBBON_POLL_S)
     raise RuntimeError(f"Could not click button {title!r}: {last_err}")
 
 
@@ -696,36 +694,36 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     _log("Clicking Import-Export tab…")
     tab_clicked_at = time.monotonic()
-    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=4)
+    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
 
     _log("Clicking Batch Import…")
     _click_when_ready(
         main,
         title="Batch Import",
         control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=8,
+        timeout_s=4,
     )
 
     _log("Waiting for Batch Import wizard…")
-    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=20)
+    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=8)
 
-    before_checkbox_s = _step_wait_s("WORLDSHIP_BEFORE_CHECKBOX_WAIT_S", 5.0)
+    before_checkbox_s = _step_wait_s("WORLDSHIP_BEFORE_CHECKBOX_WAIT_S", 2.0)
     elapsed_since_tab = time.monotonic() - tab_clicked_at
     remaining = before_checkbox_s - elapsed_since_tab
     if remaining > 0:
-        _log(f"Waiting {remaining:.0f}s before auto-process checkbox (5s from Import-Export tab)…")
+        _log(f"Waiting {remaining:.1f}s before auto-process checkbox…")
         time.sleep(remaining)
 
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
-    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=15)
+    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=5)
 
-    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 2.0)
+    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 1.0)
     if before_next_s > 0:
-        _log(f"Waiting {before_next_s:.0f}s before Next…")
+        _log(f"Waiting {before_next_s:.1f}s before Next…")
         time.sleep(before_next_s)
 
     _log("Clicking Next (wizard step 1)…")
-    _click_button(wizard, "Next", timeout_s=15)
+    _click_button(wizard, "Next", timeout_s=5)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
     preview = _find_dialog(app, PREVIEW_DIALOG_TITLE, timeout_s=120)
