@@ -740,76 +740,99 @@ def _get_control_text(hwnd: int) -> str:
 def _read_preview_text_from_hwnd(hwnd: int) -> str:
     import win32gui
 
-    edit_texts: list[str] = []
+    chunks: list[str] = []
 
-    def _cb(child, _):
+    def _walk(child, depth: int) -> None:
+        if depth > 8:
+            return
         try:
             cls = win32gui.GetClassName(child) or ""
-            if cls in ("Edit", "Static"):
-                t = _get_control_text(child)
-                if t and "record" in t.lower():
-                    edit_texts.append(t)
-                elif cls == "Edit" and t:
-                    edit_texts.append(t)
+            t = _get_control_text(child)
+            if t:
+                low = t.lower().replace("&", "")
+                if low not in {"next", "cancel", "help"}:
+                    chunks.append(t)
+            child_hwnd = child
+            next_child = 0
+            while True:
+                next_child = win32gui.FindWindowEx(child_hwnd, next_child, None, None)
+                if not next_child:
+                    break
+                _walk(next_child, depth + 1)
         except Exception:
             pass
-        return True
 
     try:
-        win32gui.EnumChildWindows(hwnd, _cb, None)
+        _walk(hwnd, 0)
     except Exception:
         pass
-    if edit_texts:
-        return "\n".join(edit_texts)
-
-    skip = {"next", "cancel", "help"}
-    parts = [
-        p
-        for p in _safe_enum_child_text(hwnd)
-        if p.lower().replace("&", "") not in skip
-    ]
-    return "\n".join(parts)
+    return "\n".join(chunks)
 
 
-def _preview_content_ready(hwnd: int) -> str | None:
-    text = _read_preview_text_from_hwnd(hwnd)
-    if text and RECORD_COUNT_RE.search(text):
-        return text
-    return None
+def _send_vk(vk: int) -> None:
+    import win32api
+    import win32con
+
+    win32api.keybd_event(vk, 0, 0, 0)
+    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
-def _wait_for_import_export_preview(*, timeout_s: float = 120) -> tuple[ModalDialog, str]:
-    """Wait until Import/Export Preview dialog shows the record count."""
+def _click_preview_next(preview: ModalDialog) -> None:
+    """Advance Import/Export Preview — Win32 Next, default button, then Enter."""
+    import win32con
     import win32gui
 
-    hint = PREVIEW_DIALOG_TITLE.lower()
-    deadline = time.monotonic() + timeout_s
-    seen_dialog = False
-    while time.monotonic() < deadline:
-        for hwnd, title in _enum_visible_modal_hwnds(title_hint=PREVIEW_DIALOG_TITLE):
-            if hint not in title.lower():
-                continue
-            if not seen_dialog:
-                _log(f"Found dialog: {title!r} — waiting for preview text…")
-                seen_dialog = True
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
-            content = _preview_content_ready(hwnd)
-            if content:
-                _log("Import/Export Preview content is ready.")
-                return ModalDialog(hwnd=hwnd, title=title), content
+    hwnd = preview.hwnd
+    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 1.0)
+    if settle_s > 0:
+        _log(f"Waiting {settle_s:.1f}s for preview dialog to finish loading…")
+        time.sleep(settle_s)
+
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+    for _ in range(5):
+        if _click_button_win32(hwnd, "Next"):
+            _log("Clicked Next on Import/Export Preview.")
+            return
         time.sleep(0.2)
-    if seen_dialog:
-        raise TimeoutError(
-            f"Import/Export Preview opened but record count did not appear within {timeout_s:.0f}s."
-        )
-    visible = [t for _, t in _enum_visible_modal_hwnds()]
-    raise TimeoutError(
-        f"Timed out waiting for {PREVIEW_DIALOG_TITLE!r} ({timeout_s:.0f}s). "
-        f"Visible dialogs: {visible or '(none)'}"
-    )
+
+    try:
+        default_btn = win32gui.GetDlgItem(hwnd, 1)
+        if default_btn:
+            win32gui.PostMessage(default_btn, win32con.BM_CLICK, 0, 0)
+            _log("Clicked default button on Import/Export Preview.")
+            return
+    except Exception:
+        pass
+
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+        _send_vk(win32con.VK_RETURN)
+        _log("Sent Enter on Import/Export Preview (Next is default).")
+        return
+    except Exception as exc:
+        raise RuntimeError(f"Could not click Next on Import/Export Preview: {exc}") from exc
+
+
+def _resolve_record_count(preview_text: str) -> tuple[int, str | None]:
+    """Record count from preview text when readable; otherwise CornerstoneMaster rows."""
+    text = (preview_text or "").strip()
+    if text:
+        m_count = RECORD_COUNT_RE.search(text)
+        if m_count:
+            m_path = IMPORT_PATH_RE.search(text)
+            source = m_path.group(1).strip() if m_path else None
+            return int(m_count.group(1)), source
+        _log("WARN: Could not read record count from preview text — using CornerstoneMaster.")
+
+    from automation.worldship_cornerstone_master import load_cornerstone_orders
+
+    orders = load_cornerstone_orders()
+    return len(orders), None
 
 
 def _click_button_win32(hwnd: int, button_text: str) -> bool:
@@ -1084,22 +1107,16 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _click_dialog_button(wizard, "Next", title_hint="Batch Import", timeout_s=4)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
-    preview, preview_text = _wait_for_import_export_preview(timeout_s=120)
-    record_count, import_source = _parse_preview(preview_text)
+    preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=60)
+    preview_text = _read_preview_text_from_hwnd(preview.hwnd)
+    record_count, import_source = _resolve_record_count(preview_text)
     if import_source:
         _log(f"Import source: {import_source}")
     _log(f"There are {record_count} record(s) to be imported.")
     if record_count == 0:
         _log("WARN: zero records — continuing with Next as configured.")
 
-    before_preview_next_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 0.5)
-    if before_preview_next_s > 0:
-        _log(f"Waiting {before_preview_next_s:.1f}s before preview Next…")
-        time.sleep(before_preview_next_s)
-
-    _log("Clicking Next (Import/Export Preview)…")
-    if not _click_button_win32(preview.hwnd, "Next"):
-        _click_dialog_button(preview, "Next", title_hint=PREVIEW_DIALOG_TITLE, timeout_s=5)
+    _click_preview_next(preview)
 
     labels_saved = 0
     if record_count > 0:
