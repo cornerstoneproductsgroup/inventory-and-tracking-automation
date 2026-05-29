@@ -502,25 +502,98 @@ def _connect_or_start(app_factory, *, startup_timeout_s: float) -> tuple[object,
     return app, cold
 
 
-def _click_first(win, *, title: str, control_types: tuple[str, ...] = ("Button", "TabItem")):
+def _click_when_ready(
+    win,
+    *,
+    title: str,
+    control_types: tuple[str, ...] = ("Button", "TabItem"),
+    timeout_s: float = 5.0,
+) -> None:
+    """Poll quickly and click as soon as the control is enabled."""
+    deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
-    for ctrl in control_types:
+    while time.monotonic() < deadline:
+        for ctrl in control_types:
+            try:
+                target = win.child_window(title=title, control_type=ctrl)
+                if not target.exists(timeout=0.15):
+                    continue
+                if not target.is_enabled():
+                    continue
+                target.click_input()
+                return
+            except Exception as exc:
+                last_err = exc
         try:
-            target = win.child_window(title=title, control_type=ctrl)
-            target.wait("enabled", timeout=20)
-            target.click_input()
-            return
+            target = win.child_window(title_re=f"^{re.escape(title)}$")
+            if target.exists(timeout=0.15) and target.is_enabled():
+                target.click_input()
+                return
         except Exception as exc:
             last_err = exc
-            continue
-    try:
-        target = win.child_window(title_re=f"^{re.escape(title)}$")
-        target.wait("enabled", timeout=10)
-        target.click_input()
-        return
-    except Exception as exc:
-        last_err = exc
+        time.sleep(0.08)
     raise RuntimeError(f"Could not click {title!r}: {last_err}")
+
+
+def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 15.0):
+    """Return the wizard host as soon as the auto-process checkbox appears."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for title_re in (".*Batch Import.*", ".*Import.*Export.*", ".*Import.*"):
+            try:
+                cand = app.window(title_re=title_re)
+                if not cand.exists(timeout=0.15):
+                    continue
+                box = cand.child_window(title=AUTO_PROCESS_LABEL, control_type="CheckBox")
+                if box.exists(timeout=0.15):
+                    return cand
+            except Exception:
+                continue
+        try:
+            box = main.child_window(title=AUTO_PROCESS_LABEL, control_type="CheckBox")
+            if box.exists(timeout=0.15):
+                return main
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return main
+
+
+def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        for ctrl in ("CheckBox", "RadioButton"):
+            try:
+                box = dlg.child_window(title=label, control_type=ctrl)
+                if not box.exists(timeout=0.15):
+                    continue
+                try:
+                    state = box.get_toggle_state()
+                    if state != 1:
+                        box.click_input()
+                except Exception:
+                    box.click_input()
+                return
+            except Exception as exc:
+                last_err = exc
+        time.sleep(0.08)
+    raise RuntimeError(f"Could not set checkbox {label!r}: {last_err}")
+
+
+def _click_button(dlg, title: str, *, timeout_s: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            btn = dlg.child_window(title=title, control_type="Button")
+            if btn.exists(timeout=0.15) and btn.is_enabled():
+                btn.click_input()
+                return
+        except Exception as exc:
+            last_err = exc
+        time.sleep(0.08)
+    raise RuntimeError(f"Could not click button {title!r}: {last_err}")
 
 
 def _find_dialog(app, title: str, *, timeout_s: float = 90):
@@ -531,30 +604,6 @@ def _find_dialog(app, title: str, *, timeout_s: float = 90):
     except Exception:
         pass
     return dlg
-
-
-def _ensure_checkbox_checked(dlg, label: str) -> None:
-    last_err: Exception | None = None
-    for ctrl in ("CheckBox", "RadioButton"):
-        try:
-            box = dlg.child_window(title=label, control_type=ctrl)
-            box.wait("visible", timeout=20)
-            try:
-                state = box.get_toggle_state()
-                if state != 1:
-                    box.click_input()
-            except Exception:
-                box.click_input()
-            return
-        except Exception as exc:
-            last_err = exc
-    raise RuntimeError(f"Could not set checkbox {label!r}: {last_err}")
-
-
-def _click_button(dlg, title: str) -> None:
-    btn = dlg.child_window(title=title, control_type="Button")
-    btn.wait("enabled", timeout=30)
-    btn.click_input()
 
 
 def _read_preview_text(preview) -> str:
@@ -602,42 +651,26 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
-    if cold_start:
-        _dismiss_blocking_dialogs_once()
-        time.sleep(0.4)
 
     _log("Clicking Import-Export tab…")
-    _click_first(main, title="Import-Export", control_types=("TabItem", "Button"))
-    if cold_start:
-        time.sleep(0.6)
+    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=4)
 
     _log("Clicking Batch Import…")
-    _click_first(main, title="Batch Import", control_types=("Button", "MenuItem", "SplitButton"))
-    time.sleep(0.8)
+    _click_when_ready(
+        main,
+        title="Batch Import",
+        control_types=("Button", "MenuItem", "SplitButton"),
+        timeout_s=4,
+    )
 
     _log("Waiting for Batch Import wizard…")
-    wizard = None
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        for title_re in (".*Batch Import.*", ".*Import.*Export.*", ".*Import.*"):
-            try:
-                cand = app.window(title_re=title_re)
-                if cand.exists(timeout=1) and cand.is_visible():
-                    wizard = cand
-                    break
-            except Exception:
-                continue
-        if wizard is not None:
-            break
-        time.sleep(0.5)
-    if wizard is None:
-        wizard = main
+    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=15)
 
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
-    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL)
+    _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=8)
 
     _log("Clicking Next (wizard step 1)…")
-    _click_button(wizard, "Next")
+    _click_button(wizard, "Next", timeout_s=8)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
     preview = _find_dialog(app, PREVIEW_DIALOG_TITLE, timeout_s=120)
