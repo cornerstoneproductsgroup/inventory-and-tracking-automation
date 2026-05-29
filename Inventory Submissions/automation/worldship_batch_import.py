@@ -681,22 +681,107 @@ def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 5.0) -> None
     raise RuntimeError(f"Could not set checkbox {label!r}: {last_err}")
 
 
-def _click_button(dlg, title: str, *, timeout_s: float = 5.0) -> None:
+def _enum_visible_modal_hwnds() -> list[tuple[int, str]]:
+    import win32gui
+
+    out: list[tuple[int, str]] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if win32gui.GetClassName(hwnd) != "#32770":
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            out.append((hwnd, title))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def _click_button_win32(hwnd: int, button_text: str) -> bool:
+    import win32con
+    import win32gui
+
+    target = button_text.lower().replace("&", "")
+    found_btn: int | None = None
+
+    def _cb(child, _):
+        nonlocal found_btn
+        try:
+            if win32gui.GetClassName(child) != "Button":
+                return True
+            text = (win32gui.GetWindowText(child) or "").strip().lower().replace("&", "")
+            if text == target:
+                found_btn = child
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+    except Exception:
+        pass
+    if not found_btn:
+        return False
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    try:
+        win32gui.PostMessage(found_btn, win32con.BM_CLICK, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _click_dialog_button(
+    dlg,
+    title: str,
+    *,
+    title_hint: str = "",
+    timeout_s: float = 3.0,
+) -> None:
+    """Click a modal dialog button — Win32 first (fast), then UIA."""
     deadline = time.monotonic() + timeout_s
+    hint = title_hint.lower()
     last_err: Exception | None = None
     while time.monotonic() < deadline:
+        modals = _enum_visible_modal_hwnds()
+        if hint:
+            modals = sorted(
+                modals,
+                key=lambda pair: hint not in pair[1].lower(),
+            )
+        for hwnd, _wtitle in modals:
+            if _click_button_win32(hwnd, title):
+                return
+        try:
+            handle = dlg.handle
+            if handle and _click_button_win32(handle, title):
+                return
+        except Exception:
+            pass
         for target in _matching_controls(dlg, title=title, control_types=("Button",)):
             try:
-                if not target.is_visible():
-                    continue
-                if not target.is_enabled():
-                    continue
-                target.click_input()
-                return
+                if target.is_visible() and target.is_enabled():
+                    target.click_input()
+                    return
             except Exception as exc:
                 last_err = exc
-        time.sleep(_RIBBON_POLL_S)
-    raise RuntimeError(f"Could not click button {title!r}: {last_err}")
+        time.sleep(0.05)
+    raise RuntimeError(
+        f"Could not click button {title!r}"
+        + (f" on {title_hint!r}" if title_hint else "")
+        + f": {last_err or 'no matching button'}"
+    )
 
 
 def _find_dialog(app, title: str, *, timeout_s: float = 90):
@@ -710,26 +795,28 @@ def _find_dialog(app, title: str, *, timeout_s: float = 90):
 
 
 def _read_preview_text(preview) -> str:
-    chunks: list[str] = []
-    for ctrl in ("Edit", "Document", "Text", "Pane"):
-        try:
-            for child in preview.descendants(control_type=ctrl):
-                try:
-                    t = (child.window_text() or "").strip()
-                except Exception:
-                    t = ""
-                if t and t not in chunks:
-                    chunks.append(t)
-        except Exception:
-            continue
-    if not chunks:
-        try:
-            t = (preview.window_text() or "").strip()
+    try:
+        hwnd = preview.handle
+        parts = _safe_enum_child_text(hwnd)
+        if parts:
+            return "\n".join(parts)
+    except Exception:
+        pass
+    try:
+        edit = preview.child_window(control_type="Edit", found_index=0)
+        if edit.exists(timeout=0.15):
+            t = (edit.window_text() or "").strip()
             if t:
-                chunks.append(t)
-        except Exception:
-            pass
-    return "\n".join(chunks)
+                return t
+    except Exception:
+        pass
+    try:
+        t = (preview.window_text() or "").strip()
+        if t:
+            return t
+    except Exception:
+        pass
+    return ""
 
 
 def _parse_preview(preview_text: str) -> tuple[int, str | None]:
@@ -844,18 +931,18 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
     _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=5)
 
-    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 1.0)
+    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 0.3)
     if before_next_s > 0:
         _log(f"Waiting {before_next_s:.1f}s before Next…")
         time.sleep(before_next_s)
 
     _log("Clicking Next (wizard step 1)…")
-    _click_button(wizard, "Next", timeout_s=5)
+    _click_dialog_button(wizard, "Next", title_hint="Batch Import", timeout_s=4)
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
     preview = _find_dialog(app, PREVIEW_DIALOG_TITLE, timeout_s=120)
     preview_text = _read_preview_text(preview)
-    record_count, import_source = _parse_preview(preview)
+    record_count, import_source = _parse_preview(preview_text)
     if import_source:
         _log(f"Import source: {import_source}")
     _log(f"There are {record_count} record(s) to be imported.")
@@ -863,7 +950,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         _log("WARN: zero records — continuing with Next as configured.")
 
     _log("Clicking Next (Import/Export Preview)…")
-    _click_button(preview, "Next")
+    _click_dialog_button(preview, "Next", title_hint=PREVIEW_DIALOG_TITLE, timeout_s=5)
 
     labels_saved = 0
     if record_count > 0:
