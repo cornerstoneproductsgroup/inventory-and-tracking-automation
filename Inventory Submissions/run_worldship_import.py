@@ -53,7 +53,7 @@ def main() -> int:
 
     print(
         f"[worldship] Done — {result.record_count} record(s) confirmed; "
-        "wizard advanced past Import/Export Preview.",
+        f"{result.labels_saved} label(s) saved.",
         flush=True,
     )
     return 0

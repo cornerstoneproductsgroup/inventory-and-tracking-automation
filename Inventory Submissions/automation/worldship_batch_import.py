@@ -124,6 +124,7 @@ class WorldShipBatchImportResult:
     record_count: int
     import_source: str | None
     preview_text: str
+    labels_saved: int
 
 
 def _log(msg: str) -> None:
@@ -743,6 +744,70 @@ def _parse_preview(preview_text: str) -> tuple[int, str | None]:
     return int(m_count.group(1)), source
 
 
+def _build_label_destination(order, vendor_maps: "VendorMapRegistry"):
+    from automation.worldship_cornerstone_master import CornerstoneOrderRow
+    from automation.worldship_label_config import LABEL_ROOTS, label_extension
+    from automation.worldship_vendor_map import VendorMapRegistry
+
+    if not isinstance(order, CornerstoneOrderRow):
+        raise TypeError("order must be CornerstoneOrderRow")
+    if not isinstance(vendor_maps, VendorMapRegistry):
+        raise TypeError("vendor_maps must be VendorMapRegistry")
+    vendor_folder = vendor_maps.lookup(order.sku, order.retailer_key)
+    root = LABEL_ROOTS.get(order.retailer_key)
+    if root is None:
+        raise ValueError(f"No label root configured for retailer key {order.retailer_key!r}.")
+    dest_dir = root / vendor_folder
+    if not dest_dir.is_dir():
+        raise FileNotFoundError(
+            f"Vendor folder not found for row {order.row_number}: {dest_dir}\n"
+            f"  SKU={order.sku!r} → vendor {vendor_folder!r}, retailer={order.retailer_raw!r}"
+        )
+    ext = label_extension()
+    filename = f"{order.po}{ext}" if ext else order.po
+    return dest_dir / filename
+
+
+def _save_shipping_labels(*, record_count: int) -> int:
+    from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
+    from automation.worldship_cornerstone_master import load_cornerstone_orders
+    from automation.worldship_label_config import save_dialog_timeout_s
+    from automation.worldship_vendor_map import VendorMapRegistry
+
+    orders = load_cornerstone_orders(limit=record_count if record_count > 0 else None)
+    if record_count > 0 and len(orders) < record_count:
+        _log(
+            f"WARN: CornerstoneMaster has {len(orders)} row(s) but preview showed "
+            f"{record_count} — saving available rows only."
+        )
+    if record_count > 0:
+        orders = orders[:record_count]
+
+    vendor_maps = VendorMapRegistry()
+    saved = 0
+    for idx, order in enumerate(orders):
+        first = idx == 0
+        timeout_s = save_dialog_timeout_s(first=first)
+        _log(
+            f"Waiting for save dialog ({idx + 1}/{len(orders)}): "
+            f"row {order.row_number}, PO {order.po!r}, SKU {order.sku!r}…"
+        )
+        if not wait_for_save_as_dialog(timeout_s=timeout_s):
+            raise TimeoutError(
+                f"Timed out waiting for save dialog for row {order.row_number} "
+                f"(PO {order.po!r}) after {timeout_s:.0f}s."
+            )
+        dest = _build_label_destination(order, vendor_maps)
+        _log(f"Saving label to {dest}")
+        if not fill_save_as_dialog(dest, timeout_s=30.0):
+            raise RuntimeError(f"Failed to save label for PO {order.po!r} to {dest}")
+        saved += 1
+        _log(f"Saved label {saved}/{len(orders)}: {dest.name}")
+        if idx + 1 < len(orders):
+            time.sleep(0.5)
+    return saved
+
+
 def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     """
     WorldShip: Import-Export → Batch Import → auto-process checkbox → Next →
@@ -800,8 +865,17 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _log("Clicking Next (Import/Export Preview)…")
     _click_button(preview, "Next")
 
+    labels_saved = 0
+    if record_count > 0:
+        _log(f"Processing {record_count} label save dialog(s)…")
+        labels_saved = _save_shipping_labels(record_count=record_count)
+        _log(f"Saved {labels_saved} shipping label(s).")
+    else:
+        _log("No records to import — skipping label saves.")
+
     return WorldShipBatchImportResult(
         record_count=record_count,
         import_source=import_source,
         preview_text=preview_text,
+        labels_saved=labels_saved,
     )
