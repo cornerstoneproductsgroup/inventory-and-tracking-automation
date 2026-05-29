@@ -819,11 +819,88 @@ def _click_preview_next(preview: ModalDialog) -> None:
 
 
 def _resolve_record_count() -> tuple[int, str | None]:
-    """Record count from CornerstoneMaster (CSV or Excel)."""
-    from automation.worldship_cornerstone_master import load_cornerstone_orders
+    """Optional record count from CornerstoneMaster (used only for processing timeout estimate)."""
+    try:
+        from automation.worldship_cornerstone_master import load_cornerstone_orders
 
-    orders = load_cornerstone_orders()
-    return len(orders), None
+        orders = load_cornerstone_orders()
+        return len(orders), None
+    except Exception as exc:
+        _log(f"WARN: Could not pre-read CornerstoneMaster ({exc}) — using default processing timeout.")
+        return 0, None
+
+
+def _parse_progress_stats(hwnd: int) -> dict[str, int]:
+    import re
+
+    stats: dict[str, int] = {}
+    for part in _safe_enum_child_text(hwnd):
+        m = re.match(r"(Remaining|Successful|Failed|Skipped|Total)\s*:\s*(\d+)", part, re.I)
+        if m:
+            stats[m.group(1).lower()] = int(m.group(2))
+    if not stats:
+        blob = " ".join(_safe_enum_child_text(hwnd))
+        for key in ("remaining", "successful", "failed", "skipped", "total"):
+            m = re.search(rf"{key}\s*:\s*(\d+)", blob, re.I)
+            if m:
+                stats[key] = int(m.group(1))
+    return stats
+
+
+def _click_smart_pickup_yes(*, timeout_s: float = 45.0) -> bool:
+    """Click Yes on the UPS Smart Pickup scheduling prompt."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for hwnd, _title in _enum_visible_modal_hwnds():
+            blob = " ".join(_safe_enum_child_text(hwnd)).lower()
+            if "smart pickup" not in blob:
+                continue
+            if _click_button_win32(hwnd, "Yes"):
+                _log("Clicked Yes on UPS Smart Pickup prompt.")
+                return True
+        time.sleep(0.25)
+    return False
+
+
+def _wait_for_automatic_processing(*, timeout_s: float) -> None:
+    """Wait until batch processing finishes and label save dialogs are ready."""
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    _log(f"Waiting up to {timeout_s:.0f}s for shipment processing to finish…")
+    deadline = time.monotonic() + timeout_s
+    seen_progress = False
+    last_log = 0.0
+    while time.monotonic() < deadline:
+        if find_save_as_dialog_hwnd():
+            _log("First Save Print Output dialog is ready.")
+            return
+
+        for hwnd, title in _enum_visible_modal_hwnds():
+            if "automatic processing progress" not in title.lower():
+                continue
+            seen_progress = True
+            stats = _parse_progress_stats(hwnd)
+            remaining = stats.get("remaining")
+            total = stats.get("total")
+            if time.monotonic() - last_log > 8.0 and remaining is not None:
+                _log(
+                    f"Processing… remaining={remaining}"
+                    + (f" of {total}" if total is not None else "")
+                )
+                last_log = time.monotonic()
+            if remaining == 0 and total is not None and total > 0:
+                _log("All shipments processed — waiting for first save dialog…")
+                # Keep looping until save dialog or timeout
+        time.sleep(0.4)
+
+    if seen_progress:
+        raise TimeoutError(
+            f"Timed out after {timeout_s:.0f}s waiting for processing to finish "
+            "and the first save dialog to appear."
+        )
+    raise TimeoutError(
+        f"Automatic Processing Progress did not appear within {timeout_s:.0f}s."
+    )
 
 
 def _click_button_win32(hwnd: int, button_text: str) -> bool:
@@ -1013,50 +1090,70 @@ def _build_label_destination(order, vendor_maps: "VendorMapRegistry"):
     return dest_dir / filename
 
 
-def _save_shipping_labels(*, record_count: int) -> int:
+def _save_shipping_labels() -> int:
     from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
     from automation.worldship_cornerstone_master import load_cornerstone_orders
     from automation.worldship_label_config import save_dialog_timeout_s
     from automation.worldship_vendor_map import VendorMapRegistry
 
-    orders = load_cornerstone_orders(limit=record_count if record_count > 0 else None)
-    if record_count > 0 and len(orders) < record_count:
-        _log(
-            f"WARN: CornerstoneMaster has {len(orders)} row(s) but preview showed "
-            f"{record_count} — saving available rows only."
-        )
-    if record_count > 0:
-        orders = orders[:record_count]
-
-    vendor_maps = VendorMapRegistry()
+    orders = None
+    vendor_maps = None
     saved = 0
-    for idx, order in enumerate(orders):
-        first = idx == 0
+
+    while saved < 500:
+        first = saved == 0
         timeout_s = save_dialog_timeout_s(first=first)
-        _log(
-            f"Waiting for save dialog ({idx + 1}/{len(orders)}): "
-            f"row {order.row_number}, PO {order.po!r}, SKU {order.sku!r}…"
-        )
-        if not wait_for_save_as_dialog(timeout_s=timeout_s):
-            raise TimeoutError(
-                f"Timed out waiting for save dialog for row {order.row_number} "
-                f"(PO {order.po!r}) after {timeout_s:.0f}s."
+        if orders is None:
+            _log("Waiting for first Save Print Output dialog…")
+        else:
+            _log(
+                f"Waiting for save dialog ({saved + 1}/{len(orders)}): "
+                f"row {orders[saved].row_number}, PO {orders[saved].po!r}…"
             )
+        if not wait_for_save_as_dialog(timeout_s=timeout_s):
+            if orders is None:
+                raise TimeoutError(
+                    f"Timed out waiting for first save dialog after {timeout_s:.0f}s."
+                )
+            break
+
+        if orders is None:
+            _log("Loading CornerstoneMaster for label routing…")
+            orders = load_cornerstone_orders()
+            vendor_maps = VendorMapRegistry()
+            _log(f"Will save {len(orders)} label(s) from CornerstoneMaster.")
+
+        if saved >= len(orders):
+            raise RuntimeError(
+                f"Unexpected extra save dialog after {len(orders)} order(s) were saved."
+            )
+
+        order = orders[saved]
         dest = _build_label_destination(order, vendor_maps)
-        _log(f"Saving label to {dest}")
+        _log(
+            f"Saving row {order.row_number}: PO {order.po!r}, SKU {order.sku!r}, "
+            f"retailer {order.retailer_raw!r}"
+        )
+        _log(f"  → {dest}")
         if not fill_save_as_dialog(dest, timeout_s=30.0):
             raise RuntimeError(f"Failed to save label for PO {order.po!r} to {dest}")
         saved += 1
         _log(f"Saved label {saved}/{len(orders)}: {dest.name}")
-        if idx + 1 < len(orders):
-            time.sleep(0.5)
+        if saved >= len(orders):
+            break
+        time.sleep(0.5)
+
+    if orders is None:
+        raise RuntimeError("No save dialogs appeared — nothing to save.")
+    if saved != len(orders):
+        raise RuntimeError(f"Expected {len(orders)} saves, completed {saved}.")
     return saved
 
 
 def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     """
-    WorldShip: Import-Export → Batch Import → auto-process checkbox → Next →
-    Import/Export Preview (read count) → Next.
+    WorldShip: Import-Export → Batch Import → auto-process → preview Next →
+    Smart Pickup Yes → wait for processing → save each label from CornerstoneMaster.
     """
     Application, _ = _require_pywinauto()
     startup_timeout_s = _startup_timeout_s()
@@ -1101,27 +1198,20 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=60)
     _click_preview_next(preview)
 
-    after_preview_s = _step_wait_s("WORLDSHIP_AFTER_PREVIEW_NEXT_S", 2.0)
-    if after_preview_s > 0:
-        _log(f"Waiting {after_preview_s:.1f}s for import to start…")
-        time.sleep(after_preview_s)
+    _log("Waiting for UPS Smart Pickup prompt…")
+    if not _click_smart_pickup_yes(timeout_s=45.0):
+        _log("WARN: Smart Pickup prompt not found — continuing.")
 
-    _log("Loading CornerstoneMaster for label routing…")
-    record_count, import_source = _resolve_record_count()
-    if import_source:
-        _log(f"Import source: {import_source}")
-    _log(f"There are {record_count} record(s) to be imported.")
+    est_count, _ = _resolve_record_count()
+    from automation.worldship_label_config import processing_timeout_s
 
-    if record_count == 0:
-        _log("WARN: zero records — skipping label saves.")
+    proc_timeout = processing_timeout_s(order_count=est_count or None)
+    _wait_for_automatic_processing(timeout_s=proc_timeout)
 
-    labels_saved = 0
-    if record_count > 0:
-        _log(f"Processing {record_count} label save dialog(s)…")
-        labels_saved = _save_shipping_labels(record_count=record_count)
-        _log(f"Saved {labels_saved} shipping label(s).")
-    else:
-        _log("No records to import — skipping label saves.")
+    labels_saved = _save_shipping_labels()
+    record_count = labels_saved
+    import_source = None
+    _log(f"Completed {labels_saved} label save(s).")
 
     return WorldShipBatchImportResult(
         record_count=record_count,

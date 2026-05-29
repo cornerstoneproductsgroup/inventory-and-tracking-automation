@@ -80,10 +80,27 @@ DEFAULT_VENDOR_MAP_CANDIDATES: tuple[Path, ...] = tuple(
 
 
 def label_extension() -> str:
-    raw = (os.environ.get("WORLDSHIP_LABEL_EXT") or ".gif").strip()
+    raw = (os.environ.get("WORLDSHIP_LABEL_EXT") or ".pdf").strip()
     if not raw:
         return ""
     return raw if raw.startswith(".") else f".{raw}"
+
+
+def processing_timeout_s(*, order_count: int | None = None) -> float:
+    """Max wait for Automatic Processing Progress before first save dialog."""
+    base_raw = (os.environ.get("WORLDSHIP_PROCESSING_TIMEOUT_S") or "600").strip()
+    per_raw = (os.environ.get("WORLDSHIP_PROCESSING_PER_ORDER_S") or "45").strip()
+    try:
+        base = max(60.0, float(base_raw))
+    except ValueError:
+        base = 600.0
+    try:
+        per = max(10.0, float(per_raw))
+    except ValueError:
+        per = 45.0
+    if order_count and order_count > 0:
+        return max(base, order_count * per)
+    return base
 
 
 def save_dialog_timeout_s(*, first: bool) -> float:
