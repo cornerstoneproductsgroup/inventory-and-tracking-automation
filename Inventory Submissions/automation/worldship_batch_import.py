@@ -818,17 +818,8 @@ def _click_preview_next(preview: ModalDialog) -> None:
         raise RuntimeError(f"Could not click Next on Import/Export Preview: {exc}") from exc
 
 
-def _resolve_record_count(preview_text: str) -> tuple[int, str | None]:
-    """Record count from preview text when readable; otherwise CornerstoneMaster rows."""
-    text = (preview_text or "").strip()
-    if text:
-        m_count = RECORD_COUNT_RE.search(text)
-        if m_count:
-            m_path = IMPORT_PATH_RE.search(text)
-            source = m_path.group(1).strip() if m_path else None
-            return int(m_count.group(1)), source
-        _log("WARN: Could not read record count from preview text — using CornerstoneMaster.")
-
+def _resolve_record_count() -> tuple[int, str | None]:
+    """Record count from CornerstoneMaster (CSV or Excel)."""
     from automation.worldship_cornerstone_master import load_cornerstone_orders
 
     orders = load_cornerstone_orders()
@@ -1108,15 +1099,21 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     _log(f"Waiting for {PREVIEW_DIALOG_TITLE!r}…")
     preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=60)
-    preview_text = _read_preview_text_from_hwnd(preview.hwnd)
-    record_count, import_source = _resolve_record_count(preview_text)
+    _click_preview_next(preview)
+
+    after_preview_s = _step_wait_s("WORLDSHIP_AFTER_PREVIEW_NEXT_S", 2.0)
+    if after_preview_s > 0:
+        _log(f"Waiting {after_preview_s:.1f}s for import to start…")
+        time.sleep(after_preview_s)
+
+    _log("Loading CornerstoneMaster for label routing…")
+    record_count, import_source = _resolve_record_count()
     if import_source:
         _log(f"Import source: {import_source}")
     _log(f"There are {record_count} record(s) to be imported.")
-    if record_count == 0:
-        _log("WARN: zero records — continuing with Next as configured.")
 
-    _click_preview_next(preview)
+    if record_count == 0:
+        _log("WARN: zero records — skipping label saves.")
 
     labels_saved = 0
     if record_count > 0:
@@ -1129,6 +1126,6 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     return WorldShipBatchImportResult(
         record_count=record_count,
         import_source=import_source,
-        preview_text=preview_text,
+        preview_text="",
         labels_saved=labels_saved,
     )
