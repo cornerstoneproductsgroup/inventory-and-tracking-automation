@@ -21,7 +21,8 @@ summarized at the end.
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
 Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
-Use --sequential-lanes to run each phase's two sides one after the other instead of parallel.
+Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
+Use --worldship-import-only to run only UPS WorldShip Batch Import (through Import/Export Preview).
 
 Each Inventory Submissions step uses Inventory Submissions\\.venv when present.
 Invoice report picks the first interpreter that can import dotenv, playwright, and pandas:
@@ -390,6 +391,22 @@ def main() -> int:
         help="Run only SPS Grainger ALL flow.",
     )
     parser.add_argument(
+        "--pull-orders-only",
+        action="store_true",
+        help=(
+            "Run only the morning pull-orders workflow (CommerceHub PDF/CSV, SPS Tractor/Grainger, "
+            "warehouse print). Not part of All Steps unless you add it there later."
+        ),
+    )
+    parser.add_argument(
+        "--worldship-import-only",
+        action="store_true",
+        help=(
+            "Run only UPS WorldShip Batch Import (Import-Export → Batch Import → preview record count). "
+            "Not part of All Steps."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -441,8 +458,16 @@ def main() -> int:
         parser.error("--tracking-invoicing-only cannot be combined with --skip-commercehub")
     if args.invoice_report_only and args.skip_invoice_report:
         parser.error("--invoice-report-only cannot be combined with --skip-invoice-report")
+    if args.pull_orders_only and args.invoice_report_only:
+        parser.error("--pull-orders-only cannot be combined with --invoice-report-only")
+    if args.worldship_import_only and args.invoice_report_only:
+        parser.error("--worldship-import-only cannot be combined with --invoice-report-only")
+    if args.pull_orders_only and args.worldship_import_only:
+        parser.error("--pull-orders-only cannot be combined with --worldship-import-only")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
+    pull_orders_only = bool(args.pull_orders_only)
+    worldship_import_only = bool(args.worldship_import_only)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -508,6 +533,55 @@ def main() -> int:
         )
     else:
         print(f"Using project Python: {python_exe}")
+
+    if pull_orders_only:
+        pull_script = INVENTORY_DIR / "run_pull_orders.py"
+        if not pull_script.is_file():
+            print(
+                f"\nERROR: Missing pull-orders script:\n  {pull_script}\n"
+                "Update/pull Inventory Submissions and retry."
+            )
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nPull Orders — CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print\n"
+            + "=" * 60
+        )
+        pull_cmd = [python_exe, str(pull_script)]
+        if args.invoice_report_date:
+            pull_cmd.extend(["--date", args.invoice_report_date.strip()])
+        errors = _run_single("Pull Orders", pull_cmd, INVENTORY_DIR)
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nPull orders completed successfully.")
+        return 0
+
+    if worldship_import_only:
+        ws_script = INVENTORY_DIR / "run_worldship_import.py"
+        if not ws_script.is_file():
+            print(
+                f"\nERROR: Missing WorldShip script:\n  {ws_script}\n"
+                "Update/pull Inventory Submissions and retry."
+            )
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nWorldShip Batch Import — through Import/Export Preview\n"
+            + "=" * 60
+        )
+        errors = _run_single("WorldShip Batch Import", [python_exe, str(ws_script)], INVENTORY_DIR)
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nWorldShip batch import step completed successfully.")
+        return 0
 
     required_chain_flags: list[str] = []
     if skip_inventory:
