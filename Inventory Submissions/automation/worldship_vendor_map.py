@@ -58,22 +58,57 @@ def resolve_vendor_map_path() -> Path:
     )
 
 
-def _pick_columns(header: list[str]) -> tuple[int, int]:
-    sku_idx: int | None = None
-    vendor_idx: int | None = None
-    for i, raw in enumerate(header):
-        col = (raw or "").strip()
-        if not col:
+def _norm_header(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+
+
+SKU_COLUMN_HINTS = (
+    "sku",
+    "model_number",
+    "model",
+    "model_no",
+    "model_num",
+    "item",
+    "part",
+    "style",
+    "product",
+)
+VENDOR_COLUMN_HINTS = (
+    "vendor",
+    "vendor_name",
+    "brand",
+    "company",
+    "folder",
+)
+
+
+def _column_index(header: list[str], hints: tuple[str, ...]) -> int | None:
+    normalized = [(i, _norm_header(raw)) for i, raw in enumerate(header)]
+    for hint in hints:
+        h = _norm_header(hint)
+        for i, norm in normalized:
+            if norm == h:
+                return i
+    for hint in hints:
+        h = _norm_header(hint)
+        if len(h) < 4:
             continue
-        low = col.lower()
-        if sku_idx is None and re.search(r"\bsku\b|item|part|style|product", low):
-            sku_idx = i
-        if vendor_idx is None and re.search(r"vendor|brand|company|folder", low):
-            vendor_idx = i
+        for i, norm in normalized:
+            if h in norm or norm in h:
+                return i
+    return None
+
+
+def _pick_columns(header: list[str]) -> tuple[int, int]:
+    sku_idx = _column_index(header, SKU_COLUMN_HINTS)
+    vendor_idx = _column_index(header, VENDOR_COLUMN_HINTS)
     if sku_idx is None or vendor_idx is None:
         raise ValueError(
-            f"Vendor map header must include SKU and Vendor columns; got: {header!r}"
+            f"Vendor map needs Model Number (SKU) and Vendor columns; got: {header!r}"
         )
+    _log(
+        f"Vendor map columns: SKU={header[sku_idx]!r}, vendor={header[vendor_idx]!r}"
+    )
     return sku_idx, vendor_idx
 
 
