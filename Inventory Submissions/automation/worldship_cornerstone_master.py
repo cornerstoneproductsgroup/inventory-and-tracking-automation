@@ -100,6 +100,14 @@ def _cell_str(value) -> str:
     return str(value).strip()
 
 
+def _normalize_po(raw: str) -> str:
+    """WorldShip PURCHASE_ORDER may include product text, e.g. '44987387 Coarse 10'."""
+    text = _cell_str(raw)
+    if not text:
+        return ""
+    return text.split()[0]
+
+
 def _norm_header(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
 
@@ -198,7 +206,7 @@ def _append_order_row(
     sku = _cell_str(row[sku_i] if len(row) > sku_i else "")
     if not sku:
         return "skip"
-    po = _cell_str(row[po_i] if len(row) > po_i else "")
+    po = _normalize_po(row[po_i] if len(row) > po_i else "")
     retailer_raw = _cell_str(row[retailer_i] if len(row) > retailer_i else "")
     if not po:
         raise ValueError(f"Row {row_idx}: PO is empty (SKU={sku!r}).")
