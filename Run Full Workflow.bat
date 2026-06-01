@@ -11,8 +11,10 @@ if not "%~1"=="" goto RUN
 
 echo.
 echo Which steps to run? ^(press a menu key — no Enter needed^)
+echo   F  FedEx Batch ^(upload Lowe's CSV, finalize, save labels by SKU/vendor^)
 echo   W  WorldShip Batch Import ^(Import-Export through Import/Export Preview^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print^)
+echo   S  Scheduled morning chain ^(Pull Orders, FedEx, invoice reports, inventories — see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(invoice reports, CH+SPS inventories, tracking/invoicing + Grainger^)
 echo   2  All Tracking and Invoicing ^(no inventory, no invoice reports^)
 echo   3  All Inventory ^(CommerceHub + SPS inventory only^)
@@ -28,18 +30,24 @@ echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole 
 echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
 echo   Other PC: git pull, then run Inventory Submissions\Install-Deps.bat ^(adds pandas etc. for invoice phase^).
 echo.
-choice /C W0123456789 /N /M "Press W or 0-9: "
-if errorlevel 11 goto OPT_9
-if errorlevel 10 goto OPT_8
-if errorlevel 9 goto OPT_7
-if errorlevel 8 goto OPT_6
-if errorlevel 7 goto OPT_5
-if errorlevel 6 goto OPT_4
-if errorlevel 5 goto OPT_3
-if errorlevel 4 goto OPT_2
-if errorlevel 3 goto OPT_1
-if errorlevel 2 goto OPT_0
+choice /C WF0123456789S /N /M "Press W, F, S, or 0-9: "
+if errorlevel 13 goto OPT_S
+if errorlevel 12 goto OPT_9
+if errorlevel 11 goto OPT_8
+if errorlevel 10 goto OPT_7
+if errorlevel 9 goto OPT_6
+if errorlevel 8 goto OPT_5
+if errorlevel 7 goto OPT_4
+if errorlevel 6 goto OPT_3
+if errorlevel 5 goto OPT_2
+if errorlevel 4 goto OPT_1
+if errorlevel 3 goto OPT_0
+if errorlevel 2 goto OPT_F
 if errorlevel 1 goto OPT_W
+
+:OPT_F
+set "EXTRA_ARGS=--fedex-batch-only"
+goto RUN
 
 :OPT_W
 set "EXTRA_ARGS=--worldship-import-only"
@@ -83,6 +91,9 @@ goto RUN
 set "EXTRA_ARGS=--invoice-report-modes all --run-grainger-all"
 goto RUN
 
+:OPT_S
+goto RUN_SCHEDULED
+
 :RUN
 echo.
 echo Running workflow...
@@ -92,7 +103,19 @@ echo.
 
 "%RUNNER%" "run_full_workflow.py" %EXTRA_ARGS% %*
 set "ERR=%ERRORLEVEL%"
+goto DONE
 
+:RUN_SCHEDULED
+echo.
+echo Running scheduled workflow chain...
+if /I not "%RUNNER%"=="python" echo Using: %RUNNER%
+echo.
+
+"%RUNNER%" "run_scheduled_workflow.py" %*
+set "ERR=%ERRORLEVEL%"
+goto DONE
+
+:DONE
 echo.
 if not "%ERR%"=="0" (
   echo One or more steps failed ^(exit %ERR%^).

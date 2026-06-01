@@ -1,0 +1,67 @@
+{
+  "schedule": {
+    "time_local": "05:00",
+    "task_name": "Cornerstone Morning Automation"
+  },
+  "settings": {
+    "log_dir": "logs",
+    "log_basename": "scheduled_workflow.log"
+  },
+  "steps": [
+    {
+      "id": "pull_orders",
+      "label": "Pull Orders — CommerceHub PDF/CSV, SPS, warehouse print",
+      "enabled": true,
+      "continue_on_error": false,
+      "type": "workflow",
+      "args": ["--pull-orders-only"]
+    },
+    {
+      "id": "fedex_batch",
+      "label": "FedEx Batch — upload Lowe's CSV, finalize, labels, shipment report",
+      "enabled": true,
+      "continue_on_error": false,
+      "type": "workflow",
+      "args": ["--fedex-batch-only"]
+    },
+    {
+      "id": "invoice_reports",
+      "label": "All Invoice Reports — Depot, Lowe's, Tractor Supply",
+      "enabled": true,
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": ["--invoice-report-only", "--invoice-report-modes", "all"]
+    },
+    {
+      "id": "inventories",
+      "label": "All Inventories — CommerceHub Rithum + SPS Tractor Supply",
+      "enabled": true,
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": [
+        "--skip-invoice-report",
+        "--skip-sps-tracking",
+        "--skip-depot",
+        "--skip-lowes"
+      ]
+    }
+  ],
+  "_future_steps_examples": [
+    {
+      "id": "worldship_import",
+      "label": "WorldShip Batch Import",
+      "enabled": false,
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": ["--worldship-import-only"]
+    },
+    {
+      "id": "tracking_invoicing",
+      "label": "All Tracking and Invoicing",
+      "enabled": false,
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": ["--skip-invoice-report", "--tracking-invoicing-only", "--run-grainger-all"]
+    }
+  ]
+}

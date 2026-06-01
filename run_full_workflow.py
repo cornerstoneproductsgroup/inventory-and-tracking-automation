@@ -407,6 +407,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--fedex-batch-only",
+        action="store_true",
+        help=(
+            "Run only FedEx batch shipping: upload Lowe's CSV, finalize shipments, "
+            "save labels by SKU/vendor map."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -464,10 +472,17 @@ def main() -> int:
         parser.error("--worldship-import-only cannot be combined with --invoice-report-only")
     if args.pull_orders_only and args.worldship_import_only:
         parser.error("--pull-orders-only cannot be combined with --worldship-import-only")
+    if args.fedex_batch_only and args.invoice_report_only:
+        parser.error("--fedex-batch-only cannot be combined with --invoice-report-only")
+    if args.fedex_batch_only and args.worldship_import_only:
+        parser.error("--fedex-batch-only cannot be combined with --worldship-import-only")
+    if args.fedex_batch_only and args.pull_orders_only:
+        parser.error("--fedex-batch-only cannot be combined with --pull-orders-only")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
     pull_orders_only = bool(args.pull_orders_only)
     worldship_import_only = bool(args.worldship_import_only)
+    fedex_batch_only = bool(args.fedex_batch_only)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -558,6 +573,32 @@ def main() -> int:
                 print(f"  - {e}")
             return 1
         print("\nPull orders completed successfully.")
+        return 0
+
+    if fedex_batch_only:
+        fedex_script = INVENTORY_DIR / "run_fedex_batch.py"
+        if not fedex_script.is_file():
+            print(
+                f"\nERROR: Missing FedEx batch script:\n  {fedex_script}\n"
+                "Update/pull Inventory Submissions and retry."
+            )
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nFedEx Batch — Lowe's CSV upload, finalize, label save by SKU\n"
+            + "=" * 60
+        )
+        fedex_cmd = [python_exe, str(fedex_script)]
+        if args.invoice_report_date:
+            fedex_cmd.extend(["--date", args.invoice_report_date.strip()])
+        errors = _run_single("FedEx Batch", fedex_cmd, INVENTORY_DIR)
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nFedEx batch completed successfully.")
         return 0
 
     if worldship_import_only:

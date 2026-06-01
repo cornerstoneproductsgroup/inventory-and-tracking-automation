@@ -1,0 +1,34 @@
+{
+  "browser": {
+    "headless": false,
+    "slow_mo_ms": 80,
+    "default_timeout_ms": 120000
+  },
+  "fedex": {
+    "login_url": "https://www.fedex.com/secure-login/en-us/",
+    "batch_url": "https://www.fedex.com/shippingplus/en-us/shipments-import",
+    "username": "${FEDEX_USERNAME}",
+    "password": "${FEDEX_PASSWORD}"
+  },
+  "selectors": {
+    "username_input": "#username, input#username[autocomplete='username'], input[name='username']",
+    "password_input": "#password, input#password[type='password'], input[name='password']",
+    "login_submit": "button:has-text('Log In'), button:has-text('LOG IN'), button:has-text('Sign in'), button.fdx-c-button:has-text('Log In')",
+    "cookie_accept": "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('Accept all cookies')",
+    "upload_button": "[data-test-id=\"files-upload-btn\"]",
+    "file_input": "#uploadFileInput-GENERAL, input[type='file']",
+    "start_upload_button": "button:has-text('Start upload'), .fdx-c-button__title:has-text('Start upload')",
+    "shipment_table_row": "table tbody tr.mat-mdc-row, tr.mat-mdc-row",
+    "row_checkbox": "input[type='checkbox']",
+    "clear_selection_button": "button:has-text('CLEAR SELECTION')",
+    "finalize_toolbar": "button:has-text('FINALIZE'), text=FINALIZE",
+    "finalize_print_manual": "span.mat-mdc-menu-item-text:has-text('Finalize and print manually')",
+    "select_all_checkbox": "thead label.fdx-c-form-group__label[data-test-id='label'], thead label[for^='fedex-checkbox-']",
+    "download_button": "button:has-text('DOWNLOAD'), a:has-text('DOWNLOAD')",
+    "shipment_report_menu": "span.mat-mdc-menu-item-text:has-text('Shipment report (.xlsx file)')"
+  },
+  "label_save": {
+    "use_native_save_dialog": true,
+    "pause_between_labels_ms": 1000
+  }
+}
