@@ -48,7 +48,7 @@ goto RUN
 :OPT_0
 set "EXTRA_ARGS=--pull-orders-only"
 goto RUN
-:OPT_CUSTOM_DATE
+:OPT_9
 echo.
 set /p INVOICE_DATE="Enter invoice date (MM/DD/YYYY or YYYY-MM-DD): "
 if not defined INVOICE_DATE (

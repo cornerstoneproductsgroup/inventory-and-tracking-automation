@@ -835,24 +835,67 @@ def _parse_progress_stats(hwnd: int) -> dict[str, int]:
     return stats
 
 
-def _click_smart_pickup_yes(*, timeout_s: float = 90.0) -> bool:
-    """Click Yes on the UPS Smart Pickup scheduling prompt."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        for hwnd, title in _enum_visible_modal_hwnds():
-            blob = " ".join(_safe_enum_child_text(hwnd)).lower()
-            title_low = title.lower()
-            if "smart pickup" not in blob and "smart pickup" not in title_low:
-                if title_low != "ups worldship" or "pickup" not in blob:
-                    continue
-            if _click_button_win32(hwnd, "Yes"):
-                _log("Clicked Yes on UPS Smart Pickup prompt.")
-                return True
-        time.sleep(0.25)
+def _try_click_smart_pickup_once() -> bool:
+    """Click Yes if the optional Smart Pickup dialog is visible right now."""
+    for hwnd, title in _enum_visible_modal_hwnds():
+        blob = " ".join(_safe_enum_child_text(hwnd)).lower()
+        title_low = title.lower()
+        if "smart pickup" not in blob and "smart pickup" not in title_low:
+            if title_low != "ups worldship" or "pickup" not in blob:
+                continue
+        if _click_button_win32(hwnd, "Yes"):
+            _log("Clicked Yes on UPS Smart Pickup prompt.")
+            return True
     return False
 
 
-def _wait_for_automatic_processing(*, timeout_s: float) -> None:
+def _has_processing_progress_window() -> bool:
+    for _hwnd, title in _enum_visible_modal_hwnds():
+        if "automatic processing progress" in title.lower():
+            return True
+    return False
+
+
+def _wait_for_optional_smart_pickup() -> None:
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    pickup_wait_s = _step_wait_s("WORLDSHIP_SMART_PICKUP_WAIT_S", 8.0)
+    _log(f"Checking for UPS Smart Pickup prompt (up to {pickup_wait_s:.0f}s, optional)…")
+    deadline = time.monotonic() + pickup_wait_s
+    while time.monotonic() < deadline:
+        if find_save_as_dialog_hwnd():
+            _log("Save dialog appeared — skipping remaining Smart Pickup wait.")
+            return
+        if _has_processing_progress_window():
+            _log("Processing started — Smart Pickup was not shown.")
+            return
+        if _try_click_smart_pickup_once():
+            return
+        time.sleep(0.2)
+    _log("No Smart Pickup prompt — continuing.")
+
+
+def _advance_after_preview_next(*, processing_timeout_s: float) -> None:
+    """
+    Optional Smart Pickup Yes, then wait for processing — unless save/processing
+    is already underway (pickup prompt skipped on repeat runs).
+    """
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    if find_save_as_dialog_hwnd():
+        _log("Save Print Output dialog already open — skipping pickup and processing wait.")
+        return
+
+    if _has_processing_progress_window():
+        _log("Automatic Processing Progress already open.")
+    else:
+        _wait_for_optional_smart_pickup()
+
+    if find_save_as_dialog_hwnd():
+        _log("Save Print Output dialog ready.")
+        return
+
+    _wait_for_automatic_processing(timeout_s=processing_timeout_s)
     """Wait until batch processing finishes and label save dialogs are ready."""
     from automation.windows_save_as import find_save_as_dialog_hwnd
 
@@ -1188,14 +1231,10 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     preview = _find_modal_dialog(PREVIEW_DIALOG_TITLE, timeout_s=60)
     _click_preview_next(preview)
 
-    _log("Waiting for UPS Smart Pickup prompt…")
-    if not _click_smart_pickup_yes(timeout_s=90.0):
-        _log("WARN: Smart Pickup prompt not found — continuing.")
-
     from automation.worldship_label_config import processing_timeout_s
 
     proc_timeout = processing_timeout_s(order_count=4)
-    _wait_for_automatic_processing(timeout_s=proc_timeout)
+    _advance_after_preview_next(processing_timeout_s=proc_timeout)
 
     labels_saved = _save_shipping_labels()
     record_count = labels_saved
