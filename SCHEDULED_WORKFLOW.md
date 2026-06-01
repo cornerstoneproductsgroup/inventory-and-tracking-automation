@@ -22,9 +22,13 @@ Run Scheduled Workflow.bat
 
 # Install Windows Task Scheduler job (~5:00 AM daily)
 Install-Morning-Schedule-Task.bat
+
+If the window closes instantly, use **Install-Morning-Schedule-Task (Debug).bat** or run from an open cmd window so you can read errors.
 ```
 
 Log file: `logs\scheduled_workflow.log`
+
+Silent runner for Task Scheduler: `Run-Scheduled-Workflow-Silent.bat` (legacy name with parentheses still works via stub).
 
 ## Change time or add steps
 
