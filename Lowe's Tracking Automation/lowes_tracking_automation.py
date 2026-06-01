@@ -12,6 +12,56 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import Browser, Page, TimeoutError, sync_playwright
 
+_CH_TIMEOUTS = None
+
+
+def _commercehub_timeouts():
+    """Lazy import from Inventory Submissions when running the CommerceHub chain."""
+    global _CH_TIMEOUTS
+    if _CH_TIMEOUTS is None:
+        inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
+        if inv.is_dir() and str(inv) not in sys.path:
+            sys.path.insert(0, str(inv))
+        try:
+            from automation import commercehub_timeouts as mod  # type: ignore
+
+            _CH_TIMEOUTS = mod
+        except ImportError:
+            _CH_TIMEOUTS = False
+    return _CH_TIMEOUTS if _CH_TIMEOUTS else None
+
+
+def _chain_fast() -> bool:
+    return os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+
+
+def _login_probe_timeout_ms() -> int:
+    ch = _commercehub_timeouts()
+    if ch:
+        return ch.commercehub_login_probe_timeout_ms()
+    return 6000 if _chain_fast() else 10000
+
+
+def _lowes_order_links_timeout_ms() -> int:
+    ch = _commercehub_timeouts()
+    if ch:
+        return ch.lowes_order_links_timeout_ms()
+    return 6000 if _chain_fast() else 15000
+
+
+def _lowes_po_row_timeout_ms() -> int:
+    ch = _commercehub_timeouts()
+    if ch:
+        return ch.lowes_po_row_timeout_ms()
+    return 4500 if _chain_fast() else 15000
+
+
+def _lowes_invoice_select_timeout_ms() -> int:
+    ch = _commercehub_timeouts()
+    if ch:
+        return ch.lowes_invoice_select_timeout_ms()
+    return 6000 if _chain_fast() else 25000
+
 
 def expand_env_vars(value: str) -> str:
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -452,8 +502,8 @@ class LowesTrackingAutomation:
         When Lowe's has no open orders the PID=lowes link may not appear; Depot-only
         days should still proceed to Depot / Special Orders workflows.
         """
-        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
-        per_try_ms = 6000 if _fast else 10000
+        _fast = _chain_fast()
+        per_try_ms = _login_probe_timeout_ms()
         candidates: list[str] = []
         primary = (selectors.get("logged_in_ready") or "").strip()
         if primary:
@@ -495,8 +545,8 @@ class LowesTrackingAutomation:
             raise ValueError(f"Missing orders_url for workflow '{workflow_name}'")
         max_orders = int(self.config["automation"].get("max_orders", 50))
         page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
-        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
-        link_timeout_ms = 6000 if _fast else 15000
+        _fast = _chain_fast()
+        link_timeout_ms = _lowes_order_links_timeout_ms()
         try:
             page.locator(selectors["order_links"]).first.wait_for(timeout=link_timeout_ms)
         except Exception:
@@ -763,7 +813,7 @@ class LowesTrackingAutomation:
             raise ValueError(f"[{workflow_name}] Missing selector 'po_links' for list workflow")
 
         page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
-        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+        _fast = _chain_fast()
         if _fast:
             page.wait_for_timeout(200)
         run_until_stopped = bool(workflow_cfg.get("run_until_stopped", False))
@@ -771,7 +821,7 @@ class LowesTrackingAutomation:
         idle_sleep_seconds = int(workflow_cfg.get("idle_sleep_seconds", 10))
         if _fast:
             idle_sleep_seconds = min(idle_sleep_seconds, 1)
-        po_row_timeout_ms = 4500 if _fast else 15000
+        po_row_timeout_ms = _lowes_po_row_timeout_ms()
 
         while True:
             try:
@@ -917,7 +967,7 @@ class LowesTrackingAutomation:
         submit_sel = (selectors.get("submit_button") or "").strip() or "input#confirmbtn[name='confirmbtn']"
         idle_after_submit_ms = int(workflow_cfg.get("idle_after_submit_ms", 800))
         delay_autofill_ms = int(workflow_cfg.get("delay_between_invoice_autofill_ms", 150))
-        _fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+        _fast = _chain_fast()
         if _fast:
             idle_after_submit_ms = min(idle_after_submit_ms, 250)
             delay_autofill_ms = min(delay_autofill_ms, 50)
@@ -926,7 +976,7 @@ class LowesTrackingAutomation:
         if _fast:
             page.wait_for_timeout(200)
 
-        invoice_select_timeout_ms = 6000 if _fast else 25000
+        invoice_select_timeout_ms = _lowes_invoice_select_timeout_ms()
 
         while True:
             try:

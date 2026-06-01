@@ -1,7 +1,12 @@
-import os
 from datetime import datetime
 from pathlib import Path
 
+from automation.commercehub_timeouts import (
+    chain_fast,
+    navigation_timeout_ms,
+    rithum_ibl_timeout_ms,
+    rithum_profile_timeout_ms,
+)
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -103,9 +108,10 @@ def run_rithum_inventory_on_authenticated_page(page, settings) -> None:
     If the profile chooser is visible (fresh login / hub landing), clicks Cornerstone (or first profile).
     If it is not shown — e.g. chained run after Lowe's login already opened a session — skips straight to IBL.
     """
-    chain_fast = os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
+    chain_fast_mode = chain_fast()
+    nav_ms = navigation_timeout_ms()
     try:
-        if chain_fast:
+        if chain_fast_mode:
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(350)
         else:
@@ -115,13 +121,13 @@ def run_rithum_inventory_on_authenticated_page(page, settings) -> None:
                 page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(900)
 
-        profile_ms = 4000 if chain_fast else 8000
+        profile_ms = rithum_profile_timeout_ms()
         try:
             page.locator("a.application-identity-item").first.wait_for(state="visible", timeout=profile_ms)
             profile_link = page.locator("a.application-identity-item").filter(
                 has_text="Cornerstone Products Group"
             ).first
-            if profile_link.count() > 0 and profile_link.is_visible(timeout=3000 if chain_fast else 5000):
+            if profile_link.count() > 0 and profile_link.is_visible(timeout=min(5000, profile_ms)):
                 profile_link.click(timeout=settings.timeout_ms)
             else:
                 _click_first_available_profile(page, settings.timeout_ms)
@@ -132,8 +138,12 @@ def run_rithum_inventory_on_authenticated_page(page, settings) -> None:
                 "Opening inventory update directly."
             )
 
-        page.goto("https://dsm.commercehub.com/dsm/gotoUpdateInventory.do", wait_until="domcontentloaded")
-        ibl_wait = 10000 if chain_fast else settings.timeout_ms
+        page.goto(
+            "https://dsm.commercehub.com/dsm/gotoUpdateInventory.do",
+            wait_until="domcontentloaded",
+            timeout=nav_ms,
+        )
+        ibl_wait = rithum_ibl_timeout_ms()
         page.locator("#selectAllIBL").wait_for(state="visible", timeout=ibl_wait)
         page.locator("#selectAllIBL").check()
         page.locator("#iblsubmit").click()

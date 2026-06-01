@@ -77,6 +77,11 @@ def main() -> int:
             print(f"Config not found: {args.lowes_config}")
             return 1
 
+        from automation.commercehub_timeouts import (  # noqa: E402
+            default_page_timeout_ms,
+            navigation_timeout_ms,
+        )
+
         settings = load_settings()
         config = copy.deepcopy(load_config(args.lowes_config))
         delays = config["rithum"].setdefault("login_delays_ms", {})
@@ -99,7 +104,10 @@ def main() -> int:
             browser = p.chromium.launch(headless=settings.headless, slow_mo=0)
             context = browser.new_context()
             page = context.new_page()
-            page.set_default_timeout(settings.timeout_ms)
+            ch_timeout = default_page_timeout_ms()
+            ch_nav = navigation_timeout_ms()
+            page.set_default_timeout(max(settings.timeout_ms, ch_timeout))
+            page.set_default_navigation_timeout(max(settings.timeout_ms, ch_nav))
             try:
                 automation.login(page)
 

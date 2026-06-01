@@ -19,6 +19,14 @@ if str(_REPO) not in sys.path:
 
 from depot_tracking1 import MAX_SHIP_PAGES, TRACKING_CSV, load_tracking_csv  # noqa: E402
 from home_depot_invoice import MAX_INVOICE_PAGES  # noqa: E402
+from automation.commercehub_timeouts import (  # noqa: E402
+    chain_fast as _chain_fast,
+    depot_invoice_ready_timeout_ms,
+    depot_queue_probe_timeout_ms,
+    depot_ship_list_timeout_ms,
+    navigation_timeout_ms,
+    poll_interval_ms,
+)
 
 ORDER_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
@@ -41,24 +49,18 @@ SPECIAL_ORDER_CONTACT_NAME = "Joey"
 SPECIAL_ORDER_SHIPPING_VALUE = "UG"  # UPS Ground
 
 
-def _chain_fast() -> bool:
-    return os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
-
-
 POST_SUBMIT_MS = 500 if _chain_fast() else 1200
 SCROLL_WAIT_MS = 250 if _chain_fast() else 600
-# Max wait for ship list UI before treating queue as empty.
-# Rithum can intermittently take 30s+ after submit/navigation.
-_SHIP_LIST_TIMEOUT_MS = int(
-    os.environ.get(
-        "DEPOT_SHIP_LIST_TIMEOUT_MS",
-        "90000" if _chain_fast() else "240000",
-    )
-)
-# Quickinvoice often loads slower than quickship (large table after navigation).
-# commercehub_chain.py sets COMMERCEHUB_CHAIN_FAST=1; a 5.5s cap caused false
-# "queue empty" when rows existed — align closer to home_depot_invoice.py (30s wait).
-_INVOICE_AUTOFILL_TIMEOUT_MS = 30000 if _chain_fast() else 22000
+_POLL_MS = poll_interval_ms()
+_NAV_TIMEOUT_MS = navigation_timeout_ms()
+# Poll until ship list / invoice UI is ready — returns as soon as controls appear.
+_SHIP_LIST_TIMEOUT_MS = depot_ship_list_timeout_ms()
+_INVOICE_AUTOFILL_TIMEOUT_MS = depot_invoice_ready_timeout_ms()
+_QUEUE_PROBE_TIMEOUT_MS = depot_queue_probe_timeout_ms()
+
+
+def _goto(page: Page, url: str) -> None:
+    page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
 
 # Selectors for invoice Auto Fill (CommerceHub / Home Depot; Lowe's-style variant included).
 _INVOICE_AUTOFILL_DISCOVERY = (
@@ -121,7 +123,7 @@ def _wait_for_tracking_page_ready(page: Page, timeout_ms: int) -> bool:
             # Page may be navigating; keep polling until timeout.
             pass
 
-        page.wait_for_timeout(400 if _chain_fast() else 700)
+        page.wait_for_timeout(_POLL_MS)
     return False
 
 
@@ -136,7 +138,7 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
         except Exception:
             # If reload fails due to navigation state, do a direct goto fallback.
             try:
-                page.goto(ORDER_URL, wait_until="domcontentloaded")
+                page.goto(ORDER_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
             except Exception:
                 pass
 
@@ -269,7 +271,7 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
 def run_depot_tracking_with_page(page: Page, tracking_csv_path: str | None = None) -> None:
     path = tracking_csv_path or TRACKING_CSV
     tracking_dict = load_tracking_csv(str(path))
-    page.goto(ORDER_URL, wait_until="domcontentloaded")
+    page.goto(ORDER_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
     page.wait_for_timeout(250 if _chain_fast() else 500)
 
     for batch in range(1, MAX_SHIP_PAGES + 1):
@@ -318,19 +320,19 @@ def _wait_for_special_order_page_ready(page: Page, timeout_ms: int) -> bool:
                 return False
         except Exception:
             pass
-        page.wait_for_timeout(400 if _chain_fast() else 700)
+        page.wait_for_timeout(_POLL_MS)
     return False
 
 
 def _open_depot_special_order_quickship(page: Page) -> bool:
     """Navigate to thdso Open/Accepted quickship. Returns False when queue is empty."""
     print("Depot Special Orders: opening Open/Accepted quickship queue...")
-    page.goto(SPECIAL_ORDER_QUICKSHIP_URL, wait_until="domcontentloaded")
+    _goto(page, SPECIAL_ORDER_QUICKSHIP_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
-    if _wait_for_special_order_page_ready(page, 15_000):
+    if _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
 
-    page.goto(SPECIAL_ORDER_SUMMARY_URL, wait_until="domcontentloaded")
+    _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
     summary_link = page.locator("a[href*='gotoOpenOrders.do?PID=thdso']").first
     try:
@@ -526,19 +528,19 @@ def _wait_for_special_order_invoice_page_ready(page: Page, timeout_ms: int) -> b
                 return True
         except Exception:
             pass
-        page.wait_for_timeout(400 if _chain_fast() else 700)
+        page.wait_for_timeout(_POLL_MS)
     return False
 
 
 def _open_depot_special_order_quickinvoice(page: Page) -> bool:
     """Navigate to thdso Needs Invoicing queue. Returns False when queue is empty."""
     print("Depot Special Orders: opening Needs Invoicing queue...")
-    page.goto(SPECIAL_ORDER_QUICKINVOICE_URL, wait_until="domcontentloaded")
+    _goto(page, SPECIAL_ORDER_QUICKINVOICE_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
-    if _wait_for_special_order_invoice_page_ready(page, 15_000):
+    if _wait_for_special_order_invoice_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
 
-    page.goto(SPECIAL_ORDER_SUMMARY_URL, wait_until="domcontentloaded")
+    _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
     needs_inv = page.locator(
         "a[href*='merchant=thdso'][href*='web_quickinvoice'], "
@@ -751,7 +753,7 @@ def _process_depot_invoice_page(page: Page) -> bool:
             page.reload(wait_until="domcontentloaded")
         except Exception:
             try:
-                page.goto(INVOICE_URL, wait_until="domcontentloaded")
+                _goto(page, INVOICE_URL)
             except Exception:
                 pass
         if not _wait_for_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
@@ -827,7 +829,7 @@ def _process_depot_invoice_page(page: Page) -> bool:
 
 
 def run_depot_invoicing_with_page(page: Page) -> None:
-    page.goto(INVOICE_URL, wait_until="domcontentloaded")
+    _goto(page, INVOICE_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
 
     for batch in range(1, MAX_INVOICE_PAGES + 1):
