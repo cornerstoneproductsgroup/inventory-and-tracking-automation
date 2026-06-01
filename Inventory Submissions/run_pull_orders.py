@@ -26,7 +26,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Pull morning orders: CommerceHub packing slips + CSVs, "
-            "SPS Tractor/Grainger PDF+CSV, then warehouse print PDFs."
+            "SPS Tractor/Grainger PDF+CSV, 1 min settle, then warehouse print PDFs."
         )
     )
     parser.add_argument(

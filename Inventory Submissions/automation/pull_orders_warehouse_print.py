@@ -28,11 +28,32 @@ def _wait_interval_s() -> float:
 
 
 def _wait_timeout_s() -> float:
-    raw = (os.environ.get("PULL_ORDERS_WAREHOUSE_WAIT_MINUTES") or "45").strip()
+    raw = (os.environ.get("PULL_ORDERS_WAREHOUSE_WAIT_MINUTES") or "60").strip()
     try:
         return max(60.0, float(raw) * 60.0)
     except ValueError:
-        return 45.0 * 60.0
+        return 60.0 * 60.0
+
+
+def post_download_settle_seconds() -> float:
+    """Fixed wait after all retailer downloads before polling for warehouse PDFs."""
+    raw = (os.environ.get("PULL_ORDERS_POST_DOWNLOAD_WAIT_S") or "60").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 60.0
+
+
+def settle_after_downloads() -> None:
+    """Let Order Splitter finish combining today's PDFs into warehouse print files."""
+    delay_s = post_download_settle_seconds()
+    if delay_s <= 0:
+        return
+    _log(
+        f"All retailer downloads finished; waiting {delay_s:.0f}s "
+        "before checking warehouse print files…"
+    )
+    time.sleep(delay_s)
 
 
 def _file_stable(path: Path, *, settle_s: float = 2.0) -> bool:

@@ -639,9 +639,9 @@ def pull_sps_retailer(
         _log(f"WARN: PDF print/save failed for {cfg.label}: {exc}")
         pdf_dest = None
 
-    _click_combine_csv_and_download(page)
     csv_dest = cfg.csv_dir / csv_filename(cfg.label, order_date)
     try:
+        _click_combine_csv_and_download(page)
         _open_downloads_tray_and_save(page, csv_dest)
         _log(f"Saved CSV {csv_dest.name}")
     except Exception as exc:
@@ -650,11 +650,22 @@ def pull_sps_retailer(
     return pdf_dest, csv_dest
 
 
+# Grainger first; Tractor Supply last (Order Splitter / warehouse PDFs follow SPS saves).
+_SPS_RETAILER_ORDER = ("grainger", "tractor")
+
+
 def pull_sps_all(page: Page, context, *, order_date: date | None = None) -> dict[str, tuple[Path | None, Path | None]]:
-    open_order_new_search(page)
     out: dict[str, tuple[Path | None, Path | None]] = {}
-    out["tractor"] = pull_sps_retailer(page, context, retailer_key="tractor", order_date=order_date)
-    page.wait_for_timeout(800)
-    open_order_new_search(page)
-    out["grainger"] = pull_sps_retailer(page, context, retailer_key="grainger", order_date=order_date)
+    for i, retailer_key in enumerate(_SPS_RETAILER_ORDER):
+        cfg = RETAILERS[retailer_key]
+        try:
+            open_order_new_search(page)
+            out[retailer_key] = pull_sps_retailer(
+                page, context, retailer_key=retailer_key, order_date=order_date
+            )
+        except Exception as exc:
+            _log(f"WARN: {cfg.label} pull failed ({exc}); continuing.")
+            out[retailer_key] = (None, None)
+        if i < len(_SPS_RETAILER_ORDER) - 1:
+            page.wait_for_timeout(800)
     return out

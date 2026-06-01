@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -26,7 +27,19 @@ def _load_commercehub_automation():
         sys.path.insert(0, str(_LOWES_DIR))
     from lowes_tracking_automation import LowesTrackingAutomation, load_config
 
-    return LowesTrackingAutomation(load_config())
+    config_path = (os.environ.get("LOWES_TRACKING_CONFIG") or "").strip()
+    if config_path:
+        path = Path(config_path)
+    else:
+        path = None
+        for name in ("config.json", "config.example.json"):
+            candidate = _LOWES_DIR / name
+            if candidate.is_file():
+                path = candidate
+                break
+        if path is None:
+            path = _LOWES_DIR / "config.example.json"
+    return LowesTrackingAutomation(load_config(path))
 
 
 def _browser_launch(playwright):
@@ -49,7 +62,7 @@ def run_pull_orders(
 ) -> int:
     from automation.pull_orders_commercehub import pull_commercehub_all
     from automation.pull_orders_sps import pull_sps_all
-    from automation.pull_orders_warehouse_print import print_warehouse_files
+    from automation.pull_orders_warehouse_print import print_warehouse_files, settle_after_downloads
     from run_sps_tracking import (
         DEFAULT_STORAGE_STATE,
         goto_dashboard,
@@ -102,6 +115,8 @@ def run_pull_orders(
     if not skip_warehouse_print:
         _log("=== Warehouse print files ===")
         try:
+            if not skip_commercehub or not skip_sps:
+                settle_after_downloads()
             print_warehouse_files(
                 order_date=order_date,
                 skip_wait=skip_warehouse_wait,

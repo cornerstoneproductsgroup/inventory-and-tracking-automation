@@ -97,7 +97,12 @@ def _iter_retailer_rows(page: Page):
         yield key, buttons[0]
 
 
-def _save_download(download, dest: Path) -> Path:
+def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
+    for key in CH_COMMERCEHUB_KEYS:
+        if key not in found_keys:
+            _log(f"No {RETAILERS[key].label} {kind} on CommerceHub today; skipping.")
+
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     download.save_as(str(dest))
     return dest
@@ -108,7 +113,9 @@ def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None
     _log("Opening packing slips page…")
     _goto_packslips(page)
     saved: list[Path] = []
+    found_keys: set[str] = set()
     for key, download_btn in _iter_retailer_rows(page):
+        found_keys.add(key)
         cfg = RETAILERS[key]
         dest = cfg.pdf_dir / pdf_filename(cfg.label, order_date)
         _log(f"Downloading packing slip for {cfg.label} → {dest}")
@@ -122,6 +129,7 @@ def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None
         except PlaywrightTimeout:
             _log(f"WARN: no download started for {cfg.label}; skipping.")
         page.wait_for_timeout(500)
+    _log_missing_retailers(found_keys, kind="packing slip")
     if not saved:
         _log("WARN: no CommerceHub packing slips were downloaded.")
     return saved
@@ -166,7 +174,9 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
     _log("Opening order files page…")
     _goto_order_files(page)
     saved: list[Path] = []
+    found_keys: set[str] = set()
     for key, download_btn in _iter_retailer_rows(page):
+        found_keys.add(key)
         cfg = RETAILERS[key]
         _log(f"Downloading order CSV for {cfg.label}")
         try:
@@ -202,6 +212,7 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
         except Exception as exc:
             _log(f"WARN: {cfg.label} CSV failed: {exc}")
         page.wait_for_timeout(500)
+    _log_missing_retailers(found_keys, kind="order file")
     if not saved:
         _log("WARN: no CommerceHub order CSVs were downloaded.")
     return saved
