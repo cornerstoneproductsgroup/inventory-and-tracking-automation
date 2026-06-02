@@ -1,6 +1,7 @@
 """
 One Playwright browser session for CommerceHub (Rithum):
 
+0. Optional (--with-invoice-reports): Depot + Lowe's invoice reports in the same browser (CDP).
 1. Log in once (Lowe's config selectors / profile).
 2. Submit inventory update (Lowe's + Home Depot IBL), unless --skip-inventory.
 3. Home Depot quickship tracking (UPS CSV).
@@ -8,7 +9,7 @@ One Playwright browser session for CommerceHub (Rithum):
 5. Lowe's workflows from config (ship to store, ship to customer, invoice).
 6. Home Depot Special Orders acknowledgment (thdso SKUs in vendor map), tracking + invoicing.
 
-SPS / Tractor Supply is a different site — run separately (e.g. run_full_workflow.py).
+SPS / Tractor Supply is a different site — use run_sps_lane.py or run_full_workflow.py parallel lanes.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import copy
 import json
 import os
 import sys
+from datetime import date
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -71,6 +73,17 @@ def main() -> int:
             default=_LOWES_DIR / "config.example.json",
             help="Path to Lowe's JSON config.",
         )
+        parser.add_argument(
+            "--with-invoice-reports",
+            action="store_true",
+            help="After login, run Depot + Lowe's invoice reports in the same browser (no restart).",
+        )
+        parser.add_argument(
+            "--invoice-report-date",
+            default=None,
+            metavar="DATE",
+            help="Invoice report calendar date (YYYY-MM-DD). Default: previous business day.",
+        )
         args = parser.parse_args()
 
         if not args.lowes_config.is_file():
@@ -100,8 +113,24 @@ def main() -> int:
                 print(f"WARN: {msg}")
                 step_errors.append(msg)
 
+        invoice_report_day: date | None = None
+        if args.invoice_report_date:
+            inv_dir = _ROOT / "invoice report"
+            if str(inv_dir) not in sys.path:
+                sys.path.insert(0, str(inv_dir))
+            from commercehub_previous_business_day import parse_report_date  # noqa: E402
+
+            invoice_report_day = parse_report_date(args.invoice_report_date.strip())
+
+        cdp_port = int((os.environ.get("COMMERCEHUB_CDP_PORT") or "9333").strip())
+        cdp_url = f"http://127.0.0.1:{cdp_port}"
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=settings.headless, slow_mo=0)
+            browser = p.chromium.launch(
+                headless=settings.headless,
+                slow_mo=0,
+                args=[f"--remote-debugging-port={cdp_port}"],
+            )
             context = browser.new_context()
             page = context.new_page()
             ch_timeout = default_page_timeout_ms()
@@ -110,6 +139,16 @@ def main() -> int:
             page.set_default_navigation_timeout(max(settings.timeout_ms, ch_nav))
             try:
                 automation.login(page)
+
+                if args.with_invoice_reports:
+                    from automation.commercehub_cdp_invoice import run_retail_invoices_via_cdp
+
+                    _run_step(
+                        "CommerceHub invoice reports (Depot + Lowe's)",
+                        lambda: run_retail_invoices_via_cdp(
+                            cdp_url, report_day=invoice_report_day
+                        ),
+                    )
 
                 if args.skip_inventory:
                     print("\n=== Rithum inventory skipped (--skip-inventory) ===")

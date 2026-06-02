@@ -4514,6 +4514,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def run_sps_partner_tracking_on_page(
+    page: Page,
+    context: BrowserContext,
+    *,
+    csv_path: Path,
+    partner_name: str,
+    submit: bool,
+    storage_path: Path,
+    headless: bool = False,
+    interactive_login: bool = False,
+    ensure_session: bool = True,
+) -> tuple[int, int]:
+    """
+    Run one partner's tracking/invoicing flow on an existing SPS browser session.
+    Returns (completed_count, attempted_count).
+    """
+    tracking_by_po = load_tracking_map(csv_path)
+    if not tracking_by_po:
+        print(f"No tracking rows loaded from {csv_path}; skipping {partner_name}.")
+        return 0, 0
+
+    if interactive_login:
+        interactive_login_then_save(page, context, storage_path)
+    elif ensure_session:
+        ensure_sps_session(
+            page,
+            context,
+            storage_path,
+            headless=headless,
+            allow_manual=not headless,
+        )
+
+    open_ready_for_shipment(page, partner_name=partner_name)
+    completed, attempted = process_orders_individually(
+        page,
+        tracking_by_po,
+        submit=bool(submit),
+        partner_name=partner_name,
+    )
+    print(f"{partner_name}: {completed}/{attempted} processed.")
+    return completed, attempted
+
+
 def main() -> int:
     args = parse_args()
     print("SPS tracking: session validation v2 (transactions page must load before continuing).")

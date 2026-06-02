@@ -1,17 +1,16 @@
 """
 Orchestrates the full daily workflow.
 
-Phases (default):
-  0 — CommerceHub invoice reports first. ``all`` runs in parallel: CommerceHub (Depot then Lowe's,
-      one browser) and SPS Tractor Supply (second browser). Folder auto-detection: see
-      ``discover_invoice_report_directory`` (CLI/env, ``<repo>/invoice report``, etc.).
-  1 — Inventories in parallel when both sides run: Rithum inventory (CommerceHub) and
-      Tractor Supply inventory (SPS), each in its own browser.
-  2 — Tracking / invoicing in parallel when both sides run: Depot + Lowe's (CommerceHub) and
-      SPS Tractor Supply tracking (+ optional Grainger), each lane in its own browser.
+Two independent lanes run in parallel (default); neither waits on the other:
 
-CommerceHub is split into two subprocesses when you need both Rithum inventory and Depot/Lowe's
-and any SPS step is enabled (two separate logins to CommerceHub).
+  **CommerceHub (Rithum)** — one browser for the whole lane: optional Depot/Lowe's invoice reports,
+  inventory, Depot tracking/invoicing, Lowe's workflows, Depot Special Orders (ack + track + invoice).
+
+  **SPS Commerce** — one browser for the whole lane: optional Tractor invoice report, Tractor
+  inventory, Tractor + Grainger tracking/invoicing.
+
+Use ``--sequential-lanes`` to run CommerceHub fully, then SPS. Invoice-only runs still use
+``--invoice-report-only`` (legacy separate export subprocesses).
 
 Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 --skip-depot, --skip-lowes, --skip-invoice-report.
@@ -257,6 +256,8 @@ def _build_chain_cmd(
     skip_depot: bool,
     skip_lowes: bool,
     lowes_submit: bool,
+    with_invoice_reports: bool = False,
+    invoice_report_date: date | None = None,
 ) -> list[str]:
     cmd: list[str] = [
         python_exe,
@@ -272,7 +273,87 @@ def _build_chain_cmd(
         cmd.append("--skip-depot")
     if skip_lowes:
         cmd.append("--skip-lowes")
+    if with_invoice_reports:
+        cmd.append("--with-invoice-reports")
+    if invoice_report_date is not None:
+        cmd.extend(["--invoice-report-date", invoice_report_date.isoformat()])
     return cmd
+
+
+def _lane_wants_ch_invoice(modes: list[str]) -> bool:
+    return any(m in modes for m in ("all", "retail", "depot", "lowes"))
+
+
+def _lane_wants_sps_invoice(modes: list[str]) -> bool:
+    return any(m in modes for m in ("all", "tractor"))
+
+
+def _build_sps_lane_cmd(
+    python_exe: str,
+    *,
+    skip_inventory: bool,
+    skip_tracking: bool,
+    skip_grainger: bool,
+    skip_tractor: bool,
+    with_invoice_reports: bool,
+    invoice_report_date: date | None,
+    submit: bool,
+    interactive_login: bool,
+) -> list[str]:
+    cmd: list[str] = [python_exe, "run_sps_lane.py"]
+    if skip_inventory:
+        cmd.append("--skip-inventory")
+    if skip_tracking:
+        cmd.append("--skip-tracking")
+    if skip_grainger:
+        cmd.append("--skip-grainger")
+    if skip_tractor:
+        cmd.append("--skip-tractor")
+    if with_invoice_reports:
+        cmd.append("--with-invoice-reports")
+    if invoice_report_date is not None:
+        cmd.extend(["--invoice-report-date", invoice_report_date.isoformat()])
+    if submit:
+        cmd.append("--submit")
+    if interactive_login:
+        cmd.append("--interactive-login")
+    return cmd
+
+
+def _run_parallel_lane_sequences(
+    left_steps: list[tuple[str, list[str], Path]],
+    right_steps: list[tuple[str, list[str], Path]],
+    *,
+    lane_label: str,
+    sequential: bool,
+) -> list[str]:
+    """Run two full lane step lists in parallel (each lane keeps one browser for all its steps)."""
+    errs: list[str] = []
+    if left_steps and right_steps:
+        if sequential:
+            print(f"\nNOTE: {lane_label} — sequential (--sequential-lanes).")
+            errs.extend(_run_step_sequence(left_steps))
+            errs.extend(_run_step_sequence(right_steps))
+        else:
+            print(
+                "\n"
+                + "=" * 60
+                + f"\n{lane_label} — parallel lanes (independent browsers)\n"
+                + "=" * 60
+                + "\n  Lane A: CommerceHub (Rithum) — invoice + inventory + tracking in one session\n"
+                + "  Lane B: SPS Commerce — invoice + inventory + tracking in one session\n"
+                + "\nEach lane runs start-to-finish without waiting on the other.\n"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fut_l = pool.submit(_run_step_sequence, left_steps)
+                fut_r = pool.submit(_run_step_sequence, right_steps)
+                errs.extend(fut_l.result())
+                errs.extend(fut_r.result())
+    elif left_steps:
+        errs.extend(_run_step_sequence(left_steps))
+    elif right_steps:
+        errs.extend(_run_step_sequence(right_steps))
+    return errs
 
 
 def _run_single(title: str, cmd: list[str], cwd: Path) -> list[str]:
@@ -330,8 +411,8 @@ def _run_parallel_pair(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Full workflow: invoice reports (optional), then inventory lanes in parallel, "
-            "then tracking lanes in parallel (CommerceHub vs SPS)."
+            "Full workflow: CommerceHub and SPS Commerce lanes in parallel; each lane uses one "
+            "browser for invoice reports (optional), inventory, and tracking/invoicing."
         )
     )
     parser.add_argument(
@@ -547,7 +628,7 @@ def main() -> int:
     if grainger_only:
         skip_commercehub = True
         skip_sps_inventory = True
-        run_sps_tracking = False
+        run_sps_tracking = True
         skip_invoice_report = True
 
     if invoice_report_only:
@@ -570,8 +651,8 @@ def main() -> int:
 
     if tracking_invoicing_only:
         print(
-            "Mode: tracking + invoicing only — inventories skipped; CommerceHub runs with "
-            "--skip-inventory (Depot/Lowe's), then SPS tracking."
+            "Mode: tracking + invoicing only — inventories skipped; each lane uses one browser "
+            "(CommerceHub: Depot/Lowe's/Special Orders; SPS: Tractor/Grainger as configured)."
         )
 
     python_exe = resolve_project_python()
@@ -755,163 +836,81 @@ def main() -> int:
         )
         return 1
 
-    tracking_script = INVENTORY_DIR / "run_sps_tracking.py"
+    sps_lane_script = INVENTORY_DIR / "run_sps_lane.py"
     sps_storage_json = INVENTORY_DIR / "sps_playwright_storage.json"
+    tracking_script = INVENTORY_DIR / "run_sps_tracking.py"
 
-    sps_inventory_entry: tuple[str, list[str], Path] | None = None
-    sps_tracking_steps: list[tuple[str, list[str], Path]] = []
+    ch_lane_steps: list[tuple[str, list[str], Path]] = []
+    sps_lane_steps: list[tuple[str, list[str], Path]] = []
 
-    if not skip_sps_inventory:
-        sps_inventory_entry = (
-            "SPS Commerce — Tractor Supply inventory",
-            [python_exe, "run_sps.py"],
-            INVENTORY_DIR,
-        )
-
-    sps_tracking_only = (
-        run_sps_tracking
-        and skip_sps_inventory
-        and skip_commercehub
-        and not grainger_only
+    wants_ch_work = not skip_commercehub and (
+        not skip_inventory or not skip_depot or not skip_lowes
     )
-    if run_sps_tracking and tracking_script.is_file():
-        tracking_cmd = [python_exe, "run_sps_tracking.py", "--submit"]
-        need_interactive = args.force_sps_interactive_login or sps_tracking_only or (
-            not sps_storage_json.is_file()
-            and os.environ.get("SPS_TRACKING_NON_INTERACTIVE", "").strip().lower()
-            not in ("1", "true", "yes", "y", "on")
+    wants_sps_work = not skip_sps_inventory or run_sps_tracking or run_grainger_all
+
+    ch_with_invoice = bool(invoice_modes and _lane_wants_ch_invoice(invoice_modes))
+    sps_with_invoice = bool(invoice_modes and _lane_wants_sps_invoice(invoice_modes))
+
+    if wants_ch_work:
+        ch_cmd = _build_chain_cmd(
+            python_exe,
+            skip_inventory=skip_inventory,
+            skip_depot=skip_depot,
+            skip_lowes=skip_lowes,
+            lowes_submit=lowes_submit,
+            with_invoice_reports=ch_with_invoice,
+            invoice_report_date=invoice_report_date,
         )
-        if need_interactive:
-            tracking_cmd.append("--interactive-login")
-            if args.force_sps_interactive_login:
-                print(
-                    "\nNOTE: Forcing interactive SPS login before tracking to refresh saved session.\n"
-                    f"      Session file target: {sps_storage_json}\n"
-                )
-            elif sps_tracking_only:
-                print(
-                    "\nNOTE: SPS tracking-only run — browser will open for sign-in if the saved session "
-                    "is missing or expired (menu B / tracking-only).\n"
-                    f"      Session file: {sps_storage_json}\n"
-                )
-            else:
-                print(
-                    "\nNOTE: No sps_playwright_storage.json — tracking will pause once for SPS login in the browser, "
-                    "then save that session for future runs.\n"
-                    "      Set SPS_TRACKING_NON_INTERACTIVE=1 to skip this (automation must supply the file).\n"
-                )
-        sps_tracking_steps.append(
+        ch_lane_steps.append(
             (
-                "SPS Commerce — Tractor Supply tracking",
-                tracking_cmd,
+                "CommerceHub lane (invoice + inventory + Depot/Lowe's + Special Orders)",
+                ch_cmd,
                 INVENTORY_DIR,
             )
         )
-    elif run_sps_tracking:
-        print(
-            "NOTE: SPS tracking step requested, but script not found:\n"
-            f"      {tracking_script}\n"
-            "      Add run_sps_tracking.py under Inventory Submissions to enable this step."
-        )
+    elif not skip_commercehub:
+        print("NOTE: CommerceHub selected but no CommerceHub actions enabled; skipping that step.")
 
-    if run_grainger_all and tracking_script.is_file():
-        grainger_cmd = [python_exe, "run_sps_tracking.py", "--submit", "--partner", "Grainger"]
-        need_interactive = args.force_sps_interactive_login or (
-            not sps_storage_json.is_file()
-            and os.environ.get("SPS_TRACKING_NON_INTERACTIVE", "").strip().lower() not in ("1", "true", "yes", "y", "on")
-        )
-        if need_interactive:
-            grainger_cmd.append("--interactive-login")
-        sps_tracking_steps.append(
-            (
-                "SPS Commerce — Grainger ALL",
-                grainger_cmd,
-                INVENTORY_DIR,
+    if wants_sps_work:
+        if not sps_lane_script.is_file():
+            print(
+                "NOTE: SPS lane script not found:\n"
+                f"      {sps_lane_script}\n"
+                "      Update/pull Inventory Submissions (run_sps_lane.py) to enable the unified SPS session."
             )
-        )
-    elif run_grainger_all:
-        print(
-            "NOTE: SPS Grainger step requested, but script not found:\n"
-            f"      {tracking_script}\n"
-            "      Add run_sps_tracking.py under Inventory Submissions to enable this step."
-        )
-
-    wants_ch_inv = not skip_commercehub and not skip_inventory
-    wants_ch_dlv = not skip_commercehub and (not skip_depot or not skip_lowes)
-    has_any_sps = sps_inventory_entry is not None or bool(sps_tracking_steps)
-
-    split_ch = False
-    ch_inventory_entry: tuple[str, list[str], Path] | None = None
-    ch_tracking_entry: tuple[str, list[str], Path] | None = None
-    ch_single_entry: tuple[str, list[str], Path] | None = None
-
-    if not skip_commercehub:
-        split_ch = bool(wants_ch_inv and wants_ch_dlv and has_any_sps)
-        if split_ch:
-            cmd_inv = _build_chain_cmd(
-                python_exe,
-                skip_inventory=False,
-                skip_depot=True,
-                skip_lowes=True,
-                lowes_submit=lowes_submit,
-            )
-            ch_inventory_entry = ("CommerceHub — Rithum inventory only (Lowe's + Home Depot IBL)", cmd_inv, INVENTORY_DIR)
-            cmd_tr = _build_chain_cmd(
-                python_exe,
-                skip_inventory=True,
-                skip_depot=skip_depot,
-                skip_lowes=skip_lowes,
-                lowes_submit=lowes_submit,
-            )
-            ch_tracking_entry = ("CommerceHub — Depot + Lowe's tracking & invoicing", cmd_tr, INVENTORY_DIR)
-        elif wants_ch_inv or wants_ch_dlv:
-            scope_parts: list[str] = []
-            if wants_ch_inv:
-                scope_parts.append("inventory")
-            if not skip_depot:
-                scope_parts.append("Depot tracking/invoicing")
-            if not skip_lowes:
-                scope_parts.append("Lowe's tracking/invoicing")
-            scope_text = ", ".join(scope_parts) if scope_parts else "chain"
-            cmd_full = _build_chain_cmd(
-                python_exe,
-                skip_inventory=skip_inventory,
-                skip_depot=skip_depot,
-                skip_lowes=skip_lowes,
-                lowes_submit=lowes_submit,
-            )
-            ch_single_entry = (f"CommerceHub — one login: {scope_text}", cmd_full, INVENTORY_DIR)
         else:
-            print("NOTE: CommerceHub selected but no CommerceHub actions enabled; skipping that step.")
+            sps_interactive = args.force_sps_interactive_login or (
+                not sps_storage_json.is_file()
+                and os.environ.get("SPS_TRACKING_NON_INTERACTIVE", "").strip().lower()
+                not in ("1", "true", "yes", "y", "on")
+            )
+            if sps_interactive and not args.force_sps_interactive_login:
+                print(
+                    "\nNOTE: No sps_playwright_storage.json — SPS lane will pause for sign-in if needed.\n"
+                    "      Set SPS_TRACKING_NON_INTERACTIVE=1 to skip interactive login prompts.\n"
+                )
+            sps_cmd = _build_sps_lane_cmd(
+                python_exe,
+                skip_inventory=skip_sps_inventory,
+                skip_tracking=not run_sps_tracking,
+                skip_grainger=not run_grainger_all,
+                skip_tractor=grainger_only,
+                with_invoice_reports=sps_with_invoice,
+                invoice_report_date=invoice_report_date,
+                submit=True,
+                interactive_login=sps_interactive,
+            )
+            sps_lane_steps.append(
+                (
+                    "SPS Commerce lane (invoice + inventory + Tractor/Grainger tracking)",
+                    sps_cmd,
+                    INVENTORY_DIR,
+                )
+            )
 
-    phase1_left: tuple[str, list[str], Path] | None = None
-    phase1_right: list[tuple[str, list[str], Path]] = []
-    phase2_left: tuple[str, list[str], Path] | None = None
-
-    if split_ch:
-        phase1_left = ch_inventory_entry
-        if sps_inventory_entry:
-            phase1_right.append(sps_inventory_entry)
-        phase2_left = ch_tracking_entry
-    elif ch_single_entry:
-        dlv_only_single = wants_ch_dlv and not wants_ch_inv
-        if sps_inventory_entry and dlv_only_single:
-            phase1_right.append(sps_inventory_entry)
-            phase2_left = ch_single_entry
-        else:
-            phase1_left = ch_single_entry
-            if sps_inventory_entry:
-                phase1_right.append(sps_inventory_entry)
-    elif sps_inventory_entry:
-        phase1_right.append(sps_inventory_entry)
-
-    has_work = bool(
-        phase1_left
-        or phase1_right
-        or phase2_left
-        or sps_tracking_steps
-        or (invoice_modes is not None and len(invoice_modes) > 0)
-    )
+    has_work = bool(ch_lane_steps or sps_lane_steps)
+    if invoice_report_only:
+        has_work = has_work or bool(invoice_modes)
     if not has_work:
         print(
             "ERROR: No steps to run (everything skipped). "
@@ -922,11 +921,9 @@ def main() -> int:
     required_names: list[str] = []
     if not skip_commercehub:
         required_names.append("run_commercehub_chain.py")
-    if not skip_sps_inventory:
-        required_names.append("run_sps.py")
-    if run_sps_tracking and tracking_script.is_file():
-        required_names.append("run_sps_tracking.py")
-    if run_grainger_all and tracking_script.is_file():
+    if wants_sps_work:
+        required_names.append("run_sps_lane.py")
+    if run_sps_tracking and tracking_script.is_file() and not sps_lane_script.is_file():
         required_names.append("run_sps_tracking.py")
 
     missing_scripts = [str(INVENTORY_DIR / n) for n in required_names if not (INVENTORY_DIR / n).is_file()]
@@ -943,7 +940,7 @@ def main() -> int:
 
     errors: list[str] = []
 
-    if invoice_modes:
+    if invoice_modes and invoice_report_only:
         export_script = invoice_report_dir / "commercehub_invoice_export.py"
         if not export_script.is_file():
             checked = "\n".join(f"  - {p}" for p in invoice_search_tried) if invoice_search_tried else "  (none)"
@@ -996,42 +993,25 @@ def main() -> int:
                     title = f"CommerceHub invoice report — {label}"
                     errors.extend(_run_single(title, cmd, invoice_report_dir))
 
-    if invoice_modes and errors:
+    if invoice_modes and errors and invoice_report_only:
         print(
             "\n"
             + "=" * 60
-            + "\nWARN: CommerceHub invoice reports (Phase 0) had issues — continuing with later phases.\n"
+            + "\nWARN: Invoice report step(s) had issues.\n"
             + "=" * 60
         )
 
-    if phase1_left or phase1_right:
-        errors.extend(
-            _run_parallel_pair(
-                phase1_left,
-                phase1_right,
-                phase_label="Phase 1 — Inventories",
-                sequential=sequential_lanes,
-            )
-        )
-        sps_inventory_failed = any(
-            "SPS Commerce — Tractor Supply inventory" in e for e in errors
-        )
-        if sps_inventory_failed and sps_tracking_steps:
-            for idx, (title, cmd, cwd) in enumerate(sps_tracking_steps):
-                if "run_sps_tracking.py" not in cmd or "--interactive-login" in cmd:
-                    continue
-                sps_tracking_steps[idx] = (title, [*cmd, "--interactive-login"], cwd)
+    if not invoice_report_only and (ch_lane_steps or sps_lane_steps):
+        if ch_with_invoice or sps_with_invoice:
             print(
-                "\nNOTE: SPS inventory did not complete — tracking will open sign-in "
-                "(saved session was not refreshed by inventory).\n"
+                "\nNOTE: Invoice reports run inside each lane's browser session "
+                "(no separate Phase 0 subprocess).\n"
             )
-
-    if phase2_left or sps_tracking_steps:
         errors.extend(
-            _run_parallel_pair(
-                phase2_left,
-                sps_tracking_steps,
-                phase_label="Phase 2 — Tracking / invoicing",
+            _run_parallel_lane_sequences(
+                ch_lane_steps,
+                sps_lane_steps,
+                lane_label="Daily workflow",
                 sequential=sequential_lanes,
             )
         )
