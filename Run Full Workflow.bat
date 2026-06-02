@@ -92,18 +92,17 @@ echo   7  Tractor Supply
 echo   8  Grainger
 echo   0  Back to main menu
 echo.
-set "TI_CHOICE="
-set /p TI_CHOICE="Enter 1-8 (or 0 to go back): "
-if /i "%TI_CHOICE%"=="0" goto MAIN_MENU
-if /i "%TI_CHOICE%"=="1" goto TI_ALL
-if /i "%TI_CHOICE%"=="2" goto TI_CH_ALL
-if /i "%TI_CHOICE%"=="3" goto TI_SPS_ALL
-if /i "%TI_CHOICE%"=="4" goto TI_DEPOT
-if /i "%TI_CHOICE%"=="5" goto TI_LOWES
-if /i "%TI_CHOICE%"=="6" goto TI_SPECIAL
-if /i "%TI_CHOICE%"=="7" goto TI_TRACTOR
-if /i "%TI_CHOICE%"=="8" goto TI_GRAINGER
-echo Invalid choice: "%TI_CHOICE%"
+choice /C 012345678 /N /M "Press 0-8: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6 6=7 7=8 8=9
+if errorlevel 9 goto TI_GRAINGER
+if errorlevel 8 goto TI_TRACTOR
+if errorlevel 7 goto TI_SPECIAL
+if errorlevel 6 goto TI_LOWES
+if errorlevel 5 goto TI_DEPOT
+if errorlevel 4 goto TI_SPS_ALL
+if errorlevel 3 goto TI_CH_ALL
+if errorlevel 2 goto TI_ALL
+if errorlevel 1 goto MAIN_MENU
 goto SUBMENU_TRACKING
 
 :TI_ALL
@@ -151,15 +150,12 @@ echo   4  Lowe's ^(same as CommerceHub ALL — both retailers on one form^)
 echo   5  Tractor Supply ^(SPS inventory only^)
 echo   0  Back to main menu
 echo.
-set "INV_CHOICE="
-set /p INV_CHOICE="Enter 1-5 (or 0 to go back): "
-if /i "%INV_CHOICE%"=="0" goto MAIN_MENU
-if /i "%INV_CHOICE%"=="1" goto INV_ALL
-if /i "%INV_CHOICE%"=="2" goto INV_CH_ALL
-if /i "%INV_CHOICE%"=="3" goto INV_CH_ALL
-if /i "%INV_CHOICE%"=="4" goto INV_CH_ALL
-if /i "%INV_CHOICE%"=="5" goto INV_TRACTOR
-echo Invalid choice: "%INV_CHOICE%"
+choice /C 012345 /N /M "Press 0-5: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6
+if errorlevel 6 goto INV_TRACTOR
+if errorlevel 3 goto INV_CH_ALL
+if errorlevel 2 goto INV_ALL
+if errorlevel 1 goto MAIN_MENU
 goto SUBMENU_INVENTORY
 
 :INV_ALL
@@ -187,15 +183,14 @@ echo   4  Lowe's
 echo   5  Tractor Supply
 echo   0  Back to main menu
 echo.
-set "IR_CHOICE="
-set /p IR_CHOICE="Enter 1-5 (or 0 to go back): "
-if /i "%IR_CHOICE%"=="0" goto MAIN_MENU
-if /i "%IR_CHOICE%"=="1" goto IR_ALL
-if /i "%IR_CHOICE%"=="2" goto IR_CH_ALL
-if /i "%IR_CHOICE%"=="3" goto IR_DEPOT
-if /i "%IR_CHOICE%"=="4" goto IR_LOWES
-if /i "%IR_CHOICE%"=="5" goto IR_TRACTOR
-echo Invalid choice: "%IR_CHOICE%"
+choice /C 012345 /N /M "Press 0-5: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6
+if errorlevel 6 goto IR_TRACTOR
+if errorlevel 5 goto IR_LOWES
+if errorlevel 4 goto IR_DEPOT
+if errorlevel 3 goto IR_CH_ALL
+if errorlevel 2 goto IR_ALL
+if errorlevel 1 goto MAIN_MENU
 goto SUBMENU_INVOICE
 
 :IR_ALL
