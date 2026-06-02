@@ -1,0 +1,14 @@
+{
+  "_comment": "Same list as Order Splitter watcher.py WAREHOUSE_VENDORS. Update here when you change that list (WorldShip PC has no Order Splitter install).",
+  "vendors": [
+    "Cord Mate",
+    "Gate Latch",
+    "Home Selects",
+    "Nisus",
+    "Post Protector-Here",
+    "Soft Seal",
+    "Weedshark",
+    "Zaca",
+    "Cornerstone"
+  ]
+}

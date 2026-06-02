@@ -8,6 +8,7 @@ from pathlib import Path
 
 from automation.fedex_batch_config import LOWES_LABELS_ROOT, label_filename
 from automation.fedex_lowes_csv import LowesOrderRow
+from automation.warehouse_print_vendors import is_warehouse_print_vendor
 from automation.worldship_vendor_map import VendorMapRegistry, lookup_vendor_folder, load_vendor_map
 
 
@@ -97,7 +98,11 @@ def print_label_plan(groups: list[VendorLabelGroup]) -> None:
     _log(f"Label plan: {total} shipment(s) in {len(groups)} vendor group(s)")
     for group in groups:
         skus = ", ".join(t.sku for t in group.targets)
-        _log(f"  [{group.vendor_folder}] {len(group.targets)} label(s) → {group.save_dir}")
+        if is_warehouse_print_vendor(group.vendor_folder):
+            dest = f"Zebra printer (warehouse print — not saved to {group.save_dir})"
+        else:
+            dest = str(group.save_dir)
+        _log(f"  [{group.vendor_folder}] {len(group.targets)} label(s) → {dest}")
         _log(f"      SKUs: {skus}")
 
 

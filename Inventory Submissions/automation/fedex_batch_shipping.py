@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -40,6 +41,13 @@ from automation.fedex_reference import (
     reference_to_order,
 )
 from automation.fedex_upload_state import mark_file_used
+from automation.pull_orders_warehouse_print import _resolve_printer, print_pdf_windows
+from automation.warehouse_print_vendors import (
+    bundled_warehouse_vendors_path,
+    is_warehouse_print_vendor,
+    load_warehouse_print_vendors,
+    order_splitter_watcher_path,
+)
 from automation.windows_save_as import fill_save_as_dialog
 
 
@@ -598,6 +606,31 @@ def _finalize_and_print_manual(page: Page, cfg: dict[str, Any]) -> None:
         raise FedexBatchError('Could not click "Finalize and print manually".')
 
 
+def _print_preview_candidate_pages(page: Page, context: BrowserContext) -> list[Page]:
+    pages = list(context.pages)
+    candidates = [p for p in pages if p != page]
+    if not candidates:
+        candidates = [page]
+
+    def _score(p: Page) -> int:
+        url = (p.url or "").lower()
+        if "pdf" in url or "print" in url or "blob:" in url:
+            return 1
+        return 0
+
+    return sorted(candidates, key=_score)
+
+
+def _close_print_preview_pages(page: Page, context: BrowserContext) -> None:
+    for candidate in _print_preview_candidate_pages(page, context):
+        if candidate == page:
+            continue
+        try:
+            candidate.close()
+        except Exception:
+            pass
+
+
 def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
     try:
         page.bring_to_front()
@@ -630,36 +663,22 @@ def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
             return False
 
 
+def _capture_print_preview_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
+    for candidate in reversed(_print_preview_candidate_pages(page, context)):
+        if _cdp_save_pdf(candidate, context, dest):
+            return True
+    return False
+
+
 def _save_print_pdf(page: Page, context: BrowserContext, dest: Path, cfg: dict[str, Any]) -> bool:
     """Save label PDF from print preview tab or native Save dialog."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     _log(f"Saving label PDF → {dest}")
 
-    pages = list(context.pages)
-    candidates = [p for p in pages if p != page]
-    if not candidates:
-        candidates = [page]
-
-    for candidate in reversed(candidates):
-        url = (candidate.url or "").lower()
-        if "pdf" in url or "print" in url or "blob:" in url:
-            if _cdp_save_pdf(candidate, context, dest):
-                _log(f"Saved via print-to-PDF ({dest.stat().st_size:,} bytes)")
-                try:
-                    candidate.close()
-                except Exception:
-                    pass
-                return True
-
-    for candidate in reversed(candidates):
-        if _cdp_save_pdf(candidate, context, dest):
-            _log(f"Saved via print-to-PDF on tab ({dest.name})")
-            try:
-                if candidate != page:
-                    candidate.close()
-            except Exception:
-                pass
-            return True
+    if _capture_print_preview_pdf(page, context, dest):
+        _log(f"Saved via print-to-PDF ({dest.stat().st_size:,} bytes)")
+        _close_print_preview_pages(page, context)
+        return True
 
     if bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
         if fill_save_as_dialog(dest, timeout_s=label_save_timeout_s()):
@@ -668,14 +687,59 @@ def _save_print_pdf(page: Page, context: BrowserContext, dest: Path, cfg: dict[s
     return dest.is_file() and dest.stat().st_size > 500
 
 
+def _zebra_label_printer() -> str:
+    return _resolve_printer(
+        "FEDEX_WAREHOUSE_LABEL_PRINTER",
+        "PULL_ORDERS_SOS_LABEL_PRINTER",
+        "Zebra ZP 450",
+    )
+
+
+def _print_label_pdf(page: Page, context: BrowserContext, cfg: dict[str, Any], *, vendor: str) -> bool:
+    """Capture FedEx print preview to a temp PDF and send to the warehouse Zebra."""
+    fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="fedex_warehouse_label_")
+    os.close(fd)
+    dest = Path(tmp_name)
+    printer = _zebra_label_printer()
+    _log(f"Warehouse vendor {vendor!r}: printing labels on {printer!r} (not saving to share)")
+
+    try:
+        if not _capture_print_preview_pdf(page, context, dest):
+            _log(f"WARN: could not capture print preview PDF for {vendor!r}")
+            return False
+        print_pdf_windows(dest, printer)
+        time.sleep(2.0)
+        _log(f"Submitted Zebra print job for {vendor!r}")
+        return True
+    finally:
+        _close_print_preview_pages(page, context)
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _process_vendor_groups(
     page: Page,
     context: BrowserContext,
     cfg: dict[str, Any],
     *,
     order_date: date | None,
-) -> int:
+) -> tuple[int, int]:
     saved_pdfs = 0
+    printed_groups = 0
+    warehouse_vendors = load_warehouse_print_vendors()
+    if warehouse_vendors:
+        _log(
+            f"Warehouse-print vendors ({len(warehouse_vendors)}): "
+            f"{', '.join(sorted(warehouse_vendors))}"
+        )
+    else:
+        _log(
+            "WARN: No warehouse-print vendors loaded; all labels save to share. "
+            f"Check {bundled_warehouse_vendors_path()} or Order Splitter at "
+            f"{order_splitter_watcher_path()}"
+        )
     pass_num = 0
     while pass_num < 50:
         pass_num += 1
@@ -703,12 +767,18 @@ def _process_vendor_groups(
 
         list_page = page
         _finalize_and_print_manual(page, cfg)
-        dest = vendor_label_pdf_path(vendor, order_date)
-        if _save_print_pdf(page, context, dest, cfg):
-            saved_pdfs += 1
-            _log(f"Saved {dest.name}")
+        if is_warehouse_print_vendor(vendor):
+            if _print_label_pdf(page, context, cfg, vendor=vendor):
+                printed_groups += 1
+            else:
+                _log(f"WARN: could not print labels on Zebra for {vendor!r}")
         else:
-            _log(f"WARN: could not save PDF for {vendor!r}")
+            dest = vendor_label_pdf_path(vendor, order_date)
+            if _save_print_pdf(page, context, dest, cfg):
+                saved_pdfs += 1
+                _log(f"Saved {dest.name}")
+            else:
+                _log(f"WARN: could not save PDF for {vendor!r}")
 
         try:
             list_page.bring_to_front()
@@ -717,7 +787,7 @@ def _process_vendor_groups(
         page.wait_for_timeout(1500)
         page.wait_for_load_state("domcontentloaded")
 
-    return saved_pdfs
+    return saved_pdfs, printed_groups
 
 
 def _select_all_checkbox_selectors(cfg: dict[str, Any]) -> list[str]:
@@ -926,8 +996,10 @@ def run_fedex_batch(
                 _log("skip_upload: opening existing batch from table…")
 
             _open_batch_shipments(page, cfg, csv_basename)
-            saved = _process_vendor_groups(page, context, cfg, order_date=d)
-            _log(f"Saved {saved} vendor label PDF(s).")
+            saved, printed = _process_vendor_groups(page, context, cfg, order_date=d)
+            _log(f"Saved {saved} vendor label PDF(s) to share.")
+            if printed:
+                _log(f"Printed {printed} warehouse vendor group(s) on Zebra.")
 
             _export_shipment_report_for_tracking(page, cfg)
 
