@@ -170,34 +170,56 @@ def _unresolved_recipient_names(mail) -> list[str]:
     return bad
 
 
+def _dedupe_mail_recipients(mail) -> int:
+    """Remove duplicate To/Cc entries (same name + type). Returns count removed."""
+    removed = 0
+    seen: set[tuple[str, int]] = set()
+    try:
+        count = int(mail.Recipients.Count)
+    except Exception:
+        return 0
+    for idx in range(count, 0, -1):
+        try:
+            recip = mail.Recipients.Item(idx)
+            key = (str(getattr(recip, "Name", "") or "").casefold(), int(recip.Type))
+            if key in seen:
+                mail.Recipients.Remove(idx)
+                removed += 1
+            else:
+                seen.add(key)
+        except Exception:
+            continue
+    if removed:
+        _log(f"Removed {removed} duplicate recipient(s).")
+    return removed
+
+
 def _add_resolved_recipient_from_gal(mail, gal, *, rtype: int) -> bool:
-    """Add a namespace.CreateRecipient that already resolved."""
+    """Add one resolved distribution list / GAL entry (single recipient only)."""
+    candidates: list[object] = [gal]
     try:
-        added = mail.Recipients.Add(gal)
-        added.Type = rtype
-        if _recipient_is_resolved(added):
-            return True
+        candidates.append(gal.AddressEntry)
     except Exception:
         pass
-    try:
-        entry = gal.AddressEntry
-        added = mail.Recipients.Add(entry)
-        added.Type = rtype
-        if _recipient_is_resolved(added):
-            return True
-    except Exception:
-        pass
-    try:
-        addr = str(getattr(gal, "Address", "") or "").strip()
-        name = str(getattr(gal, "Name", "") or "").strip()
-        token = addr or name
-        if token:
-            added = mail.Recipients.Add(token)
+
+    for item in candidates:
+        added = None
+        try:
+            added = mail.Recipients.Add(item)
             added.Type = rtype
-            if added.Resolve() or _recipient_is_resolved(added):
+            try:
+                added.Resolve()
+            except Exception:
+                pass
+            if _recipient_is_resolved(added):
                 return True
-    except Exception:
-        pass
+            mail.Recipients.Remove(added.Index)
+        except Exception:
+            if added is not None:
+                try:
+                    mail.Recipients.Remove(added.Index)
+                except Exception:
+                    pass
     return False
 
 
@@ -234,19 +256,18 @@ def _apply_mail_recipients(
             if gal.Resolve():
                 if _add_resolved_recipient_from_gal(mail, gal, rtype=rtype):
                     return
+                unresolved.append(name)
+                return
         except Exception:
             gal = None
 
         recip = mail.Recipients.Add(name)
         recip.Type = rtype
-        if recip.Resolve() or _recipient_is_resolved(recip):
-            return
-
-        if gal is not None and _add_resolved_recipient_from_gal(mail, gal, rtype=rtype):
-            try:
-                mail.Recipients.Remove(recip.Index)
-            except Exception:
-                pass
+        try:
+            recip.Resolve()
+        except Exception:
+            pass
+        if _recipient_is_resolved(recip):
             return
 
         unresolved.append(name)
@@ -255,6 +276,8 @@ def _apply_mail_recipients(
         add_one(name, _OL_TO)
     for name in _split_recipient_field(cc):
         add_one(name, _OL_CC)
+
+    _dedupe_mail_recipients(mail)
 
     try:
         mail.Recipients.ResolveAll()
@@ -297,22 +320,12 @@ def _ensure_all_recipients_resolved(
         for recip in list(mail.Recipients):
             if _recipient_is_resolved(recip):
                 continue
-            label = str(getattr(recip, "Name", "") or "")
-            try:
-                gal = namespace.CreateRecipient(label)
-                if gal.Resolve():
-                    if _add_resolved_recipient_from_gal(mail, gal, rtype=int(recip.Type)):
-                        try:
-                            mail.Recipients.Remove(recip.Index)
-                        except Exception:
-                            pass
-                        continue
-            except Exception:
-                pass
             try:
                 recip.Resolve()
             except Exception:
                 pass
+
+        _dedupe_mail_recipients(mail)
 
         bad = _unresolved_recipient_names(mail)
         if not bad:
@@ -388,15 +401,33 @@ def _body_text_to_html(body: str) -> str:
     return safe.replace("\r\n", "\n").replace("\n", "<br>")
 
 
+def _inline_signature_image_paths(sig_html: str, sig_file: Path) -> str:
+    """Rewrite relative <img src> in signature .htm to absolute file paths."""
+    sig_dir = sig_file.parent
+
+    def fix_src(match: re.Match[str]) -> str:
+        quote = match.group(1)
+        src = (match.group(2) or "").strip()
+        if not src or src.startswith(("http:", "https:", "cid:", "file:", "data:")):
+            return match.group(0)
+        asset = (sig_dir / src.replace("/", os.sep)).resolve()
+        if asset.is_file():
+            return f"src={quote}{asset.as_uri()}{quote}"
+        return match.group(0)
+
+    return re.sub(r'src=(["\'])([^"\']+)\1', fix_src, sig_html, flags=re.IGNORECASE)
+
+
 def _load_outlook_signature_html(signature_name: str) -> str | None:
     name = (signature_name or "").strip()
     if not name:
         return None
-    appdata = (Path.home() / "AppData" / "Roaming")
+    appdata = Path.home() / "AppData" / "Roaming"
     sig_file = appdata / "Microsoft" / "Signatures" / f"{name}.htm"
     try:
         if sig_file.is_file():
-            return sig_file.read_text(encoding="utf-8", errors="ignore")
+            html = sig_file.read_text(encoding="utf-8", errors="ignore")
+            return _inline_signature_image_paths(html, sig_file)
     except OSError:
         return None
     return None
@@ -408,22 +439,23 @@ def _set_mail_body_with_optional_signature(
     *,
     signature_name: str,
     signature_image_path: Path | None,
-    prefer_file_signature: bool = False,
-) -> None:
-    # Prefer Outlook's native default signature (already configured in profile),
-    # because it carries embedded resources the same way as manual New Email.
-    if signature_name and prefer_file_signature:
-        sig_html = _load_outlook_signature_html(signature_name)
-        if sig_html:
-            try:
-                mail.HTMLBody = f"{_body_text_to_html(body)}<br><br>{sig_html}"
-                return
-            except Exception:
-                pass
-
+    show_window: bool = True,
+) -> bool:
+    """
+    Set HTML body + signature. Returns True if a compose window was opened.
+    Outlook embeds signature images via Display + HTMLBody — raw .htm paste breaks images.
+    """
+    opened = False
     if signature_name:
         try:
             mail.Display(False)
+            opened = True
+            if not show_window:
+                try:
+                    mail.GetInspector().Visible = False
+                except Exception:
+                    pass
+            time.sleep(0.6)
         except Exception:
             pass
         try:
@@ -433,7 +465,7 @@ def _set_mail_body_with_optional_signature(
         if existing_html:
             try:
                 mail.HTMLBody = f"{_body_text_to_html(body)}<br><br>{existing_html}"
-                return
+                return opened
             except Exception:
                 pass
 
@@ -441,7 +473,7 @@ def _set_mail_body_with_optional_signature(
     if sig_html:
         try:
             mail.HTMLBody = f"{_body_text_to_html(body)}<br><br>{sig_html}"
-            return
+            return opened
         except Exception:
             pass
 
@@ -460,10 +492,11 @@ def _set_mail_body_with_optional_signature(
                 f"<img src='cid:{cid}' alt='Cornerstone Products Group logo'>"
                 "</body></html>"
             )
-            return
+            return opened
         except Exception:
             pass
     mail.Body = body
+    return opened
 
 
 def send_vendor_emails(
@@ -580,18 +613,6 @@ def send_vendor_emails(
                 mail, namespace, vendor=vendor, required_names=required
             )
             _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
-            try:
-                _set_mail_body_with_optional_signature(
-                    mail,
-                    entry.body,
-                    signature_name=cfg.outlook_signature_name,
-                    signature_image_path=cfg.signature_image_path,
-                    prefer_file_signature=True,
-                )
-            except Exception as exc:
-                raise VendorEmailError(
-                    f"{vendor}: failed while setting body/signature: {exc}"
-                ) from exc
             for path in attachments:
                 try:
                     mail.Attachments.Add(str(path))
@@ -599,15 +620,29 @@ def send_vendor_emails(
                     raise VendorEmailError(
                         f"{vendor}: failed adding attachment {path.name!r}: {exc}"
                     ) from exc
+            try:
+                opened = _set_mail_body_with_optional_signature(
+                    mail,
+                    entry.body,
+                    signature_name=cfg.outlook_signature_name,
+                    signature_image_path=cfg.signature_image_path,
+                    show_window=True,
+                )
+            except Exception as exc:
+                raise VendorEmailError(
+                    f"{vendor}: failed while setting body/signature: {exc}"
+                ) from exc
+            _dedupe_mail_recipients(mail)
             _ensure_all_recipients_resolved(
                 mail, namespace, vendor=vendor, required_names=required
             )
             _log(f"  Subject={final_subject!r}")
-            _log("  Opening message in Outlook — To/CC should show as resolved groups.")
-            try:
-                mail.Display(False)
-            except Exception as exc:
-                raise VendorEmailError(f"{vendor}: failed opening preview: {exc}") from exc
+            if not opened:
+                _log("  Opening message in Outlook — To/CC should show as resolved groups.")
+                try:
+                    mail.Display(False)
+                except Exception as exc:
+                    raise VendorEmailError(f"{vendor}: failed opening preview: {exc}") from exc
             if preview_pause:
                 try:
                     input("  Close the message when done, then press Enter for the next vendor… ")
@@ -626,18 +661,6 @@ def send_vendor_emails(
             mail, namespace, vendor=vendor, required_names=required
         )
         _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
-        try:
-            _set_mail_body_with_optional_signature(
-                mail,
-                entry.body,
-                signature_name=cfg.outlook_signature_name,
-                signature_image_path=cfg.signature_image_path,
-                prefer_file_signature=True,
-            )
-        except Exception as exc:
-            raise VendorEmailError(
-                f"{vendor}: failed while setting body/signature: {exc}"
-            ) from exc
         for path in attachments:
             try:
                 mail.Attachments.Add(str(path))
@@ -645,6 +668,19 @@ def send_vendor_emails(
                 raise VendorEmailError(
                     f"{vendor}: failed adding attachment {path.name!r}: {exc}"
                 ) from exc
+        try:
+            _set_mail_body_with_optional_signature(
+                mail,
+                entry.body,
+                signature_name=cfg.outlook_signature_name,
+                signature_image_path=cfg.signature_image_path,
+                show_window=False,
+            )
+        except Exception as exc:
+            raise VendorEmailError(
+                f"{vendor}: failed while setting body/signature: {exc}"
+            ) from exc
+        _dedupe_mail_recipients(mail)
         _ensure_all_recipients_resolved(
             mail, namespace, vendor=vendor, required_names=required
         )
