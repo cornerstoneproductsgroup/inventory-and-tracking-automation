@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -33,6 +34,7 @@ class VendorEmailConfig:
     skip_root_entries: tuple[str, ...]
     skip_file_prefixes: tuple[str, ...]
     skip_subfolders_inside_vendor: tuple[str, ...]
+    append_run_date_to_subject: bool
     outlook_signature_name: str
     signature_image_path: Path | None
     vendors: tuple[VendorEmailEntry, ...]
@@ -60,6 +62,7 @@ def load_vendor_email_config(config_path: Path) -> VendorEmailConfig:
     skip_subfolders = tuple(
         _as_str(x) for x in (raw.get("skip_subfolders_inside_vendor") or []) if _as_str(x)
     )
+    append_run_date_to_subject = bool(raw.get("append_run_date_to_subject", True))
     signature_name = _as_str(raw.get("outlook_signature_name"))
     sig_raw = _as_str(raw.get("signature_image_path"))
     signature_image_path = Path(sig_raw) if sig_raw else None
@@ -86,6 +89,7 @@ def load_vendor_email_config(config_path: Path) -> VendorEmailConfig:
         skip_root_entries=skip_root,
         skip_file_prefixes=skip_prefixes,
         skip_subfolders_inside_vendor=skip_subfolders,
+        append_run_date_to_subject=append_run_date_to_subject,
         outlook_signature_name=signature_name,
         signature_image_path=signature_image_path,
         vendors=tuple(vendors),
@@ -138,6 +142,19 @@ def _collect_vendor_attachments(cfg: VendorEmailConfig, vendor_folder: str) -> l
             continue
         out.append(item)
     return out
+
+
+def _run_date_stamp(d: date | None = None) -> str:
+    x = d or date.today()
+    return f"{x.month}-{x.day}-{x.year}"
+
+
+def _subject_with_optional_date(subject: str, *, append_date: bool) -> str:
+    base = (subject or "").strip()
+    if not append_date:
+        return base
+    stamp = _run_date_stamp()
+    return f"{base} {stamp}".strip()
 
 
 def _body_text_to_html(body: str) -> str:
@@ -220,6 +237,9 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
 
     _log(f"Daily vendor root: {cfg.daily_vendor_root}")
     _log(f"Mode: {'DRY RUN (no emails sent)' if dry_run else 'SEND'}")
+    _log(
+        f"Subject date suffix: {'enabled' if cfg.append_run_date_to_subject else 'disabled'}"
+    )
     if cfg.outlook_signature_name:
         sig = _load_outlook_signature_html(cfg.outlook_signature_name)
         if sig:
@@ -267,10 +287,13 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
             skipped += 1
             continue
 
+        final_subject = _subject_with_optional_date(
+            entry.subject, append_date=cfg.append_run_date_to_subject
+        )
         _log(f"{vendor}: {len(attachments)} attachment(s)")
         if dry_run:
             _log(f"  TO={entry.to!r} CC={entry.cc!r}")
-            _log(f"  Subject={entry.subject!r}")
+            _log(f"  Subject={final_subject!r}")
             if cfg.outlook_signature_name:
                 _log(f"  outlook_signature={cfg.outlook_signature_name!r}")
             if cfg.signature_image_path and cfg.signature_image_path.is_file():
@@ -284,7 +307,7 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
         mail.To = entry.to
         if entry.cc:
             mail.CC = entry.cc
-        mail.Subject = entry.subject
+        mail.Subject = final_subject
         try:
             _set_mail_body_with_optional_signature(
                 mail,

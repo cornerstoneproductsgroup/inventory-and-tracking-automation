@@ -12,6 +12,7 @@
   "skip_subfolders_inside_vendor": [
     "Individual Labels"
   ],
+  "append_run_date_to_subject": true,
   "outlook_signature_name": "Cornerstone Logo Signature",
   "signature_image_path": "",
   "vendors": [
@@ -59,6 +60,13 @@
     },
     {
       "vendor_folder": "Post Protector",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Snake Snare",
       "to": "gfetzer@4cct.com",
       "cc": "",
       "subject": "New Orders Attached for Processing",
