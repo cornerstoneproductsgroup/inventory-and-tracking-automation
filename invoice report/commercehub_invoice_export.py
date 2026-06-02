@@ -67,6 +67,22 @@ LOGIN_TIMEOUT_MS = _ms("COMMERCEHUB_LOGIN_TIMEOUT_MS", 180_000)  # post-password
 DOWNLOAD_TIMEOUT_MS = _ms("COMMERCEHUB_DOWNLOAD_TIMEOUT_MS", 600_000)  # generate + download export
 LIST_SETTLE_MS = _ms("COMMERCEHUB_SAVED_SEARCH_LIST_SETTLE_MS", 3_500)  # saved-search list paint delay
 
+
+def _invoice_fast() -> bool:
+    raw = (os.environ.get("COMMERCEHUB_CHAIN_FAST") or os.environ.get("COMMERCEHUB_INVOICE_FAST") or "")
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def _probe_ms(slow_ms: int, fast_ms: int | None = None) -> int:
+    if not _invoice_fast():
+        return slow_ms
+    return fast_ms if fast_ms is not None else min(slow_ms, 2500)
+
+
+def _step_timeout_ms() -> int:
+    return _probe_ms(STEP_TIMEOUT_MS, 12_000)
+
+
 HOME_URL = "https://dsm.commercehub.com/dsm/gotoHome.do"
 
 # Lowe's saved search (execute); override with COMMERCEHUB_LOWE_SAVED_SEARCH_URL if id/name differs.
@@ -266,7 +282,7 @@ async def _open_order_search(page) -> None:
 
     _log("Opening Orders menu, then Search…")
     orders = page.locator('[data-test="dsmMenu-orders"]').first
-    await orders.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    await orders.wait_for(state="visible", timeout=_step_timeout_ms())
     await orders.hover()
     await asyncio.sleep(0.35)
 
@@ -278,7 +294,7 @@ async def _open_order_search(page) -> None:
         await orders.click()
         await asyncio.sleep(0.35)
 
-    await search.first.wait_for(state="visible", timeout=30_000)
+    await search.first.wait_for(state="visible", timeout=_probe_ms(30_000, 12_000))
     await search.first.click()
     _log("Waiting for Order Search / criteria page after Search click…")
     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -301,44 +317,64 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
         _log("COMMERCEHUB_SAVED_SEARCH_NAME is empty; skip saved-search list step.")
         return
 
-    _log(f"Waiting {LIST_SETTLE_MS} ms for saved-search list to render…")
-    await asyncio.sleep(LIST_SETTLE_MS / 1000.0)
+    probe = _probe_ms(5_000, 900)
+    settle_ms = _probe_ms(LIST_SETTLE_MS, 700)
+    if _invoice_fast():
+        _log("Invoice fast-empty mode enabled (COMMERCEHUB_CHAIN_FAST).")
 
     op = page.locator("#Operator1")
     results = page.locator('a[href*="sortSearchResults.do"]')
     search_btn = page.locator('button[data-test="Search"]')
 
     try:
-        await op.first.wait_for(state="visible", timeout=5_000)
+        await op.first.wait_for(state="visible", timeout=probe)
         _log("Already on criteria form; no saved search to click.")
         return
     except PlaywrightTimeout:
         pass
     try:
-        await results.first.wait_for(state="visible", timeout=4_000)
+        await results.first.wait_for(state="visible", timeout=probe)
+        if await _search_results_empty(page):
+            _log("Already on empty search results; no saved search to click.")
+            return
         _log("Already on search results; no saved search to click.")
         return
     except PlaywrightTimeout:
         pass
     try:
-        await search_btn.first.wait_for(state="visible", timeout=4_000)
+        await search_btn.first.wait_for(state="visible", timeout=probe)
         _log("Criteria page has Search button; no saved-search list step.")
         return
     except PlaywrightTimeout:
         pass
 
+    _log(f"Waiting {settle_ms} ms for saved-search list to render…")
+    await asyncio.sleep(settle_ms / 1000.0)
+
     _log(f"Selecting saved search matching: {name!r}")
     rx = re.compile(re.escape(name), re.I)
+    click_timeout = _step_timeout_ms()
+    has_link = (await page.get_by_role("link", name=rx).count() > 0) or (
+        await page.locator("a").filter(has_text=rx).count() > 0
+    )
+    if not has_link:
+        if await _search_results_empty(page):
+            _log(f"No saved search link for {name!r}; page already has empty results.")
+            return
+        _log(f"Saved search {name!r} not listed; opening criteria form directly.")
+        await _ensure_invoice_criteria_form(page)
+        return
 
     last_err: Exception | None = None
-    for attempt in range(1, 4):
-        _log(f"Saved-search pick attempt {attempt}/3…")
+    max_attempts = 1 if _invoice_fast() else 3
+    for attempt in range(1, max_attempts + 1):
+        _log(f"Saved-search pick attempt {attempt}/{max_attempts}…")
         try:
             by_role = page.get_by_role("link", name=rx)
-            await by_role.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await by_role.first.wait_for(state="visible", timeout=click_timeout)
             await by_role.first.scroll_into_view_if_needed()
-            await asyncio.sleep(0.35)
-            await by_role.first.click(timeout=STEP_TIMEOUT_MS)
+            await asyncio.sleep(0.2 if _invoice_fast() else 0.35)
+            await by_role.first.click(timeout=click_timeout)
             last_err = None
             break
         except PlaywrightTimeout as e:
@@ -348,10 +384,10 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
 
         try:
             row_link = page.locator("tr").filter(has_text=rx).locator("a").first
-            await row_link.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await row_link.wait_for(state="visible", timeout=click_timeout)
             await row_link.scroll_into_view_if_needed()
-            await asyncio.sleep(0.35)
-            await row_link.click(timeout=STEP_TIMEOUT_MS)
+            await asyncio.sleep(0.2 if _invoice_fast() else 0.35)
+            await row_link.click(timeout=click_timeout)
             last_err = None
             break
         except PlaywrightTimeout as e:
@@ -361,10 +397,10 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
 
         try:
             loose = page.locator("a").filter(has_text=rx).first
-            await loose.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+            await loose.wait_for(state="visible", timeout=click_timeout)
             await loose.scroll_into_view_if_needed()
-            await asyncio.sleep(0.35)
-            await loose.click(timeout=STEP_TIMEOUT_MS)
+            await asyncio.sleep(0.2 if _invoice_fast() else 0.35)
+            await loose.click(timeout=click_timeout)
             last_err = None
             break
         except PlaywrightTimeout as e:
@@ -372,7 +408,8 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
         except PlaywrightError as e:
             last_err = e
 
-        await asyncio.sleep(0.8)
+        if attempt < max_attempts:
+            await asyncio.sleep(0.4 if _invoice_fast() else 0.8)
 
     if last_err is not None:
         snap = Path(__file__).resolve().parent / "debug_saved_search_list.png"
@@ -388,7 +425,7 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
     await page.wait_for_selector(
         '#Operator1, a[href*="sortSearchResults.do"], button[data-test="Search"]',
         state="visible",
-        timeout=NAV_TIMEOUT_MS,
+        timeout=_probe_ms(NAV_TIMEOUT_MS, 20_000),
     )
     _log("Saved search is open.")
 
@@ -400,7 +437,7 @@ async def _ensure_invoice_criteria_form(page) -> None:
     """
     op = page.locator("#Operator1")
     try:
-        await op.wait_for(state="visible", timeout=10_000)
+        await op.wait_for(state="visible", timeout=_probe_ms(10_000, 2_500))
         _log("Invoice criteria form already open.")
         return
     except PlaywrightTimeout:
@@ -409,14 +446,14 @@ async def _ensure_invoice_criteria_form(page) -> None:
     results_marker = page.locator('a[href*="sortSearchResults.do"]')
     on_results = False
     try:
-        await results_marker.first.wait_for(state="visible", timeout=5_000)
+        await results_marker.first.wait_for(state="visible", timeout=_probe_ms(5_000, 1_500))
         on_results = await results_marker.first.is_visible()
     except PlaywrightTimeout:
         on_results = False
 
     if not on_results:
-        _log("No sortSearchResults link; waiting longer for criteria form…")
-        await op.wait_for(state="visible", timeout=NAV_TIMEOUT_MS)
+        _log("No sortSearchResults link; waiting for criteria form…")
+        await op.wait_for(state="visible", timeout=_probe_ms(NAV_TIMEOUT_MS, 15_000))
         return
 
     _log("On Search Results; navigating to Search Criteria to set dates…")
@@ -428,7 +465,7 @@ async def _ensure_invoice_criteria_form(page) -> None:
         .or_(page.locator('a[href*="editSearch"]'))
     )
     try:
-        await criteria_link.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+        await criteria_link.first.wait_for(state="visible", timeout=_step_timeout_ms())
     except PlaywrightTimeout:
         snap = Path(__file__).resolve().parent / "debug_no_criteria_link.png"
         await page.screenshot(path=str(snap), full_page=True)
@@ -492,8 +529,9 @@ async def _search_results_empty(page) -> bool:
         pass
 
     csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV")
+    csv_wait = _probe_ms(8_000, 1_500)
     try:
-        await csv.first.wait_for(state="visible", timeout=8_000)
+        await csv.first.wait_for(state="visible", timeout=csv_wait)
         return False
     except PlaywrightTimeout:
         pass
@@ -501,8 +539,9 @@ async def _search_results_empty(page) -> bool:
     po_sort = page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
     if await po_sort.count() == 0:
         return True
+    po_wait = _probe_ms(5_000, 1_200)
     try:
-        await po_sort.first.wait_for(state="visible", timeout=5_000)
+        await po_sort.first.wait_for(state="visible", timeout=po_wait)
         return False
     except PlaywrightTimeout:
         return True
@@ -515,7 +554,7 @@ async def _sort_by_po_number(page) -> None:
         .filter(has_text=re.compile(r"PO\s+Number", re.I))
         .first
     )
-    await link.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    await link.wait_for(state="visible", timeout=_step_timeout_ms())
     await link.click()
     await page.wait_for_load_state("domcontentloaded", timeout=STEP_TIMEOUT_MS)
 
@@ -636,12 +675,18 @@ async def _failure_screenshot(context, page) -> None:
 async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Depot invoicing: Order Search → saved search → export…")
     await _open_order_search(page)
+    if await _search_results_empty(page):
+        _log(f"Depot: no invoices for {report_day} (empty results already); skipping.")
+        return None
     _default_saved = "Home Depot Invoice Batch Print by Date"
     if "COMMERCEHUB_SAVED_SEARCH_NAME" in os.environ:
         saved_name = os.environ["COMMERCEHUB_SAVED_SEARCH_NAME"].strip()
     else:
         saved_name = _default_saved
     await _maybe_select_saved_search(page, saved_name)
+    if await _search_results_empty(page):
+        _log(f"Depot: no invoices for {report_day} — skipping export and print.")
+        return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
     if await _search_results_empty(page):
@@ -658,12 +703,18 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path 
 async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Lowe's invoicing: Order Search → Lowe's saved search → export…")
     await _open_order_search(page)
+    if await _search_results_empty(page):
+        _log(f"Lowe's: no invoices for {report_day} (empty results already); skipping.")
+        return None
     await _open_lowes_saved_search(page)
     lowes_saved = (
         os.environ.get("COMMERCEHUB_LOWE_SAVED_SEARCH_NAME")
         or "Lowe's Invoice Batch Print by Date"
     ).strip()
     await _maybe_select_saved_search(page, lowes_saved)
+    if await _search_results_empty(page):
+        _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
+        return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
     if await _search_results_empty(page):

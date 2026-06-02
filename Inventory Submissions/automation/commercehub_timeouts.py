@@ -31,12 +31,14 @@ def navigation_timeout_ms() -> int:
 
 def depot_ship_list_timeout_ms() -> int:
     """Poll until tracking / special-order ship list is ready (exits early when loaded)."""
-    return ms("DEPOT_SHIP_LIST_TIMEOUT_MS", 300_000)
+    default = 45_000 if chain_fast() else 300_000
+    return ms("DEPOT_SHIP_LIST_TIMEOUT_MS", default)
 
 
 def depot_queue_probe_timeout_ms() -> int:
     """First poll on quickship/quickinvoice before summary fallback (still exits early when ready)."""
-    return ms("DEPOT_QUEUE_PROBE_TIMEOUT_MS", 60_000)
+    default = 12_000 if chain_fast() else 60_000
+    return ms("DEPOT_QUEUE_PROBE_TIMEOUT_MS", default)
 
 def depot_invoice_ready_timeout_ms() -> int:
     """Poll until quickinvoice form is ready (exits early when loaded)."""

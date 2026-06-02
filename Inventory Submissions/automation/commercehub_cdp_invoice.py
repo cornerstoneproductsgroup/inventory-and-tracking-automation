@@ -50,6 +50,7 @@ def run_retail_invoices_via_cdp(
         from playwright.async_api import async_playwright
 
         load_project_dotenv()
+        os.environ.setdefault("COMMERCEHUB_CHAIN_FAST", "1")
         day = report_day if report_day is not None else previous_business_day()
         download_dir = Path(
             os.environ.get("COMMERCEHUB_DOWNLOAD_DIR", str(inv_dir / "downloads"))

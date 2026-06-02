@@ -110,6 +110,40 @@ def _filled_select(page: Page, selector: str) -> bool:
         return False
 
 
+def _rithum_empty_queue(page: Page) -> bool:
+    """True when CommerceHub shows an empty order queue (no work to do)."""
+    try:
+        body = (page.inner_text("body") or "").lower()
+    except Exception:
+        return False
+    if not body:
+        return False
+    empty_phrases = (
+        "no orders",
+        "0 orders",
+        "there are no orders",
+        "no open orders",
+        "no unacknowledged",
+        "no records",
+        "no results",
+        "0 record",
+        "did not match",
+    )
+    if any(p in body for p in empty_phrases):
+        return True
+    try:
+        if (
+            page.locator("select[name*='.shippingmethod']").count() == 0
+            and page.locator("a[href*='gotoOrderDetail']").count() == 0
+            and page.locator("input[name*='.trackingnumber']").count() == 0
+        ):
+            if "order" in body and ("queue" in body or "quickship" in body or "quickinvoice" in body):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _wait_for_tracking_page_ready(page: Page, timeout_ms: int) -> bool:
     """
     Wait until tracking form rows are attached or timeout expires.
@@ -125,6 +159,9 @@ def _wait_for_tracking_page_ready(page: Page, timeout_ms: int) -> bool:
         except Exception:
             pass
 
+        if _rithum_empty_queue(page):
+            return False
+
         try:
             if page.locator(ship_selector).count() > 0 or page.locator(po_selector).count() > 0:
                 return True
@@ -138,6 +175,9 @@ def _wait_for_tracking_page_ready(page: Page, timeout_ms: int) -> bool:
 
 def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
     if not _wait_for_tracking_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+        if _rithum_empty_queue(page):
+            print("Depot tracking: queue empty; moving on.")
+            return False
         print(
             f"Depot tracking: timed out waiting {int(_SHIP_LIST_TIMEOUT_MS / 1000)}s; "
             "retrying page load once..."
@@ -152,10 +192,13 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
                 pass
 
         if not _wait_for_tracking_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-            print(
-                f"Depot tracking: no ship list after retry and {int(_SHIP_LIST_TIMEOUT_MS / 1000)}s wait; "
-                "moving on."
-            )
+            if _rithum_empty_queue(page):
+                print("Depot tracking: queue empty after retry; moving on.")
+            else:
+                print(
+                    f"Depot tracking: no ship list after retry and {int(_SHIP_LIST_TIMEOUT_MS / 1000)}s wait; "
+                    "moving on."
+                )
             return False
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -360,6 +403,8 @@ def _wait_for_special_order_ack_page_ready(page: Page, timeout_ms: int) -> bool:
             body = (page.inner_text("body") or "").lower()
             if "special orders" in body and "no orders" in body:
                 return False
+            if _rithum_empty_queue(page):
+                return False
         except Exception:
             pass
         page.wait_for_timeout(_POLL_MS)
@@ -373,6 +418,9 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
     page.wait_for_timeout(250 if _chain_fast() else 500)
     if _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
+    if _rithum_empty_queue(page):
+        print("Depot Special Orders ack: queue empty; skipping.")
+        return False
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
@@ -402,8 +450,11 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
         print(f"Depot Special Orders ack: could not open queue ({exc}); skipping.")
         return False
 
-    if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        print("Depot Special Orders ack: queue empty or not ready; skipping.")
+    if not _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
+        if _rithum_empty_queue(page):
+            print("Depot Special Orders ack: queue empty; skipping.")
+        else:
+            print("Depot Special Orders ack: queue not ready; skipping.")
         return False
     return True
 
@@ -576,6 +627,8 @@ def _wait_for_special_order_page_ready(page: Page, timeout_ms: int) -> bool:
             body = (page.inner_text("body") or "").lower()
             if "special orders" in body and "no orders" in body:
                 return False
+            if _rithum_empty_queue(page):
+                return False
         except Exception:
             pass
         page.wait_for_timeout(_POLL_MS)
@@ -589,6 +642,9 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
     page.wait_for_timeout(250 if _chain_fast() else 500)
     if _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
+    if _rithum_empty_queue(page):
+        print("Depot Special Orders: accepted queue empty; skipping.")
+        return False
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
@@ -618,8 +674,11 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
         print(f"Depot Special Orders: could not open Accepted queue ({exc}); skipping.")
         return False
 
-    if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        print("Depot Special Orders: queue empty or not ready; skipping.")
+    if not _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
+        if _rithum_empty_queue(page):
+            print("Depot Special Orders: accepted queue empty; skipping.")
+        else:
+            print("Depot Special Orders: queue not ready; skipping.")
         return False
     return True
 
