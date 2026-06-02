@@ -68,6 +68,11 @@ def main() -> int:
             help="Skip Lowe's workflows (tracking/invoicing).",
         )
         parser.add_argument(
+            "--skip-special-orders",
+            action="store_true",
+            help="Skip Home Depot Special Orders (thdso) acknowledgment/tracking/invoicing.",
+        )
+        parser.add_argument(
             "--lowes-config",
             type=Path,
             default=_LOWES_DIR / "config.example.json",
@@ -203,11 +208,9 @@ def main() -> int:
                     )
 
                 print("\n=== Home Depot Special Orders (acknowledge, track, invoice) ===")
-                if args.skip_depot and args.skip_lowes:
-                    print(
-                        "Depot Special Orders: skipped (Depot and Lowe's tracking both disabled)."
-                    )
-                    _chain_skip("Depot Special Orders", "Disabled via --skip-depot and --skip-lowes")
+                if args.skip_special_orders:
+                    print("Depot Special Orders: skipped (--skip-special-orders).")
+                    _chain_skip("Depot Special Orders", "Disabled via --skip-special-orders")
                 else:
                     _run_step(
                         "Depot Special Orders",

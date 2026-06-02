@@ -292,6 +292,7 @@ def _build_chain_cmd(
     lowes_submit: bool,
     with_invoice_reports: bool = False,
     invoice_report_date: date | None = None,
+    skip_special_orders: bool = False,
 ) -> list[str]:
     cmd: list[str] = [
         python_exe,
@@ -307,6 +308,8 @@ def _build_chain_cmd(
         cmd.append("--skip-depot")
     if skip_lowes:
         cmd.append("--skip-lowes")
+    if skip_special_orders:
+        cmd.append("--skip-special-orders")
     if with_invoice_reports:
         cmd.append("--with-invoice-reports")
     if invoice_report_date is not None:
@@ -483,6 +486,11 @@ def main() -> int:
         help="Skip Lowe's tracking/invoicing inside the CommerceHub chain.",
     )
     parser.add_argument(
+        "--skip-special-orders",
+        action="store_true",
+        help="Skip Home Depot Special Orders (thdso) inside the CommerceHub chain.",
+    )
+    parser.add_argument(
         "--skip-inventory",
         action="store_true",
         help="Skip Rithum/CommerceHub inventory inside the CommerceHub chain.",
@@ -653,6 +661,7 @@ def main() -> int:
     skip_sps_inventory = bool(args.skip_sps_inventory) or tracking_invoicing_only
     skip_depot = bool(args.skip_depot)
     skip_lowes = bool(args.skip_lowes)
+    skip_special_orders = bool(args.skip_special_orders)
     run_grainger_all = bool(args.run_grainger_all) or grainger_only
     sequential_lanes = bool(args.sequential_lanes)
     skip_invoice_report = bool(args.skip_invoice_report)
@@ -854,6 +863,8 @@ def main() -> int:
         required_chain_flags.append("--skip-depot")
     if skip_lowes:
         required_chain_flags.append("--skip-lowes")
+    if skip_special_orders:
+        required_chain_flags.append("--skip-special-orders")
 
     for required_flag in required_chain_flags:
         if script_supports_flag(python_exe, "run_commercehub_chain.py", required_flag, INVENTORY_DIR):
@@ -885,7 +896,10 @@ def main() -> int:
     sps_lane_steps: list[tuple[str, list[str], Path]] = []
 
     wants_ch_work = not skip_commercehub and (
-        not skip_inventory or not skip_depot or not skip_lowes
+        not skip_inventory
+        or not skip_depot
+        or not skip_lowes
+        or not skip_special_orders
     )
     wants_sps_work = not skip_sps_inventory or run_sps_tracking or run_grainger_all
 
@@ -901,6 +915,7 @@ def main() -> int:
             lowes_submit=lowes_submit,
             with_invoice_reports=ch_with_invoice,
             invoice_report_date=invoice_report_date,
+            skip_special_orders=skip_special_orders,
         )
         ch_lane_steps.append(
             (
