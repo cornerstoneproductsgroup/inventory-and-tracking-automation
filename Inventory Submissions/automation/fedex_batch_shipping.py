@@ -971,6 +971,21 @@ def run_fedex_batch(
         _log("Run without --plan-only to open FedEx and process vendor groups.")
         return 0
 
+    # Eagerly load and log warehouse vendors before opening FedEx, so output
+    # clearly shows whether Zebra-print vendors were detected on this machine.
+    warehouse_vendors = load_warehouse_print_vendors(reload=True)
+    if warehouse_vendors:
+        _log(
+            f"Warehouse-print vendors ({len(warehouse_vendors)}): "
+            f"{', '.join(sorted(warehouse_vendors))}"
+        )
+    else:
+        _log(
+            "WARN: No warehouse-print vendors loaded; all labels will save to share. "
+            f"Check {bundled_warehouse_vendors_path()} or Order Splitter at "
+            f"{order_splitter_watcher_path()}"
+        )
+
     browser_cfg = cfg.get("browser", {})
     headless = bool(browser_cfg.get("headless", False))
     slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
