@@ -1,0 +1,68 @@
+{
+  "_comment": "Fill this in for Outlook vendor emails. Keep vendor names matching the folder names under z- Daily Vendor Orders.",
+  "daily_vendor_root": "\\\\rygarcorp.com\\shares\\Cornerstone\\Dot Com Packing Slips\\1-Orders Before Extraction\\Order Splitter Output\\z- Daily Vendor Orders",
+  "skip_root_entries": [
+    ".warehouse_parts",
+    "z-Daily Orders Archive"
+  ],
+  "skip_file_prefixes": [
+    "Warehouse Print ",
+    "Warehouse SOS Tags "
+  ],
+  "skip_subfolders_inside_vendor": [
+    "Individual Labels"
+  ],
+  "outlook_signature_name": "Cornerstone Logo Signature",
+  "signature_image_path": "",
+  "vendors": [
+    {
+      "vendor_folder": "Agra Life",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Ez Pole",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Handozer",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "MMR",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Oru Kayak",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "ORU Kayaks",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Post Protector",
+      "to": "gfetzer@4cct.com",
+      "cc": "",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    }
+  ]
+}

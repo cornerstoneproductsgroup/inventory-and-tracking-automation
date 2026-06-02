@@ -13,6 +13,7 @@ echo.
 echo Which steps to run? ^(press a menu key — no Enter needed^)
 echo   F  FedEx Batch ^(upload Lowe's CSV, finalize, save labels by SKU/vendor^)
 echo   W  WorldShip Batch Import ^(Import-Export through Import/Export Preview^)
+echo   O  Vendor Emails ^(Outlook send from z- Daily Vendor Orders only^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS Tractor/Grainger, warehouse print^)
 echo   S  Scheduled morning chain ^(Pull Orders, FedEx, invoice reports, inventories — see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(invoice reports, CH+SPS inventories, tracking/invoicing + Grainger^)
@@ -30,7 +31,8 @@ echo   Easiest: folder named "invoice report" inside this repo ^(copy the whole 
 echo   Or: "CommerceHub Invoice Report (Depot and Lowe's)" inside or next to this repo, OR set COMMERCEHUB_INVOICE_REPORT_DIR.
 echo   Other PC: git pull, then run Inventory Submissions\Install-Deps.bat ^(adds pandas etc. for invoice phase^).
 echo.
-choice /C WF0123456789S /N /M "Press W, F, S, or 0-9: "
+choice /C WF0123456789SO /N /M "Press W, F, O, S, or 0-9: "
+if errorlevel 14 goto OPT_O
 if errorlevel 13 goto OPT_S
 if errorlevel 12 goto OPT_9
 if errorlevel 11 goto OPT_8
@@ -55,6 +57,9 @@ goto RUN
 
 :OPT_0
 set "EXTRA_ARGS=--pull-orders-only"
+goto RUN
+:OPT_O
+set "EXTRA_ARGS=--vendor-emails-only"
 goto RUN
 :OPT_9
 echo.

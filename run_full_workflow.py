@@ -23,6 +23,7 @@ Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
 Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
+Use --vendor-emails-only to run only Outlook vendor emails from z- Daily Vendor Orders.
 Use --amazon-seller-download-only to download Amazon Deferred Transaction CSV to the Input share.
 
 Each Inventory Submissions step uses Inventory Submissions\\.venv when present.
@@ -424,6 +425,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--vendor-emails-only",
+        action="store_true",
+        help=(
+            "Run only Outlook vendor emails from z- Daily Vendor Orders "
+            "(uses Inventory Submissions/vendor_email_config.json)."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -495,12 +504,23 @@ def main() -> int:
         parser.error("--amazon-seller-download-only cannot be combined with --pull-orders-only")
     if args.amazon_seller_download_only and args.fedex_batch_only:
         parser.error("--amazon-seller-download-only cannot be combined with --fedex-batch-only")
+    if args.vendor_emails_only and args.invoice_report_only:
+        parser.error("--vendor-emails-only cannot be combined with --invoice-report-only")
+    if args.vendor_emails_only and args.worldship_import_only:
+        parser.error("--vendor-emails-only cannot be combined with --worldship-import-only")
+    if args.vendor_emails_only and args.pull_orders_only:
+        parser.error("--vendor-emails-only cannot be combined with --pull-orders-only")
+    if args.vendor_emails_only and args.fedex_batch_only:
+        parser.error("--vendor-emails-only cannot be combined with --fedex-batch-only")
+    if args.vendor_emails_only and args.amazon_seller_download_only:
+        parser.error("--vendor-emails-only cannot be combined with --amazon-seller-download-only")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
     pull_orders_only = bool(args.pull_orders_only)
     worldship_import_only = bool(args.worldship_import_only)
     fedex_batch_only = bool(args.fedex_batch_only)
     amazon_seller_download_only = bool(args.amazon_seller_download_only)
+    vendor_emails_only = bool(args.vendor_emails_only)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -653,6 +673,33 @@ def main() -> int:
                 print(f"  - {e}")
             return 1
         print("\nAmazon seller download step finished (may be on hold — see script output).")
+        return 0
+
+    if vendor_emails_only:
+        vendor_script = INVENTORY_DIR / "run_vendor_emails.py"
+        if not vendor_script.is_file():
+            print(
+                f"\nERROR: Missing vendor email script:\n  {vendor_script}\n"
+                "Update/pull Inventory Submissions and retry."
+            )
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nVendor Emails — Outlook send from Daily Vendor Orders\n"
+            + "=" * 60
+        )
+        errors = _run_single(
+            "Vendor Emails",
+            [python_exe, str(vendor_script), "--send"],
+            INVENTORY_DIR,
+        )
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nVendor emails completed successfully.")
         return 0
 
     if worldship_import_only:
