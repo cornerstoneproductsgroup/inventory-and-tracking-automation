@@ -49,16 +49,50 @@ def _record_skip(step: str, reason: str) -> None:
         print(f"{step}: Skipped — {reason}", flush=True)
 
 
-def _thdso_summary_queue_count(page: Page, status_label: str) -> int | None:
+# thdso summary queue links (relative hrefs on gotoOpenOrders.do?PID=thdso)
+_THDSO_SUMMARY_QUEUES: dict[str, dict[str, str | re.Pattern[str]]] = {
+    "unacknowledged": {
+        "href": (
+            "a[href*='merchant=thdso'][href*='web_quickack'][href*='substatus=unacknowledged'], "
+            "a[href*='merchant=thdso'][href*='substatus=unacknowledged']"
+        ),
+        "text": re.compile(r"open\s*/\s*unacknowledged", re.I),
+    },
+    "accepted": {
+        "href": (
+            "a[href*='merchant=thdso'][href*='web_quickship'][href*='substatus=accepted'], "
+            "a[href*='merchant=thdso'][href*='substatus=accepted']"
+        ),
+        "text": re.compile(r"open\s*/\s*accepted", re.I),
+    },
+    "invoicing": {
+        "href": (
+            "a[href*='merchant=thdso'][href*='web_quickinvoice'], "
+            "a[href*='gotoOrderRealmForm.do?action=web_quickinvoice'][href*='merchant=thdso']"
+        ),
+        "text": re.compile(r"needs\s+invoicing", re.I),
+    },
+}
+
+
+def _thdso_summary_queue_link(page: Page, queue: str):
+    """Locator for a summary-table queue link (Open / Accepted, etc.)."""
+    spec = _THDSO_SUMMARY_QUEUES.get(queue)
+    if not spec:
+        raise ValueError(f"Unknown thdso summary queue: {queue!r}")
+    loc = page.locator(str(spec["href"])).filter(has_text=spec["text"])
+    if loc.count() == 0:
+        loc = page.locator("a").filter(has_text=spec["text"])
+    return loc.first
+
+
+def _thdso_summary_queue_count(page: Page, queue: str) -> int | None:
     """
-    Read the # Orders count from the thdso merchant summary table for a status row
-    (e.g. Open / Accepted, Open / Unacknowledged, Needs Invoicing).
+    Read the # Orders count from the thdso merchant summary table for a status row.
+    ``queue`` is one of: unacknowledged, accepted, invoicing.
     """
-    rx = re.compile(status_label, re.I)
     try:
-        link = page.get_by_role("link", name=rx).first
-        if link.count() == 0:
-            link = page.locator("a").filter(has_text=rx).first
+        link = _thdso_summary_queue_link(page, queue)
         if link.count() == 0:
             return None
         row = link.locator("xpath=ancestor::tr[1]")
@@ -76,7 +110,7 @@ def _thdso_summary_queue_count(page: Page, status_label: str) -> int | None:
 
 
 def _skip_if_special_order_empty(
-    page: Page, step: str, summary_status: str
+    page: Page, step: str, queue: str
 ) -> bool:
     """
     Skip only when the criteria notification is shown AND the summary row count is 0/missing.
@@ -88,7 +122,7 @@ def _skip_if_special_order_empty(
     if not on_summary:
         _goto(page, SPECIAL_ORDER_SUMMARY_URL)
         page.wait_for_timeout(300 if _chain_fast() else 600)
-    count = _thdso_summary_queue_count(page, summary_status)
+    count = _thdso_summary_queue_count(page, queue)
     if count is not None and count > 0:
         print(
             f"{step}: criteria notification on direct URL but summary shows {count} order(s); "
@@ -463,17 +497,12 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
-    unack_count = _thdso_summary_queue_count(page, r"open\s*/\s*unacknowledged")
+    unack_count = _thdso_summary_queue_count(page, "unacknowledged")
     if unack_count == 0:
         _record_skip("Depot Special Orders ack", "Summary shows 0 unacknowledged orders")
         return False
 
-    open_unack = page.locator(
-        "a[href*='merchant=thdso'][href*='web_quickack'], "
-        "a[href*='merchant=thdso'][href*='substatus=unacknowledged']"
-    ).filter(has_text=re.compile(r"open\s*/\s*unacknowledged", re.I)).first
-    if open_unack.count() == 0:
-        open_unack = page.get_by_role("link", name=re.compile(r"open\s*/\s*unacknowledged", re.I)).first
+    open_unack = _thdso_summary_queue_link(page, "unacknowledged")
     if open_unack.count() == 0:
         _record_skip("Depot Special Orders ack", "No Open/Unacknowledged link")
         return False
@@ -485,9 +514,7 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders ack", "unacknowledged"):
             return False
         _record_skip("Depot Special Orders ack", "Queue not ready")
         return False
@@ -538,14 +565,10 @@ def _special_order_ack_order_ids(page: Page) -> list[str]:
 def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]) -> bool:
     from automation.worldship_vendor_map import is_sku_in_vendor_map
 
-    if _skip_if_special_order_empty(
-        page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
-    ):
+    if _skip_if_special_order_empty(page, "Depot Special Orders ack", "unacknowledged"):
         return False
     if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders ack", "unacknowledged"):
             return False
         _record_skip("Depot Special Orders ack", "Timed out waiting for order list")
         return False
@@ -686,17 +709,12 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
-    accepted_count = _thdso_summary_queue_count(page, r"open\s*/\s*accepted")
+    accepted_count = _thdso_summary_queue_count(page, "accepted")
     if accepted_count == 0:
         _record_skip("Depot Special Orders tracking", "Summary shows 0 accepted orders")
         return False
 
-    open_accepted = page.locator(
-        "a[href*='merchant=thdso'][href*='web_quickship'], "
-        "a[href*='merchant=thdso'][href*='substatus=accepted']"
-    ).filter(has_text=re.compile(r"open\s*/\s*accepted", re.I)).first
-    if open_accepted.count() == 0:
-        open_accepted = page.get_by_role("link", name=re.compile(r"open\s*/\s*accepted", re.I)).first
+    open_accepted = _thdso_summary_queue_link(page, "accepted")
     if open_accepted.count() == 0:
         _record_skip("Depot Special Orders tracking", "No Open/Accepted link")
         return False
@@ -708,9 +726,7 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders tracking", "accepted"):
             return False
         _record_skip("Depot Special Orders tracking", "Queue not ready")
         return False
@@ -718,14 +734,10 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
 
 
 def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str]) -> bool:
-    if _skip_if_special_order_empty(
-        page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
-    ):
+    if _skip_if_special_order_empty(page, "Depot Special Orders tracking", "accepted"):
         return False
     if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders tracking", "accepted"):
             return False
         _record_skip("Depot Special Orders tracking", "Timed out waiting for order list")
         return False
@@ -926,16 +938,11 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
-    inv_count = _thdso_summary_queue_count(page, r"needs\s+invoicing")
+    inv_count = _thdso_summary_queue_count(page, "invoicing")
     if inv_count == 0:
         _record_skip("Depot Special Orders invoicing", "Summary shows 0 needs invoicing")
         return False
-    needs_inv = page.locator(
-        "a[href*='merchant=thdso'][href*='web_quickinvoice'], "
-        "a[href*='gotoOrderRealmForm.do?action=web_quickinvoice'][href*='merchant=thdso']"
-    ).filter(has_text=re.compile(r"needs\s+invoicing", re.I)).first
-    if needs_inv.count() == 0:
-        needs_inv = page.get_by_role("link", name=re.compile(r"needs\s+invoicing", re.I)).first
+    needs_inv = _thdso_summary_queue_link(page, "invoicing")
     if needs_inv.count() == 0:
         _record_skip("Depot Special Orders invoicing", "No Needs Invoicing link")
         return False
@@ -947,9 +954,7 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_invoice_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders invoicing", r"needs\s+invoicing"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders invoicing", "invoicing"):
             return False
         _record_skip("Depot Special Orders invoicing", "Queue not ready")
         return False
@@ -1057,14 +1062,10 @@ def _fill_special_order_invoice_quantities(page: Page) -> int:
 
 
 def _process_depot_special_order_invoice_page(page: Page) -> bool:
-    if _skip_if_special_order_empty(
-        page, "Depot Special Orders invoicing", r"needs\s+invoicing"
-    ):
+    if _skip_if_special_order_empty(page, "Depot Special Orders invoicing", "invoicing"):
         return False
     if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
-        if _skip_if_special_order_empty(
-            page, "Depot Special Orders invoicing", r"needs\s+invoicing"
-        ):
+        if _skip_if_special_order_empty(page, "Depot Special Orders invoicing", "invoicing"):
             return False
         _record_skip("Depot Special Orders invoicing", "Timed out waiting for invoice page")
         return False
