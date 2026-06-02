@@ -85,6 +85,13 @@ def _step_timeout_ms() -> int:
     return _probe_ms(STEP_TIMEOUT_MS, 12_000)
 
 
+def _frames_main_first(pg) -> list:
+    """Prefer main frame when scanning for export dialog (often in popup or iframe)."""
+    frames = list(pg.frames)
+    mf = pg.main_frame
+    return [mf] + [f for f in frames if f is not mf]
+
+
 def _invoice_results_ready_timeout_ms() -> int:
     """Wait for CSV / sort links after clicking Search (slow Rithum days need longer)."""
     default = 35_000 if _invoice_fast() else 60_000
@@ -99,19 +106,73 @@ async def _invoice_on_criteria_form(page) -> bool:
         return False
 
 
-async def _invoice_results_have_export_controls(page) -> bool:
-    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV")
+async def _invoice_on_results_page(page) -> bool:
+    """True when the Order Search results view is showing (not the criteria form)."""
+    if await _invoice_on_criteria_form(page):
+        return False
+    sort = page.locator('a[href*="sortSearchResults.do"]')
+    try:
+        if await sort.count() and await sort.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+    try:
+        hdr = page.get_by_text(re.compile(r"search\s+results", re.I))
+        if await hdr.count() and await hdr.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+    return False
+
+
+async def _invoice_results_ready_in_frame(fr) -> bool:
+    """True when this frame shows exportable invoice search results."""
+    csv = fr.locator('a[href*="linkOpen"]').filter(has_text=re.compile(r"csv", re.I))
     try:
         if await csv.count() and await csv.first.is_visible():
             return True
     except PlaywrightError:
         pass
-    po_sort = page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
+    export = fr.get_by_role("link", name=re.compile(r"export.*csv|^\s*csv\s*$", re.I))
+    try:
+        if await export.count() and await export.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+    po_sort = fr.locator('a[href*="sortSearchResults.do"]').filter(
+        has_text=re.compile(r"PO\s+Number", re.I)
+    )
     try:
         if await po_sort.count() and await po_sort.first.is_visible():
             return True
     except PlaywrightError:
         pass
+    sort_any = fr.locator('a[href*="sortSearchResults.do"]')
+    try:
+        if await sort_any.count() and await sort_any.first.is_visible():
+            no_msg = fr.get_by_text(
+                re.compile(
+                    r"no\s+(records|results|orders|matching)|0\s+record|did\s+not\s+match",
+                    re.I,
+                )
+            )
+            if await no_msg.count() and await no_msg.first.is_visible():
+                return False
+            data_rows = fr.locator("table tr").filter(has=fr.locator("td"))
+            if await data_rows.count() >= 1:
+                return True
+    except PlaywrightError:
+        pass
+    return False
+
+
+async def _invoice_results_have_export_controls(page) -> bool:
+    for fr in _frames_main_first(page):
+        try:
+            if await _invoice_results_ready_in_frame(fr):
+                return True
+        except PlaywrightError:
+            continue
     return False
 
 
@@ -168,6 +229,14 @@ async def _search_results_empty(page, *, after_search: bool = False) -> bool:
         return False
     if state == "empty":
         return True
+    if await _invoice_results_have_export_controls(page):
+        return False
+    if await _invoice_on_results_page(page) and not await _invoice_explicit_no_results(page):
+        _log(
+            "WARN: Search Results page is visible with data but export controls were slow; "
+            "continuing export flow."
+        )
+        return False
     _log(
         "WARN: Search results not confirmed within "
         f"{_invoice_results_ready_timeout_ms() // 1000}s; retrying search once…"
@@ -613,7 +682,25 @@ async def _set_invoice_criteria(page, report_day) -> None:
 
 
 async def _run_search(page) -> None:
-    await page.locator('button[data-test="Search"]').click()
+    if await _invoice_results_have_export_controls(page):
+        _log("Search results already visible; skipping Search click.")
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        return
+
+    btn = page.locator('button[data-test="Search"]')
+    try:
+        await btn.first.wait_for(state="visible", timeout=_probe_ms(10_000, 3_000))
+    except PlaywrightTimeout:
+        if await _invoice_on_results_page(page):
+            state = await _wait_for_invoice_results_state(page)
+            if state in ("ready", "timeout") and not await _invoice_explicit_no_results(page):
+                _log("On Search Results without Search button; continuing with loaded results.")
+                return
+        _log("Search button not visible; opening Search Criteria…")
+        await _ensure_invoice_criteria_form(page)
+        await btn.first.wait_for(state="visible", timeout=_step_timeout_ms())
+
+    await btn.first.click()
     _log("Waiting for search results…")
     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
@@ -627,8 +714,12 @@ async def _confirm_search_results_or_skip(
     """
     if not await _search_results_empty(page, after_search=True):
         return True
+    if await _invoice_results_have_export_controls(page):
+        _log(f"{retailer_label}: results visible on recheck; continuing.")
+        return True
     _log(f"{retailer_label}: no results on first search pass; retrying once…")
     await asyncio.sleep(1.0 if _invoice_fast() else 2.0)
+    await _ensure_invoice_criteria_form(page)
     await _run_search(page)
     if not await _search_results_empty(page, after_search=True):
         return True
@@ -640,11 +731,18 @@ async def _confirm_search_results_or_skip(
 async def _sort_by_po_number(page) -> None:
     _log("Sorting results by PO Number (Order)…")
     link = (
-        page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
+        page.locator('a[href*="sortSearchResults.do"]')
         .filter(has_text=re.compile(r"PO\s+Number", re.I))
         .first
     )
-    await link.wait_for(state="visible", timeout=_step_timeout_ms())
+    try:
+        await link.wait_for(state="visible", timeout=_probe_ms(5_000, 1_500))
+    except PlaywrightTimeout:
+        sorted_hdr = page.get_by_text(re.compile(r"sorted\s+by:\s*PO\s+Number", re.I))
+        if await sorted_hdr.count() and await sorted_hdr.first.is_visible():
+            _log("Results already sorted by PO Number; skipping sort click.")
+            return
+        raise
     await link.click()
     await page.wait_for_load_state("domcontentloaded", timeout=STEP_TIMEOUT_MS)
 
@@ -656,14 +754,6 @@ async def _open_lowes_saved_search(page) -> None:
     _log("Opening Lowe's saved invoice search…")
     await page.goto(url, wait_until="domcontentloaded")
     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
-
-
-def _frames_main_first(pg) -> list:
-    """Prefer main frame when scanning for export dialog (often in popup or iframe)."""
-    frames = list(pg.frames)
-    mf = pg.main_frame
-    out = [mf] + [f for f in frames if f is not mf]
-    return out
 
 
 async def _frame_with_export_checkbox(pg) -> object:
@@ -685,7 +775,12 @@ async def _frame_with_export_checkbox(pg) -> object:
 async def _export_excel(
     page, download_dir: Path, *, local_filename_stem: str | None = None
 ) -> Path:
-    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV").first
+    csv = (
+        page.locator('a[href*="linkOpen"]')
+        .filter(has_text=re.compile(r"csv", re.I))
+        .or_(page.get_by_role("link", name=re.compile(r"export.*csv", re.I)))
+        .first
+    )
     await csv.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
 
     export_pg = None
