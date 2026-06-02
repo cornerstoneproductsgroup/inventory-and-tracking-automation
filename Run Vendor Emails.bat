@@ -8,17 +8,26 @@ if exist "%INV_PY%" set "RUNNER=%INV_PY%"
 
 echo.
 echo Vendor Emails (Outlook)
-echo   1  Dry run preview (no emails sent)
-echo   2  Send emails now
+echo   1  Dry run log only ^(no Outlook^)
+echo   2  Preview in Outlook ^(opens each draft, no send^)
+echo   3  Send emails now
 echo.
-choice /C 12 /N /M "Choose 1 or 2: "
-if errorlevel 2 goto SEND
-if errorlevel 1 goto PREVIEW
+choice /C 123 /N /M "Choose 1, 2, or 3: "
+if errorlevel 3 goto SEND
+if errorlevel 2 goto PREVIEW
+if errorlevel 1 goto LOGONLY
+
+:LOGONLY
+echo.
+echo Running dry run (console only)...
+"%RUNNER%" "Inventory Submissions\run_vendor_emails.py"
+set "ERR=%ERRORLEVEL%"
+goto DONE
 
 :PREVIEW
 echo.
-echo Running dry run...
-"%RUNNER%" "Inventory Submissions\run_vendor_emails.py"
+echo Opening Outlook previews ^(close each message, press Enter for next^)...
+"%RUNNER%" "Inventory Submissions\run_vendor_emails.py" --preview
 set "ERR=%ERRORLEVEL%"
 goto DONE
 

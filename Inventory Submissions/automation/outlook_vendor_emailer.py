@@ -230,13 +230,33 @@ def _set_mail_body_with_optional_signature(
     mail.Body = body
 
 
-def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s: float = 0.5) -> int:
+def send_vendor_emails(
+    *,
+    config_path: Path,
+    dry_run: bool = True,
+    preview: bool = False,
+    vendor_filter: str | None = None,
+    preview_pause: bool = True,
+    send_delay_s: float = 0.5,
+) -> int:
     cfg = load_vendor_email_config(config_path)
     if not cfg.daily_vendor_root.is_dir():
         raise VendorEmailError(f"Daily vendor folder not found: {cfg.daily_vendor_root}")
 
+    if preview and dry_run:
+        dry_run = False
+
+    filter_cf = (vendor_filter or "").strip().casefold()
+    if filter_cf:
+        _log(f"Vendor filter: {vendor_filter!r}")
+
     _log(f"Daily vendor root: {cfg.daily_vendor_root}")
-    _log(f"Mode: {'DRY RUN (no emails sent)' if dry_run else 'SEND'}")
+    if preview:
+        _log("Mode: PREVIEW (Outlook compose windows open; nothing is sent)")
+    elif dry_run:
+        _log("Mode: DRY RUN (console preview only; Outlook is not opened)")
+    else:
+        _log("Mode: SEND")
     _log(
         f"Subject date suffix: {'enabled' if cfg.append_run_date_to_subject else 'disabled'}"
     )
@@ -258,6 +278,8 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
 
     for entry in cfg.vendors:
         vendor = entry.vendor_folder
+        if filter_cf and vendor.casefold() != filter_cf:
+            continue
         root_entry = cfg.daily_vendor_root / vendor
         if not root_entry.exists():
             _log(f"Skip {vendor!r}: folder not present today.")
@@ -303,6 +325,45 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
             sent += 1
             continue
 
+        if preview:
+            mail = app.CreateItem(0)  # olMailItem
+            mail.To = entry.to
+            if entry.cc:
+                mail.CC = entry.cc
+            mail.Subject = final_subject
+            try:
+                _set_mail_body_with_optional_signature(
+                    mail,
+                    entry.body,
+                    signature_name=cfg.outlook_signature_name,
+                    signature_image_path=cfg.signature_image_path,
+                )
+            except Exception as exc:
+                raise VendorEmailError(
+                    f"{vendor}: failed while setting body/signature: {exc}"
+                ) from exc
+            for path in attachments:
+                try:
+                    mail.Attachments.Add(str(path))
+                except Exception as exc:
+                    raise VendorEmailError(
+                        f"{vendor}: failed adding attachment {path.name!r}: {exc}"
+                    ) from exc
+            _log(f"  TO={entry.to!r} CC={entry.cc!r}")
+            _log(f"  Subject={final_subject!r}")
+            _log("  Opening message in Outlook — verify To/CC resolve (groups, GAL names).")
+            try:
+                mail.Display(False)
+            except Exception as exc:
+                raise VendorEmailError(f"{vendor}: failed opening preview: {exc}") from exc
+            if preview_pause:
+                try:
+                    input("  Close the message when done, then press Enter for the next vendor… ")
+                except EOFError:
+                    time.sleep(max(1.0, send_delay_s))
+            sent += 1
+            continue
+
         mail = app.CreateItem(0)  # olMailItem
         mail.To = entry.to
         if entry.cc:
@@ -334,5 +395,12 @@ def send_vendor_emails(*, config_path: Path, dry_run: bool = True, send_delay_s:
         _log(f"Sent {vendor!r}")
         time.sleep(max(0.0, send_delay_s))
 
-    _log(f"Done. {'Prepared' if dry_run else 'Sent'} {sent}; skipped {skipped}.")
+    label = "Prepared"
+    if preview:
+        label = "Previewed"
+    elif not dry_run:
+        label = "Sent"
+    _log(f"Done. {label} {sent}; skipped {skipped}.")
+    if filter_cf and sent == 0 and skipped == 0:
+        _log(f"No vendor matched filter {vendor_filter!r}. Check vendor_folder in JSON.")
     return 0
