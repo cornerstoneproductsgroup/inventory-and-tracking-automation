@@ -42,14 +42,26 @@ def _load_commercehub_automation():
     return LowesTrackingAutomation(load_config(path))
 
 
-def _browser_launch(playwright):
+def _browser_launch(playwright, *, for_sps: bool = False):
     headless = (os.environ.get("COMMERCEHUB_HEADLESS") or "false").strip().lower() in (
         "1",
         "true",
         "yes",
     )
+    if for_sps:
+        headless = (os.environ.get("HEADLESS") or os.environ.get("COMMERCEHUB_HEADLESS") or "false").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
     slow_mo = int(os.environ.get("COMMERCEHUB_SLOW_MO_MS") or "0")
-    return playwright.chromium.launch(headless=headless, slow_mo=slow_mo)
+    launch_kwargs: dict = {"headless": headless, "slow_mo": slow_mo}
+    if for_sps:
+        launch_kwargs["args"] = [
+            "--disable-features=BlockThirdPartyCookies,TrackingProtection3pcd",
+            "--disable-blink-features=AutomationControlled",
+        ]
+    return playwright.chromium.launch(**launch_kwargs)
 
 
 def run_pull_orders(
@@ -63,11 +75,7 @@ def run_pull_orders(
     from automation.pull_orders_commercehub import pull_commercehub_all
     from automation.pull_orders_sps import pull_sps_all
     from automation.pull_orders_warehouse_print import print_warehouse_files, settle_after_downloads
-    from run_sps_tracking import (
-        DEFAULT_STORAGE_STATE,
-        goto_dashboard,
-        login_with_env_credentials_then_save,
-    )
+    from run_sps_tracking import DEFAULT_STORAGE_STATE, ensure_sps_session
 
     errors: list[str] = []
 
@@ -94,19 +102,35 @@ def run_pull_orders(
     if not skip_sps:
         _log("=== SPS Commerce: Tractor Supply + Grainger ===")
         try:
+            headless = (os.environ.get("HEADLESS") or "false").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
             with sync_playwright() as p:
-                browser = _browser_launch(p)
-                storage = DEFAULT_STORAGE_STATE if DEFAULT_STORAGE_STATE.is_file() else None
-                context = browser.new_context(
-                    accept_downloads=True,
-                    storage_state=str(storage) if storage else None,
-                )
+                browser = _browser_launch(p, for_sps=True)
+                state_path = DEFAULT_STORAGE_STATE
+                if state_path.is_file():
+                    _log(f"SPS: loading session from {state_path}")
+                    context = browser.new_context(
+                        accept_downloads=True,
+                        storage_state=str(state_path),
+                    )
+                else:
+                    _log(
+                        f"SPS: no session file at {state_path}; "
+                        "will sign in with SPS_USERNAME/SPS_PASSWORD from .env "
+                        "(same as inventory/tracking)."
+                    )
+                    context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
-                goto_dashboard(page)
-                if not login_with_env_credentials_then_save(
-                    page, context, DEFAULT_STORAGE_STATE
-                ):
-                    _log("SPS: using saved session or manual sign-in may be required.")
+                ensure_sps_session(
+                    page,
+                    context,
+                    state_path,
+                    headless=headless,
+                    allow_manual=not headless,
+                )
                 pull_sps_all(page, context, order_date=order_date)
                 context.close()
                 browser.close()
