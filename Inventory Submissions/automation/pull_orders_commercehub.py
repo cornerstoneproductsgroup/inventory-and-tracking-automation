@@ -8,7 +8,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import Frame, Page, TimeoutError as PlaywrightTimeout
 
 from automation.pull_orders_config import (
     COMMERCEHUB_HOME_URL,
@@ -17,11 +17,19 @@ from automation.pull_orders_config import (
     RETAILERS,
     csv_filename,
     merchant_column_to_key,
-    partner_text_to_key,
     pdf_filename,
 )
 
-CH_COMMERCEHUB_KEYS = ("depot", "lowes", "thdso")
+# Exact CommerceHub control (see packing slips / order files table).
+DOWNLOAD_SPAN_SELECTOR = (
+    "span.download-dialog-info__element:has-text('Download'), "
+    "span.ch-icon-export.download-dialog-info__element:has-text('Download'), "
+    "span.chub-chui-chicon.ch-icon-export.download-dialog-info__element"
+)
+
+# thdso before depot so "Home Depot Special Order" is not matched as depot.
+RETAILER_PULL_ORDER = ("thdso", "depot", "lowes")
+
 DOWNLOAD_TIMEOUT_MS = 120_000
 
 
@@ -29,35 +37,59 @@ def _log(msg: str) -> None:
     print(f"[pull-orders/ch] {msg}", flush=True)
 
 
-def _goto_packslips(page: Page) -> None:
+def _all_frames(page: Page) -> list[Frame | Page]:
+    frames: list[Frame | Page] = [page]
+    for fr in page.frames:
+        if fr not in frames:
+            frames.append(fr)
+    return frames
+
+
+def _resolve_table_frame(page: Page) -> Frame | Page:
+    """CommerceHub tables often live in an iframe — find the frame with Download controls."""
+    for fr in _all_frames(page):
+        try:
+            count = fr.locator(DOWNLOAD_SPAN_SELECTOR).count()
+        except Exception:
+            continue
+        if count > 0:
+            name = fr.url if hasattr(fr, "url") else "main"
+            _log(f"Using CommerceHub table frame ({count} Download control(s)): {name}")
+            return fr
+    _log("WARN: Download controls not found in any frame; using main page.")
+    return page
+
+
+def _goto_packslips(page: Page) -> Frame | Page:
     page.goto(COMMERCEHUB_PACKSLIPS_URL, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(800)
-    page.locator("text=/packing slip/i").first.wait_for(state="visible", timeout=60_000)
-    _wait_for_download_table(page)
-
-
-def _goto_order_files(page: Page) -> None:
-    page.goto(COMMERCEHUB_ORDER_FILES_URL, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(800)
-    page.locator("text=/order file/i").first.wait_for(state="visible", timeout=60_000)
-    _wait_for_download_table(page)
-
-
-def _wait_for_download_table(page: Page) -> None:
+    page.wait_for_timeout(1000)
     try:
-        page.locator("table tbody tr").first.wait_for(state="visible", timeout=60_000)
+        page.locator("text=/packing slip/i").first.wait_for(state="visible", timeout=60_000)
     except PlaywrightTimeout:
-        page.locator("table tr").first.wait_for(state="visible", timeout=30_000)
-    page.wait_for_timeout(1200)
+        pass
+    frame = _resolve_table_frame(page)
+    _wait_for_download_table(frame)
+    return frame
 
 
-def _row_partner_key(row_text: str) -> str | None:
-    lines = [ln.strip() for ln in (row_text or "").splitlines() if ln.strip()]
-    for line in lines:
-        key = partner_text_to_key(line)
-        if key:
-            return key
-    return partner_text_to_key(row_text)
+def _goto_order_files(page: Page) -> Frame | Page:
+    page.goto(COMMERCEHUB_ORDER_FILES_URL, wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(1000)
+    try:
+        page.locator("text=/order file/i").first.wait_for(state="visible", timeout=60_000)
+    except PlaywrightTimeout:
+        pass
+    frame = _resolve_table_frame(page)
+    _wait_for_download_table(frame)
+    return frame
+
+
+def _wait_for_download_table(frame: Frame | Page) -> None:
+    try:
+        frame.locator("table tbody tr").first.wait_for(state="visible", timeout=60_000)
+    except PlaywrightTimeout:
+        frame.locator("table tr").first.wait_for(state="visible", timeout=30_000)
+    frame.wait_for_timeout(1500)
 
 
 def _row_matches_retailer(key: str, row_text: str) -> bool:
@@ -71,147 +103,79 @@ def _row_matches_retailer(key: str, row_text: str) -> bool:
     return False
 
 
-def _download_buttons_in_row(row) -> list:
-    selectors = (
+def _retailer_row_locator(frame: Frame | Page, key: str):
+    if key == "thdso":
+        return frame.locator("tr").filter(has_text=re.compile(r"special\s+order", re.I))
+    if key == "lowes":
+        return frame.locator("tr").filter(has_text=re.compile(r"lowe", re.I))
+    return frame.locator("tr").filter(has_text=re.compile(r"home\s+depot", re.I)).filter(
+        has_not_text=re.compile(r"special", re.I)
+    )
+
+
+def _download_button_in_row(row):
+    for sel in (
         "span.download-dialog-info__element:has-text('Download')",
         "span.ch-icon-export.download-dialog-info__element",
-        "span.ch-icon-export",
-        "a:has-text('Download')",
-        "button:has-text('Download')",
-        "span:has-text('Download')",
-        "[title*='Download' i]",
-        "[aria-label*='Download' i]",
-    )
-    out = []
-    for sel in selectors:
+        "span.chub-chui-chicon.ch-icon-export.download-dialog-info__element",
+    ):
         loc = row.locator(sel)
-        n = loc.count()
-        for i in range(n):
-            btn = loc.nth(i)
+        if loc.count() > 0:
+            btn = loc.first
             try:
                 if btn.is_visible():
-                    out.append(btn)
+                    return btn
             except Exception:
-                continue
-        if out:
-            return out
-    try:
-        dl = row.get_by_text(re.compile(r"^download$", re.I))
-        if dl.count() > 0 and dl.first.is_visible():
-            out.append(dl.first)
-    except Exception:
-        pass
-    return out
+                return btn
+    return None
 
 
-def _find_row_for_retailer(page: Page, key: str):
-    label = RETAILERS[key].label
-    patterns = [label]
-    if key == "depot":
-        patterns.extend(["Home Depot", "The Home Depot"])
-    elif key == "lowes":
-        patterns.extend(["Lowe's", "Lowes"])
-    elif key == "thdso":
-        patterns.extend(["Depot Special Order", "Special Order"])
-
-    rows = page.locator("table tbody tr, table tr")
-    for i in range(rows.count()):
+def _find_retailer_download(frame: Frame | Page, key: str):
+    rows = _retailer_row_locator(frame, key)
+    n = rows.count()
+    if n == 0:
+        return None, None
+    for i in range(n):
         row = rows.nth(i)
         try:
             if not row.is_visible():
                 continue
-            text = row.inner_text()
         except Exception:
             continue
-        if _row_matches_retailer(key, text) or any(p.lower() in text.lower() for p in patterns):
-            buttons = _download_buttons_in_row(row)
-            if buttons:
-                return row, buttons[0]
+        btn = _download_button_in_row(row)
+        if btn is not None:
+            return row, btn
     return None, None
 
 
-def _iter_retailer_rows(page: Page):
-    rows = page.locator("table tbody tr, table tr")
-    count = rows.count()
-    _log(f"Scanning {count} CommerceHub table row(s) for retailer downloads…")
-    seen_keys: set[str] = set()
-    matched_no_button: list[str] = []
-
-    for i in range(count):
-        row = rows.nth(i)
-        try:
-            if not row.is_visible():
-                continue
-        except Exception:
+def _iter_retailer_downloads(frame: Frame | Page):
+    for key in RETAILER_PULL_ORDER:
+        row, btn = _find_retailer_download(frame, key)
+        if btn is None:
+            _log(f"No Download button found for {RETAILERS[key].label}.")
             continue
-        try:
-            text = row.inner_text()
-        except Exception:
-            continue
-        key = _row_partner_key(text)
-        if not key or key not in CH_COMMERCEHUB_KEYS or key in seen_keys:
-            continue
-        buttons = _download_buttons_in_row(row)
-        if not buttons:
-            matched_no_button.append(key)
-            continue
-        seen_keys.add(key)
-        _log(f"Found {RETAILERS[key].label} row with download control.")
-        yield key, buttons[0]
-
-    for key in matched_no_button:
-        if key in seen_keys:
-            continue
-        row, btn = _find_row_for_retailer(page, key)
-        if row is not None and btn is not None:
-            seen_keys.add(key)
-            _log(f"Found {RETAILERS[key].label} row on second pass.")
-            yield key, btn
-
-    for key in CH_COMMERCEHUB_KEYS:
-        if key in seen_keys:
-            continue
-        row, btn = _find_row_for_retailer(page, key)
-        if row is not None and btn is not None:
-            seen_keys.add(key)
-            _log(f"Found {RETAILERS[key].label} row by retailer name search.")
-            yield key, btn
+        _log(f"Ready to download for {RETAILERS[key].label}.")
+        yield key, row, btn
 
 
-def _trigger_row_download(page: Page, row, download_btn):
-    """Click row download; try export icon + dialog Download if needed."""
-    try:
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-            download_btn.click(timeout=15_000)
-        return dl_info.value
-    except PlaywrightTimeout:
-        pass
-
-    if row is None or row.count() == 0:
-        raise PlaywrightTimeout("no download control")
-    export = row.locator("span.ch-icon-export").first
-    if export.count() == 0:
-        raise PlaywrightTimeout("no download control")
-    export.click(timeout=10_000)
-    page.wait_for_timeout(600)
-    dialog_dl = page.locator(
-        "span.download-dialog-info__element:has-text('Download'), "
-        "a:has-text('Download'), button:has-text('Download')"
-    ).first
-    dialog_dl.wait_for(state="visible", timeout=10_000)
+def _click_download(page: Page, download_btn) -> object:
+    download_btn.scroll_into_view_if_needed(timeout=10_000)
+    page.wait_for_timeout(200)
     with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-        dialog_dl.click(timeout=15_000)
+        download_btn.click(timeout=15_000, force=True)
     return dl_info.value
 
 
 def _save_download(download, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     download.save_as(str(dest))
+    if not dest.is_file() or dest.stat().st_size < 100:
+        raise RuntimeError(f"Download did not save a valid file: {dest}")
     return dest
 
 
 def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
-    for key in CH_COMMERCEHUB_KEYS:
+    for key in RETAILER_PULL_ORDER:
         if key not in found_keys:
             _log(f"No {RETAILERS[key].label} {kind} on CommerceHub today; skipping.")
 
@@ -219,24 +183,26 @@ def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
 def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None) -> list[Path]:
     """Download Depot / Lowe's / Special Order packing slip PDFs."""
     _log("Opening packing slips page…")
-    _goto_packslips(page)
+    frame = _goto_packslips(page)
     saved: list[Path] = []
     found_keys: set[str] = set()
-    for key, download_btn in _iter_retailer_rows(page):
+
+    for key, _row, download_btn in _iter_retailer_downloads(frame):
         found_keys.add(key)
         cfg = RETAILERS[key]
         dest = cfg.pdf_dir / pdf_filename(cfg.label, order_date)
         _log(f"Downloading packing slip for {cfg.label} → {dest}")
         try:
-            download = _trigger_row_download(page, download_btn.locator("xpath=ancestor::tr").first, download_btn)
+            download = _click_download(page, download_btn)
             path = _save_download(download, dest)
             saved.append(path)
-            _log(f"Saved {path.name}")
+            _log(f"Saved {path.name} ({path.stat().st_size:,} bytes)")
         except PlaywrightTimeout:
             _log(f"WARN: no download started for {cfg.label}; skipping.")
         except Exception as exc:
             _log(f"WARN: {cfg.label} packing slip failed: {exc}")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(800)
+
     _log_missing_retailers(found_keys, kind="packing slip")
     if not saved:
         _log("WARN: no CommerceHub packing slips were downloaded.")
@@ -280,16 +246,16 @@ def _read_csv_merchant_key(path: Path) -> str | None:
 def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -> list[Path]:
     """Download Depot / Lowe's / Special Order CSV order files (.neworders → .csv)."""
     _log("Opening order files page…")
-    _goto_order_files(page)
+    frame = _goto_order_files(page)
     saved: list[Path] = []
     found_keys: set[str] = set()
-    for key, download_btn in _iter_retailer_rows(page):
+
+    for key, _row, download_btn in _iter_retailer_downloads(frame):
         found_keys.add(key)
         cfg = RETAILERS[key]
         _log(f"Downloading order CSV for {cfg.label}")
         try:
-            row = download_btn.locator("xpath=ancestor::tr").first
-            download = _trigger_row_download(page, row, download_btn)
+            download = _click_download(page, download_btn)
             with tempfile.TemporaryDirectory() as tmp:
                 raw_name = download.suggested_filename or "order.neworders"
                 raw_path = Path(tmp) / raw_name
@@ -313,12 +279,13 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(csv_path.read_bytes())
                 saved.append(dest)
-                _log(f"Saved {dest.name}")
+                _log(f"Saved {dest.name} ({dest.stat().st_size:,} bytes)")
         except PlaywrightTimeout:
             _log(f"WARN: no download started for {cfg.label} CSV; skipping.")
         except Exception as exc:
             _log(f"WARN: {cfg.label} CSV failed: {exc}")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(800)
+
     _log_missing_retailers(found_keys, kind="order file")
     if not saved:
         _log("WARN: no CommerceHub order CSVs were downloaded.")
@@ -329,6 +296,15 @@ def pull_commercehub_all(page: Page, *, order_date: date | None = None) -> tuple
     """Packing slips first, then order CSV files."""
     pdfs = pull_commercehub_packing_slips(page, order_date=order_date)
     page.goto(COMMERCEHUB_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(500)
     csvs = pull_commercehub_order_csvs(page, order_date=order_date)
+
+    if not pdfs and not csvs:
+        raise RuntimeError(
+            "CommerceHub: no packing slips or order CSV files were saved. "
+            "Check console for 'No Download button found' or download timeout messages."
+        )
+    _log(
+        f"CommerceHub complete: {len(pdfs)} packing slip PDF(s), {len(csvs)} order CSV(s)."
+    )
     return pdfs, csvs

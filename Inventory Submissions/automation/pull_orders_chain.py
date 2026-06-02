@@ -80,7 +80,10 @@ def run_pull_orders(
                 context = browser.new_context(accept_downloads=True)
                 page = context.new_page()
                 automation.login(page)
-                pull_commercehub_all(page, order_date=order_date)
+                pdfs, csvs = pull_commercehub_all(page, order_date=order_date)
+                _log(
+                    f"CommerceHub saved {len(pdfs)} PDF(s) and {len(csvs)} CSV(s)."
+                )
                 context.close()
                 browser.close()
         except Exception as exc:
