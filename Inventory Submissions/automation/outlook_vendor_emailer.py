@@ -139,6 +139,67 @@ def _split_recipient_field(value: str) -> list[str]:
     return out
 
 
+def _looks_like_smtp_address(value: str) -> bool:
+    return "@" in value and "." in value.split("@", 1)[-1]
+
+
+def _recipient_is_resolved(recip) -> bool:
+    try:
+        if bool(getattr(recip, "Resolved", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        addr = str(getattr(recip, "Address", "") or "").strip()
+        if addr and (_looks_like_smtp_address(addr) or addr.startswith("/o=") or addr.startswith("EX")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _unresolved_recipient_names(mail) -> list[str]:
+    bad: list[str] = []
+    try:
+        for recip in mail.Recipients:
+            if not _recipient_is_resolved(recip):
+                bad.append(str(getattr(recip, "Name", "") or "?"))
+    except Exception:
+        pass
+    return bad
+
+
+def _add_resolved_recipient_from_gal(mail, gal, *, rtype: int) -> bool:
+    """Add a namespace.CreateRecipient that already resolved."""
+    try:
+        added = mail.Recipients.Add(gal)
+        added.Type = rtype
+        if _recipient_is_resolved(added):
+            return True
+    except Exception:
+        pass
+    try:
+        entry = gal.AddressEntry
+        added = mail.Recipients.Add(entry)
+        added.Type = rtype
+        if _recipient_is_resolved(added):
+            return True
+    except Exception:
+        pass
+    try:
+        addr = str(getattr(gal, "Address", "") or "").strip()
+        name = str(getattr(gal, "Name", "") or "").strip()
+        token = addr or name
+        if token:
+            added = mail.Recipients.Add(token)
+            added.Type = rtype
+            if added.Resolve() or _recipient_is_resolved(added):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _apply_mail_recipients(
     mail,
     namespace,
@@ -147,10 +208,9 @@ def _apply_mail_recipients(
     cc: str,
 ) -> list[str]:
     """
-    Add To/CC through Recipients and resolve (distribution lists, GAL display names).
+    Add To/CC through the address book and resolve distribution lists / GAL names.
 
-    Setting mail.To = "Group Name" often leaves plain text in the compose window.
-    Recipients.Add + Resolve() matches typing the name and pressing Tab/Enter.
+    Prefer namespace.CreateRecipient + Recipients.Add(resolved entry) over plain strings.
     """
     unresolved: list[str] = []
 
@@ -159,39 +219,34 @@ def _apply_mail_recipients(
         if not name:
             return
 
-        recip = mail.Recipients.Add(name)
-        recip.Type = rtype
-        if recip.Resolve():
+        if _looks_like_smtp_address(name):
+            recip = mail.Recipients.Add(name)
+            recip.Type = rtype
+            if _recipient_is_resolved(recip) or recip.Resolve():
+                return
+            unresolved.append(name)
             return
 
         gal = None
         try:
             gal = namespace.CreateRecipient(name)
-            if not gal.Resolve():
-                gal = None
+            if gal.Resolve():
+                if _add_resolved_recipient_from_gal(mail, gal, rtype=rtype):
+                    return
         except Exception:
             gal = None
 
-        if gal is not None:
+        recip = mail.Recipients.Add(name)
+        recip.Type = rtype
+        if recip.Resolve() or _recipient_is_resolved(recip):
+            return
+
+        if gal is not None and _add_resolved_recipient_from_gal(mail, gal, rtype=rtype):
             try:
                 mail.Recipients.Remove(recip.Index)
             except Exception:
                 pass
-            resolved_name = str(getattr(gal, "Name", "") or name).strip()
-            entry = mail.Recipients.Add(resolved_name)
-            entry.Type = rtype
-            if entry.Resolve():
-                return
-            try:
-                addr = str(getattr(gal, "Address", "") or "").strip()
-                if addr:
-                    mail.Recipients.Remove(entry.Index)
-                    entry = mail.Recipients.Add(addr)
-                    entry.Type = rtype
-                    if entry.Resolve():
-                        return
-            except Exception:
-                pass
+            return
 
         unresolved.append(name)
 
@@ -208,6 +263,75 @@ def _apply_mail_recipients(
     return unresolved
 
 
+def _recipient_resolve_timeout_s() -> float:
+    raw = (os.environ.get("VENDOR_EMAIL_RESOLVE_TIMEOUT_S") or "45").strip()
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 45.0
+
+
+def _ensure_all_recipients_resolved(
+    mail,
+    namespace,
+    *,
+    vendor: str,
+    required_names: list[str],
+) -> None:
+    """
+    Poll until every recipient is resolved, or raise before Send().
+
+    New Outlook sometimes paints plain text first; MAPI Resolved must be True.
+    """
+    timeout_s = _recipient_resolve_timeout_s()
+    deadline = time.monotonic() + timeout_s
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            mail.Recipients.ResolveAll()
+        except Exception:
+            pass
+
+        for recip in list(mail.Recipients):
+            if _recipient_is_resolved(recip):
+                continue
+            label = str(getattr(recip, "Name", "") or "")
+            try:
+                gal = namespace.CreateRecipient(label)
+                if gal.Resolve():
+                    if _add_resolved_recipient_from_gal(mail, gal, rtype=int(recip.Type)):
+                        try:
+                            mail.Recipients.Remove(recip.Index)
+                        except Exception:
+                            pass
+                        continue
+            except Exception:
+                pass
+            try:
+                recip.Resolve()
+            except Exception:
+                pass
+
+        bad = _unresolved_recipient_names(mail)
+        if not bad:
+            if attempt > 1:
+                _log(f"{vendor}: all recipients resolved (after {attempt} checks).")
+            return
+
+        if attempt == 1 or attempt % 5 == 0:
+            _log(f"{vendor}: waiting for Outlook to resolve: {', '.join(bad)}")
+        time.sleep(0.5)
+
+    bad = _unresolved_recipient_names(mail)
+    if bad:
+        _log_recipient_resolution(mail, to=";".join(required_names), cc="", unresolved=bad)
+        raise VendorEmailError(
+            f"{vendor}: recipient(s) not resolved after {timeout_s:.0f}s: {', '.join(bad)}. "
+            "Use the exact group name from Outlook's address book, or test with --preview."
+        )
+
+
 def _log_recipient_resolution(mail, *, to: str, cc: str, unresolved: list[str]) -> None:
     _log(f"  TO={to!r} CC={cc!r}")
     try:
@@ -216,7 +340,7 @@ def _log_recipient_resolution(mail, *, to: str, cc: str, unresolved: list[str]) 
             addr = str(getattr(recip, "Address", "") or "")
             rtype = int(getattr(recip, "Type", 0))
             kind = "To" if rtype == _OL_TO else "Cc" if rtype == _OL_CC else f"type={rtype}"
-            resolved = bool(getattr(recip, "Resolved", False))
+            resolved = _recipient_is_resolved(recip)
             _log(f"  recipient [{kind}]: {name!r} resolved={resolved} address={addr!r}")
     except Exception as exc:
         _log(f"  (could not list recipients: {exc})")
@@ -283,9 +407,19 @@ def _set_mail_body_with_optional_signature(
     *,
     signature_name: str,
     signature_image_path: Path | None,
+    prefer_file_signature: bool = False,
 ) -> None:
     # Prefer Outlook's native default signature (already configured in profile),
     # because it carries embedded resources the same way as manual New Email.
+    if signature_name and prefer_file_signature:
+        sig_html = _load_outlook_signature_html(signature_name)
+        if sig_html:
+            try:
+                mail.HTMLBody = f"{_body_text_to_html(body)}<br><br>{sig_html}"
+                return
+            except Exception:
+                pass
+
     if signature_name:
         try:
             mail.Display(False)
@@ -435,16 +569,23 @@ def send_vendor_emails(
         if preview:
             mail = app.CreateItem(0)  # olMailItem
             mail.Subject = final_subject
+            required = _split_recipient_field(entry.to) + _split_recipient_field(entry.cc)
             unresolved = _apply_mail_recipients(
                 mail, namespace, to=entry.to, cc=entry.cc
             )
-            _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=unresolved)
+            if unresolved:
+                _log(f"  WARN: initial add could not resolve: {', '.join(unresolved)}")
+            _ensure_all_recipients_resolved(
+                mail, namespace, vendor=vendor, required_names=required
+            )
+            _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
             try:
                 _set_mail_body_with_optional_signature(
                     mail,
                     entry.body,
                     signature_name=cfg.outlook_signature_name,
                     signature_image_path=cfg.signature_image_path,
+                    prefer_file_signature=True,
                 )
             except Exception as exc:
                 raise VendorEmailError(
@@ -457,8 +598,11 @@ def send_vendor_emails(
                     raise VendorEmailError(
                         f"{vendor}: failed adding attachment {path.name!r}: {exc}"
                     ) from exc
+            _ensure_all_recipients_resolved(
+                mail, namespace, vendor=vendor, required_names=required
+            )
             _log(f"  Subject={final_subject!r}")
-            _log("  Opening message in Outlook — verify To/CC show as resolved groups.")
+            _log("  Opening message in Outlook — To/CC should show as resolved groups.")
             try:
                 mail.Display(False)
             except Exception as exc:
@@ -473,18 +617,21 @@ def send_vendor_emails(
 
         mail = app.CreateItem(0)  # olMailItem
         mail.Subject = final_subject
+        required = _split_recipient_field(entry.to) + _split_recipient_field(entry.cc)
         unresolved = _apply_mail_recipients(mail, namespace, to=entry.to, cc=entry.cc)
         if unresolved:
-            raise VendorEmailError(
-                f"{vendor}: could not resolve recipient(s): {', '.join(unresolved)}. "
-                "Use the exact Outlook display name from the address book."
-            )
+            _log(f"  WARN: initial add could not resolve: {', '.join(unresolved)}")
+        _ensure_all_recipients_resolved(
+            mail, namespace, vendor=vendor, required_names=required
+        )
+        _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
         try:
             _set_mail_body_with_optional_signature(
                 mail,
                 entry.body,
                 signature_name=cfg.outlook_signature_name,
                 signature_image_path=cfg.signature_image_path,
+                prefer_file_signature=True,
             )
         except Exception as exc:
             raise VendorEmailError(
@@ -497,6 +644,9 @@ def send_vendor_emails(
                 raise VendorEmailError(
                     f"{vendor}: failed adding attachment {path.name!r}: {exc}"
                 ) from exc
+        _ensure_all_recipients_resolved(
+            mail, namespace, vendor=vendor, required_names=required
+        )
         try:
             mail.Send()
         except Exception as exc:

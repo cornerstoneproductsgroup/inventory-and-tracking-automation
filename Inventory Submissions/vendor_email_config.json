@@ -1,5 +1,5 @@
 {
-  "_comment": "Fill this in for Outlook vendor emails. Keep vendor_folder matching folder names under z- Daily Vendor Orders. For Outlook groups/distribution lists, put the exact display name in \"to\". Test one vendor: run_vendor_emails.py --preview --vendor \"MMR\"",
+  "_comment": "Fill vendor_folder to match z- Daily Vendor Orders folders. Put exact Outlook group display name in \"to\". Preview: run_vendor_emails.py --preview --vendor \"MMR\". Send is blocked until groups resolve (VENDOR_EMAIL_RESOLVE_TIMEOUT_S, default 45s).",
   "daily_vendor_root": "\\\\rygarcorp.com\\shares\\Cornerstone\\Dot Com Packing Slips\\1-Orders Before Extraction\\Order Splitter Output\\z- Daily Vendor Orders",
   "skip_root_entries": [
     ".warehouse_parts",
