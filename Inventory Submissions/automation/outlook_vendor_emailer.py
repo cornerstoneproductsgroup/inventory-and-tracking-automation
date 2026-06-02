@@ -144,7 +144,51 @@ def _looks_like_smtp_address(value: str) -> bool:
     return "@" in value and "." in value.split("@", 1)[-1]
 
 
-def _recipient_is_resolved(recip) -> bool:
+def _gal_resolves(namespace, name: str) -> bool:
+    """True when the name exists in Outlook's address book (including distribution lists)."""
+    label = (name or "").strip()
+    if not label:
+        return False
+    if _looks_like_smtp_address(label):
+        return True
+    try:
+        gal = namespace.CreateRecipient(label)
+        return bool(gal.Resolve())
+    except Exception:
+        return False
+
+
+def _find_canonical_gal_name(namespace, name: str) -> str | None:
+    """Return the address-book display name for a GAL / distribution list match."""
+    label = (name or "").strip()
+    if not label:
+        return None
+    try:
+        gal = namespace.CreateRecipient(label)
+        if gal.Resolve():
+            canon = str(getattr(gal, "Name", "") or "").strip()
+            return canon or label
+    except Exception:
+        pass
+    try:
+        gal_list = namespace.GetGlobalAddressList()
+        if gal_list is not None:
+            entries = gal_list.AddressEntries
+            target = label.casefold()
+            for i in range(1, int(entries.Count) + 1):
+                try:
+                    entry = entries.Item(i)
+                    entry_name = str(getattr(entry, "Name", "") or "").strip()
+                    if entry_name.casefold() == target:
+                        return entry_name
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _recipient_is_resolved(recip, namespace=None) -> bool:
     try:
         if bool(getattr(recip, "Resolved", False)):
             return True
@@ -152,19 +196,35 @@ def _recipient_is_resolved(recip) -> bool:
         pass
     try:
         addr = str(getattr(recip, "Address", "") or "").strip()
-        if addr and (_looks_like_smtp_address(addr) or addr.startswith("/o=") or addr.startswith("EX")):
+        if addr and (
+            _looks_like_smtp_address(addr)
+            or addr.startswith("/o=")
+            or addr.startswith("EX")
+        ):
             return True
     except Exception:
         pass
+    if namespace is not None:
+        name = str(getattr(recip, "Name", "") or "").strip()
+        if name and _gal_resolves(namespace, name):
+            return True
     return False
 
 
-def _unresolved_recipient_names(mail) -> list[str]:
+def _unresolved_recipient_names(mail, namespace) -> list[str]:
     bad: list[str] = []
     try:
         for recip in mail.Recipients:
-            if not _recipient_is_resolved(recip):
-                bad.append(str(getattr(recip, "Name", "") or "?"))
+            name = str(getattr(recip, "Name", "") or "").strip()
+            if _recipient_is_resolved(recip, namespace):
+                continue
+            try:
+                recip.Resolve()
+            except Exception:
+                pass
+            if _recipient_is_resolved(recip, namespace):
+                continue
+            bad.append(name or "?")
     except Exception:
         pass
     return bad
@@ -194,35 +254,6 @@ def _dedupe_mail_recipients(mail) -> int:
     return removed
 
 
-def _add_resolved_recipient_from_gal(mail, gal, *, rtype: int) -> bool:
-    """Add one resolved distribution list / GAL entry (single recipient only)."""
-    candidates: list[object] = [gal]
-    try:
-        candidates.append(gal.AddressEntry)
-    except Exception:
-        pass
-
-    for item in candidates:
-        added = None
-        try:
-            added = mail.Recipients.Add(item)
-            added.Type = rtype
-            try:
-                added.Resolve()
-            except Exception:
-                pass
-            if _recipient_is_resolved(added):
-                return True
-            mail.Recipients.Remove(added.Index)
-        except Exception:
-            if added is not None:
-                try:
-                    mail.Recipients.Remove(added.Index)
-                except Exception:
-                    pass
-    return False
-
-
 def _apply_mail_recipients(
     mail,
     namespace,
@@ -231,59 +262,47 @@ def _apply_mail_recipients(
     cc: str,
 ) -> list[str]:
     """
-    Add To/CC through the address book and resolve distribution lists / GAL names.
+    Set To/CC the same way as typing in Outlook, then ResolveAll.
 
-    Prefer namespace.CreateRecipient + Recipients.Add(resolved entry) over plain strings.
+    Distribution lists (e.g. Ez Pole) often keep Recipient.Resolved=False with an empty
+    Address even when the group is valid — use the address book to verify those names.
     """
     unresolved: list[str] = []
+    to_tokens: list[str] = []
+    cc_tokens: list[str] = []
 
-    def add_one(display_name: str, rtype: int) -> None:
-        name = display_name.strip()
-        if not name:
-            return
+    def collect_tokens(raw: str, bucket: list[str]) -> None:
+        for token in _split_recipient_field(raw):
+            if _looks_like_smtp_address(token):
+                bucket.append(token)
+                continue
+            canon = _find_canonical_gal_name(namespace, token)
+            if canon and canon.casefold() != token.casefold():
+                _log(f"  address book: {token!r} -> {canon!r}")
+                bucket.append(canon)
+            elif _gal_resolves(namespace, token):
+                bucket.append(canon or token)
+            else:
+                _log(f"  WARN: not found in address book: {token!r}")
+                unresolved.append(token)
+                bucket.append(token)
 
-        if _looks_like_smtp_address(name):
-            recip = mail.Recipients.Add(name)
-            recip.Type = rtype
-            if _recipient_is_resolved(recip) or recip.Resolve():
-                return
-            unresolved.append(name)
-            return
+    collect_tokens(to, to_tokens)
+    collect_tokens(cc, cc_tokens)
 
-        gal = None
+    if to_tokens:
+        mail.To = "; ".join(to_tokens)
+    if cc_tokens:
+        mail.CC = "; ".join(cc_tokens)
+
+    for _ in range(3):
         try:
-            gal = namespace.CreateRecipient(name)
-            if gal.Resolve():
-                if _add_resolved_recipient_from_gal(mail, gal, rtype=rtype):
-                    return
-                unresolved.append(name)
-                return
-        except Exception:
-            gal = None
-
-        recip = mail.Recipients.Add(name)
-        recip.Type = rtype
-        try:
-            recip.Resolve()
+            mail.Recipients.ResolveAll()
         except Exception:
             pass
-        if _recipient_is_resolved(recip):
-            return
-
-        unresolved.append(name)
-
-    for name in _split_recipient_field(to):
-        add_one(name, _OL_TO)
-    for name in _split_recipient_field(cc):
-        add_one(name, _OL_CC)
+        time.sleep(0.3)
 
     _dedupe_mail_recipients(mail)
-
-    try:
-        mail.Recipients.ResolveAll()
-    except Exception:
-        pass
-
     return unresolved
 
 
@@ -327,7 +346,14 @@ def _ensure_all_recipients_resolved(
 
         _dedupe_mail_recipients(mail)
 
-        bad = _unresolved_recipient_names(mail)
+        bad = _unresolved_recipient_names(mail, namespace)
+        bad = [n for n in bad if not _gal_resolves(namespace, n)]
+        for req in required_names:
+            if _looks_like_smtp_address(req):
+                continue
+            if not _gal_resolves(namespace, req) and req not in bad:
+                bad.append(req)
+
         if not bad:
             if attempt > 1:
                 _log(f"{vendor}: all recipients resolved (after {attempt} checks).")
@@ -337,16 +363,26 @@ def _ensure_all_recipients_resolved(
             _log(f"{vendor}: waiting for Outlook to resolve: {', '.join(bad)}")
         time.sleep(0.5)
 
-    bad = _unresolved_recipient_names(mail)
+    bad = _unresolved_recipient_names(mail, namespace)
+    bad = [n for n in bad if not _gal_resolves(namespace, n)]
+    for req in required_names:
+        if _looks_like_smtp_address(req):
+            continue
+        if not _gal_resolves(namespace, req) and req not in bad:
+            bad.append(req)
     if bad:
-        _log_recipient_resolution(mail, to=";".join(required_names), cc="", unresolved=bad)
+        _log_recipient_resolution(
+            mail, to=";".join(required_names), cc="", unresolved=bad, namespace=namespace
+        )
         raise VendorEmailError(
             f"{vendor}: recipient(s) not resolved after {timeout_s:.0f}s: {', '.join(bad)}. "
             "Use the exact group name from Outlook's address book, or test with --preview."
         )
 
 
-def _log_recipient_resolution(mail, *, to: str, cc: str, unresolved: list[str]) -> None:
+def _log_recipient_resolution(
+    mail, *, to: str, cc: str, unresolved: list[str], namespace=None
+) -> None:
     _log(f"  TO={to!r} CC={cc!r}")
     try:
         for recip in mail.Recipients:
@@ -354,12 +390,16 @@ def _log_recipient_resolution(mail, *, to: str, cc: str, unresolved: list[str]) 
             addr = str(getattr(recip, "Address", "") or "")
             rtype = int(getattr(recip, "Type", 0))
             kind = "To" if rtype == _OL_TO else "Cc" if rtype == _OL_CC else f"type={rtype}"
-            resolved = _recipient_is_resolved(recip)
-            _log(f"  recipient [{kind}]: {name!r} resolved={resolved} address={addr!r}")
+            resolved = _recipient_is_resolved(recip, namespace)
+            gal_ok = bool(name and namespace and _gal_resolves(namespace, name))
+            _log(
+                f"  recipient [{kind}]: {name!r} resolved={resolved} "
+                f"gal={gal_ok} address={addr!r}"
+            )
     except Exception as exc:
         _log(f"  (could not list recipients: {exc})")
     if unresolved:
-        _log(f"  WARN: unresolved name(s): {', '.join(unresolved)}")
+        _log(f"  WARN: not in address book: {', '.join(unresolved)}")
 
 
 def _collect_vendor_attachments(cfg: VendorEmailConfig, vendor_folder: str) -> list[Path]:
@@ -612,7 +652,13 @@ def send_vendor_emails(
             _ensure_all_recipients_resolved(
                 mail, namespace, vendor=vendor, required_names=required
             )
-            _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
+            _log_recipient_resolution(
+                mail,
+                to=entry.to,
+                cc=entry.cc,
+                unresolved=unresolved,
+                namespace=namespace,
+            )
             for path in attachments:
                 try:
                     mail.Attachments.Add(str(path))
@@ -660,7 +706,9 @@ def send_vendor_emails(
         _ensure_all_recipients_resolved(
             mail, namespace, vendor=vendor, required_names=required
         )
-        _log_recipient_resolution(mail, to=entry.to, cc=entry.cc, unresolved=[])
+        _log_recipient_resolution(
+            mail, to=entry.to, cc=entry.cc, unresolved=unresolved, namespace=namespace
+        )
         for path in attachments:
             try:
                 mail.Attachments.Add(str(path))
