@@ -17,9 +17,11 @@ import asyncio
 import os
 import re
 import sys
+import time
 import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
@@ -81,6 +83,96 @@ def _probe_ms(slow_ms: int, fast_ms: int | None = None) -> int:
 
 def _step_timeout_ms() -> int:
     return _probe_ms(STEP_TIMEOUT_MS, 12_000)
+
+
+def _invoice_results_ready_timeout_ms() -> int:
+    """Wait for CSV / sort links after clicking Search (slow Rithum days need longer)."""
+    default = 35_000 if _invoice_fast() else 60_000
+    return _ms("COMMERCEHUB_INVOICE_RESULTS_READY_MS", default)
+
+
+async def _invoice_on_criteria_form(page) -> bool:
+    """True when the date-filter criteria form is showing (not finished search results)."""
+    try:
+        return await page.locator("#Operator1").first.is_visible()
+    except PlaywrightError:
+        return False
+
+
+async def _invoice_results_have_export_controls(page) -> bool:
+    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV")
+    try:
+        if await csv.count() and await csv.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+    po_sort = page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
+    try:
+        if await po_sort.count() and await po_sort.first.is_visible():
+            return True
+    except PlaywrightError:
+        pass
+    return False
+
+
+async def _invoice_explicit_no_results(page) -> bool:
+    no_msg = page.get_by_text(
+        re.compile(
+            r"no\s+(records|results|orders|matching)|0\s+record|did\s+not\s+match",
+            re.I,
+        )
+    )
+    try:
+        return bool(await no_msg.count()) and await no_msg.first.is_visible()
+    except PlaywrightError:
+        return False
+
+
+async def _wait_for_invoice_results_state(
+    page, timeout_ms: int | None = None
+) -> Literal["ready", "empty", "timeout"]:
+    """
+    After Search: wait for export controls (has rows) or an explicit no-results message.
+    """
+    wait_ms = timeout_ms if timeout_ms is not None else _invoice_results_ready_timeout_ms()
+    deadline = time.monotonic() + max(2000, wait_ms) / 1000.0
+    while time.monotonic() < deadline:
+        if await _invoice_on_criteria_form(page):
+            await asyncio.sleep(0.3)
+            continue
+        if await _invoice_explicit_no_results(page):
+            return "empty"
+        if await _invoice_results_have_export_controls(page):
+            return "ready"
+        await asyncio.sleep(0.3)
+    return "timeout"
+
+
+async def _search_results_empty(page, *, after_search: bool = False) -> bool:
+    """
+    True when CommerceHub search results are loaded and there is nothing to export.
+
+    When ``after_search`` is False, never treat the criteria form or a loading page as empty.
+    """
+    if not after_search:
+        if await _invoice_on_criteria_form(page):
+            return False
+        if not await page.locator('a[href*="sortSearchResults.do"]').count():
+            return False
+        if not await _invoice_explicit_no_results(page):
+            return False
+        return not await _invoice_results_have_export_controls(page)
+
+    state = await _wait_for_invoice_results_state(page)
+    if state == "ready":
+        return False
+    if state == "empty":
+        return True
+    _log(
+        "WARN: Search results not confirmed within "
+        f"{_invoice_results_ready_timeout_ms() // 1000}s; retrying search once…"
+    )
+    return True
 
 
 HOME_URL = "https://dsm.commercehub.com/dsm/gotoHome.do"
@@ -346,7 +438,7 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
         pass
     try:
         await results.first.wait_for(state="visible", timeout=probe)
-        if await _search_results_empty(page):
+        if await _search_results_empty(page, after_search=True):
             _log("Already on empty search results; no saved search to click.")
             return
         _log("Already on search results; no saved search to click.")
@@ -370,7 +462,7 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
         await page.locator("a").filter(has_text=rx).count() > 0
     )
     if not has_link:
-        if await _search_results_empty(page):
+        if await _search_results_empty(page, after_search=True):
             _log(f"No saved search link for {name!r}; page already has empty results.")
             return
         _log(f"Saved search {name!r} not listed; opening criteria form directly.")
@@ -378,7 +470,7 @@ async def _maybe_select_saved_search(page, saved_search_name: str) -> None:
         return
 
     last_err: Exception | None = None
-    max_attempts = 1 if _invoice_fast() else 3
+    max_attempts = 2 if _invoice_fast() else 3
     for attempt in range(1, max_attempts + 1):
         _log(f"Saved-search pick attempt {attempt}/{max_attempts}…")
         try:
@@ -526,37 +618,23 @@ async def _run_search(page) -> None:
     await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
 
-async def _search_results_empty(page) -> bool:
-    """True when the search finished but there is nothing to sort or export."""
-    no_msg = page.get_by_text(
-        re.compile(
-            r"no\s+(records|results|orders|matching)|0\s+record|did\s+not\s+match",
-            re.I,
-        )
-    )
-    try:
-        if await no_msg.count() and await no_msg.first.is_visible():
-            return True
-    except PlaywrightError:
-        pass
-
-    csv = page.locator('a[href="javascript:linkOpen();"]').filter(has_text="CSV")
-    csv_wait = _probe_ms(8_000, 1_500)
-    try:
-        await csv.first.wait_for(state="visible", timeout=csv_wait)
-        return False
-    except PlaywrightTimeout:
-        pass
-
-    po_sort = page.locator('a[href*="sortSearchResults.do"][href*="ponumber"]')
-    if await po_sort.count() == 0:
+async def _confirm_search_results_or_skip(
+    page, report_day, retailer_label: str
+) -> bool:
+    """
+    Return True when results are ready to export; False when confirmed empty (skip).
+    Retries Search once on timeout before skipping.
+    """
+    if not await _search_results_empty(page, after_search=True):
         return True
-    po_wait = _probe_ms(5_000, 1_200)
-    try:
-        await po_sort.first.wait_for(state="visible", timeout=po_wait)
-        return False
-    except PlaywrightTimeout:
+    _log(f"{retailer_label}: no results on first search pass; retrying once…")
+    await asyncio.sleep(1.0 if _invoice_fast() else 2.0)
+    await _run_search(page)
+    if not await _search_results_empty(page, after_search=True):
         return True
+    _log(f"{retailer_label}: no invoices for {report_day} — skipping export and print.")
+    _record_invoice_skip(f"{retailer_label} invoice report", "No invoices for report day")
+    return False
 
 
 async def _sort_by_po_number(page) -> None:
@@ -687,25 +765,15 @@ async def _failure_screenshot(context, page) -> None:
 async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Depot invoicing: Order Search → saved search → export…")
     await _open_order_search(page)
-    if await _search_results_empty(page):
-        _log(f"Depot: no invoices for {report_day} (empty results already); skipping.")
-        _record_invoice_skip("Depot invoice report", "No invoices for report day")
-        return None
     _default_saved = "Home Depot Invoice Batch Print by Date"
     if "COMMERCEHUB_SAVED_SEARCH_NAME" in os.environ:
         saved_name = os.environ["COMMERCEHUB_SAVED_SEARCH_NAME"].strip()
     else:
         saved_name = _default_saved
     await _maybe_select_saved_search(page, saved_name)
-    if await _search_results_empty(page):
-        _log(f"Depot: no invoices for {report_day} — skipping export and print.")
-        _record_invoice_skip("Depot invoice report", "No invoices for report day")
-        return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
-    if await _search_results_empty(page):
-        _log(f"Depot: no invoices for {report_day} — skipping export and print.")
-        _record_invoice_skip("Depot invoice report", "No invoices for report day")
+    if not await _confirm_search_results_or_skip(page, report_day, "Depot"):
         return None
     await _sort_by_po_number(page)
     path = await _export_excel(page, download_dir, local_filename_stem="commercehub_depot")
@@ -718,25 +786,15 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path 
 async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Lowe's invoicing: Order Search → Lowe's saved search → export…")
     await _open_order_search(page)
-    if await _search_results_empty(page):
-        _log(f"Lowe's: no invoices for {report_day} (empty results already); skipping.")
-        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
-        return None
     await _open_lowes_saved_search(page)
     lowes_saved = (
         os.environ.get("COMMERCEHUB_LOWE_SAVED_SEARCH_NAME")
         or "Lowe's Invoice Batch Print by Date"
     ).strip()
     await _maybe_select_saved_search(page, lowes_saved)
-    if await _search_results_empty(page):
-        _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
-        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
-        return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
-    if await _search_results_empty(page):
-        _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
-        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
+    if not await _confirm_search_results_or_skip(page, report_day, "Lowe's"):
         return None
     await _sort_by_po_number(page)
     path_l = await _export_excel(page, download_dir, local_filename_stem="commercehub_lowes")
