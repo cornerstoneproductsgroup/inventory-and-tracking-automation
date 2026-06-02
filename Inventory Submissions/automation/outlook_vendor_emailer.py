@@ -144,48 +144,205 @@ def _looks_like_smtp_address(value: str) -> bool:
     return "@" in value and "." in value.split("@", 1)[-1]
 
 
+def _name_matches(a: str, b: str) -> bool:
+    return (a or "").strip().casefold() == (b or "").strip().casefold()
+
+
+def _search_address_entries(entries, label: str, *, depth: int = 0) -> object | None:
+    """Search an AddressEntries collection (and nested containers) for a display name."""
+    if depth > 6:
+        return None
+    target = label.casefold()
+    try:
+        count = int(entries.Count)
+    except Exception:
+        return None
+    for i in range(1, count + 1):
+        try:
+            entry = entries.Item(i)
+            entry_name = str(getattr(entry, "Name", "") or "").strip()
+            if entry_name.casefold() == target:
+                return entry
+            nested = getattr(entry, "AddressEntries", None)
+            if nested is not None:
+                try:
+                    if int(nested.Count) > 0:
+                        hit = _search_address_entries(nested, label, depth=depth + 1)
+                        if hit is not None:
+                            return hit
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return None
+
+
+def _find_in_contacts_folder(namespace, label: str) -> object | None:
+    """Find a contact or contact group in the default Contacts folder (My Contacts)."""
+    try:
+        folder = namespace.GetDefaultFolder(10)  # olFolderContacts
+        items = folder.Items
+    except Exception:
+        return None
+
+    safe = label.replace("'", "''")
+    found = None
+    try:
+        found = items.Find(f"[FullName] = '{safe}'")
+        if found is not None and not _name_matches(
+            str(getattr(found, "FullName", "") or ""), label
+        ):
+            found = None
+    except Exception:
+        found = None
+
+    if found is None:
+        try:
+            found = items.Find(f"[FileAs] = '{safe}'")
+            if found is not None and not _name_matches(
+                str(getattr(found, "FileAs", "") or getattr(found, "FullName", "") or ""),
+                label,
+            ):
+                found = None
+        except Exception:
+            found = None
+
+    if found is None:
+        try:
+            for item in items:
+                try:
+                    full = str(
+                        getattr(item, "FullName", "") or getattr(item, "FileAs", "") or ""
+                    ).strip()
+                    if _name_matches(full, label):
+                        return item
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    return found
+
+
+def _find_address_entry(namespace, name: str) -> object | None:
+    """
+    Find Ez Pole-style entries in any Outlook address source:
+    GAL, other address lists, and My Contacts contact groups.
+    """
+    label = (name or "").strip()
+    if not label:
+        return None
+    if _looks_like_smtp_address(label):
+        return None
+
+    try:
+        recip = namespace.CreateRecipient(label)
+        if recip.Resolve():
+            try:
+                return recip.AddressEntry
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        lists = namespace.AddressLists
+        for li in range(1, int(lists.Count) + 1):
+            try:
+                addr_list = lists.Item(li)
+                hit = _search_address_entries(addr_list.AddressEntries, label)
+                if hit is not None:
+                    return hit
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        gal_list = namespace.GetGlobalAddressList()
+        if gal_list is not None:
+            hit = _search_address_entries(gal_list.AddressEntries, label)
+            if hit is not None:
+                return hit
+    except Exception:
+        pass
+
+    contact = _find_in_contacts_folder(namespace, label)
+    if contact is not None:
+        try:
+            return contact.AddressEntry
+        except Exception:
+            return contact
+    return None
+
+
 def _gal_resolves(namespace, name: str) -> bool:
-    """True when the name exists in Outlook's address book (including distribution lists)."""
+    """True when the name exists in any Outlook address list or Contacts folder."""
     label = (name or "").strip()
     if not label:
         return False
     if _looks_like_smtp_address(label):
         return True
-    try:
-        gal = namespace.CreateRecipient(label)
-        return bool(gal.Resolve())
-    except Exception:
-        return False
+    return _find_address_entry(namespace, label) is not None
 
 
 def _find_canonical_gal_name(namespace, name: str) -> str | None:
-    """Return the address-book display name for a GAL / distribution list match."""
+    """Return the display name Outlook uses for this contact / group."""
     label = (name or "").strip()
     if not label:
         return None
+    hit = _find_address_entry(namespace, label)
+    if hit is None:
+        return None
     try:
-        gal = namespace.CreateRecipient(label)
-        if gal.Resolve():
-            canon = str(getattr(gal, "Name", "") or "").strip()
-            return canon or label
+        canon = str(getattr(hit, "Name", "") or "").strip()
+        return canon or label
+    except Exception:
+        return label
+
+
+def _add_recipient_token(
+    mail, namespace, token: str, rtype: int
+) -> tuple[bool, str | None]:
+    """
+    Add one To/Cc entry. Returns (ok, source) where source is 'entry', 'smtp', or None.
+    """
+    label = token.strip()
+    if not label:
+        return True, None
+
+    if _looks_like_smtp_address(label):
+        recip = mail.Recipients.Add(label)
+        recip.Type = rtype
+        try:
+            recip.Resolve()
+        except Exception:
+            pass
+        return _recipient_is_resolved(recip, namespace), "smtp"
+
+    hit = _find_address_entry(namespace, label)
+    if hit is not None:
+        try:
+            recip = mail.Recipients.Add(hit)
+            recip.Type = rtype
+            try:
+                recip.Resolve()
+            except Exception:
+                pass
+            return True, "entry"
+        except Exception as exc:
+            _log(f"  WARN: address book entry found for {label!r} but Add failed: {exc}")
+
+    recip = mail.Recipients.Add(label)
+    recip.Type = rtype
+    try:
+        recip.Resolve()
     except Exception:
         pass
-    try:
-        gal_list = namespace.GetGlobalAddressList()
-        if gal_list is not None:
-            entries = gal_list.AddressEntries
-            target = label.casefold()
-            for i in range(1, int(entries.Count) + 1):
-                try:
-                    entry = entries.Item(i)
-                    entry_name = str(getattr(entry, "Name", "") or "").strip()
-                    if entry_name.casefold() == target:
-                        return entry_name
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return None
+    if _recipient_is_resolved(recip, namespace):
+        return True, "string"
+    return False, None
 
 
 def _recipient_is_resolved(recip, namespace=None) -> bool:
@@ -262,38 +419,33 @@ def _apply_mail_recipients(
     cc: str,
 ) -> list[str]:
     """
-    Set To/CC the same way as typing in Outlook, then ResolveAll.
+    Add To/Cc from SMTP, GAL, other address lists, or My Contacts contact groups.
 
-    Distribution lists (e.g. Ez Pole) often keep Recipient.Resolved=False with an empty
-    Address even when the group is valid — use the address book to verify those names.
+    Contact groups (e.g. Ez Pole) often live under Contacts, not the Global Address List.
     """
     unresolved: list[str] = []
-    to_tokens: list[str] = []
-    cc_tokens: list[str] = []
 
-    def collect_tokens(raw: str, bucket: list[str]) -> None:
-        for token in _split_recipient_field(raw):
-            if _looks_like_smtp_address(token):
-                bucket.append(token)
-                continue
-            canon = _find_canonical_gal_name(namespace, token)
-            if canon and canon.casefold() != token.casefold():
-                _log(f"  address book: {token!r} -> {canon!r}")
-                bucket.append(canon)
-            elif _gal_resolves(namespace, token):
-                bucket.append(canon or token)
-            else:
-                _log(f"  WARN: not found in address book: {token!r}")
-                unresolved.append(token)
-                bucket.append(token)
+    for token in _split_recipient_field(to):
+        ok, source = _add_recipient_token(mail, namespace, token, _OL_TO)
+        if ok:
+            if source == "entry":
+                _log(f"  To: added {token!r} from address book / Contacts")
+            continue
+        if not _gal_resolves(namespace, token):
+            _log(f"  WARN: not found in address book: {token!r}")
+            unresolved.append(token)
+        else:
+            _log(f"  To: {token!r} found in address book (may show resolved=False until send)")
 
-    collect_tokens(to, to_tokens)
-    collect_tokens(cc, cc_tokens)
-
-    if to_tokens:
-        mail.To = "; ".join(to_tokens)
-    if cc_tokens:
-        mail.CC = "; ".join(cc_tokens)
+    for token in _split_recipient_field(cc):
+        ok, source = _add_recipient_token(mail, namespace, token, _OL_CC)
+        if ok:
+            if source == "entry":
+                _log(f"  Cc: added {token!r} from address book / Contacts")
+            continue
+        if not _gal_resolves(namespace, token):
+            _log(f"  WARN: not found in address book: {token!r}")
+            unresolved.append(token)
 
     for _ in range(3):
         try:
@@ -392,9 +544,10 @@ def _log_recipient_resolution(
             kind = "To" if rtype == _OL_TO else "Cc" if rtype == _OL_CC else f"type={rtype}"
             resolved = _recipient_is_resolved(recip, namespace)
             gal_ok = bool(name and namespace and _gal_resolves(namespace, name))
+            in_book = "yes" if gal_ok else "no"
             _log(
                 f"  recipient [{kind}]: {name!r} resolved={resolved} "
-                f"gal={gal_ok} address={addr!r}"
+                f"in_book={in_book} address={addr!r}"
             )
     except Exception as exc:
         _log(f"  (could not list recipients: {exc})")
