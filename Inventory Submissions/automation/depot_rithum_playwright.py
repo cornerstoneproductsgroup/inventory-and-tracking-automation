@@ -34,6 +34,7 @@ from automation.commercehub_timeouts import (  # noqa: E402
 )
 from automation.rithum_empty_queue import (  # noqa: E402
     log_rithum_empty_skip as _log_rithum_empty_skip,
+    rithum_criteria_empty as _rithum_criteria_empty,
     rithum_empty_queue as _rithum_empty_queue,
     skip_if_rithum_empty as _skip_if_rithum_empty,
 )
@@ -46,6 +47,56 @@ def _record_skip(step: str, reason: str) -> None:
         log_and_record_skip(step, reason)
     except ImportError:
         print(f"{step}: Skipped — {reason}", flush=True)
+
+
+def _thdso_summary_queue_count(page: Page, status_label: str) -> int | None:
+    """
+    Read the # Orders count from the thdso merchant summary table for a status row
+    (e.g. Open / Accepted, Open / Unacknowledged, Needs Invoicing).
+    """
+    rx = re.compile(status_label, re.I)
+    try:
+        link = page.get_by_role("link", name=rx).first
+        if link.count() == 0:
+            link = page.locator("a").filter(has_text=rx).first
+        if link.count() == 0:
+            return None
+        row = link.locator("xpath=ancestor::tr[1]")
+        if row.count() == 0:
+            return None
+        for cell in row.locator("td").all():
+            txt = (cell.inner_text() or "").strip()
+            if txt.isdigit():
+                return int(txt)
+        for token in re.findall(r"\b(\d+)\b", row.inner_text() or ""):
+            return int(token)
+    except Exception:
+        pass
+    return None
+
+
+def _skip_if_special_order_empty(
+    page: Page, step: str, summary_status: str
+) -> bool:
+    """
+    Skip only when the criteria notification is shown AND the summary row count is 0/missing.
+    Avoids false skips on the merchant summary page (orders listed, no form fields yet).
+    """
+    if not _rithum_criteria_empty(page):
+        return False
+    on_summary = "gotoopenorders.do?pid=thdso" in (page.url or "").lower()
+    if not on_summary:
+        _goto(page, SPECIAL_ORDER_SUMMARY_URL)
+        page.wait_for_timeout(300 if _chain_fast() else 600)
+    count = _thdso_summary_queue_count(page, summary_status)
+    if count is not None and count > 0:
+        print(
+            f"{step}: criteria notification on direct URL but summary shows {count} order(s); "
+            "will open queue from summary."
+        )
+        return False
+    _log_rithum_empty_skip(step)
+    return True
 
 ORDER_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
@@ -394,7 +445,7 @@ def _wait_for_special_order_ack_page_ready(page: Page, timeout_ms: int) -> bool:
             body = (page.inner_text("body") or "").lower()
             if "special orders" in body and "no orders" in body:
                 return False
-            if _rithum_empty_queue(page):
+            if _rithum_criteria_empty(page):
                 return False
         except Exception:
             pass
@@ -407,22 +458,15 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
     print("Depot Special Orders: opening Open/Unacknowledged acknowledgment queue...")
     _goto(page, SPECIAL_ORDER_QUICKACK_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
-    if _skip_if_rithum_empty(page, "Depot Special Orders ack"):
-        return False
     if _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
-    summary_link = page.locator("a[href*='gotoOpenOrders.do?PID=thdso']").first
-    try:
-        if summary_link.count() > 0:
-            txt = (summary_link.inner_text() or "").strip()
-            if txt.isdigit() and int(txt) == 0:
-                _record_skip("Depot Special Orders ack", "Summary shows 0 orders")
-                return False
-    except Exception:
-        pass
+    unack_count = _thdso_summary_queue_count(page, r"open\s*/\s*unacknowledged")
+    if unack_count == 0:
+        _record_skip("Depot Special Orders ack", "Summary shows 0 unacknowledged orders")
+        return False
 
     open_unack = page.locator(
         "a[href*='merchant=thdso'][href*='web_quickack'], "
@@ -441,8 +485,11 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if not _skip_if_rithum_empty(page, "Depot Special Orders ack"):
-            _record_skip("Depot Special Orders ack", "Queue not ready")
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
+        ):
+            return False
+        _record_skip("Depot Special Orders ack", "Queue not ready")
         return False
     return True
 
@@ -491,10 +538,14 @@ def _special_order_ack_order_ids(page: Page) -> list[str]:
 def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]) -> bool:
     from automation.worldship_vendor_map import is_sku_in_vendor_map
 
-    if _skip_if_rithum_empty(page, "Depot Special Orders ack"):
+    if _skip_if_special_order_empty(
+        page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
+    ):
         return False
     if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        if _skip_if_rithum_empty(page, "Depot Special Orders ack"):
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders ack", r"open\s*/\s*unacknowledged"
+        ):
             return False
         _record_skip("Depot Special Orders ack", "Timed out waiting for order list")
         return False
@@ -570,7 +621,7 @@ def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]
         except Exception:
             pass
         if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-            if _rithum_empty_queue(page):
+            if _rithum_criteria_empty(page):
                 return False
         page.wait_for_timeout(500 if _chain_fast() else 900)
         return True
@@ -617,7 +668,7 @@ def _wait_for_special_order_page_ready(page: Page, timeout_ms: int) -> bool:
             body = (page.inner_text("body") or "").lower()
             if "special orders" in body and "no orders" in body:
                 return False
-            if _rithum_empty_queue(page):
+            if _rithum_criteria_empty(page):
                 return False
         except Exception:
             pass
@@ -630,22 +681,15 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
     print("Depot Special Orders: opening Open/Accepted quickship queue...")
     _goto(page, SPECIAL_ORDER_QUICKSHIP_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
-    if _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
-        return False
     if _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
-    summary_link = page.locator("a[href*='gotoOpenOrders.do?PID=thdso']").first
-    try:
-        if summary_link.count() > 0:
-            txt = (summary_link.inner_text() or "").strip()
-            if txt.isdigit() and int(txt) == 0:
-                _record_skip("Depot Special Orders tracking", "Summary shows 0 orders")
-                return False
-    except Exception:
-        pass
+    accepted_count = _thdso_summary_queue_count(page, r"open\s*/\s*accepted")
+    if accepted_count == 0:
+        _record_skip("Depot Special Orders tracking", "Summary shows 0 accepted orders")
+        return False
 
     open_accepted = page.locator(
         "a[href*='merchant=thdso'][href*='web_quickship'], "
@@ -664,17 +708,24 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if not _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
-            _record_skip("Depot Special Orders tracking", "Queue not ready")
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
+        ):
+            return False
+        _record_skip("Depot Special Orders tracking", "Queue not ready")
         return False
     return True
 
 
 def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str]) -> bool:
-    if _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
+    if _skip_if_special_order_empty(
+        page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
+    ):
         return False
     if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-        if _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders tracking", r"open\s*/\s*accepted"
+        ):
             return False
         _record_skip("Depot Special Orders tracking", "Timed out waiting for order list")
         return False
@@ -809,7 +860,7 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
         except Exception:
             pass
         if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
-            if _rithum_empty_queue(page):
+            if _rithum_criteria_empty(page):
                 return False
             return False
         page.wait_for_timeout(500 if _chain_fast() else 900)
@@ -852,7 +903,7 @@ def _wait_for_special_order_invoice_page_ready(page: Page, timeout_ms: int) -> b
             page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
-        if _rithum_empty_queue(page):
+        if _rithum_criteria_empty(page):
             return False
         try:
             if page.locator("input[name$='.invoicenumber.autofill']").count() > 0:
@@ -870,13 +921,15 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
     print("Depot Special Orders: opening Needs Invoicing queue...")
     _goto(page, SPECIAL_ORDER_QUICKINVOICE_URL)
     page.wait_for_timeout(250 if _chain_fast() else 500)
-    if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
-        return False
     if _wait_for_special_order_invoice_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         return True
 
     _goto(page, SPECIAL_ORDER_SUMMARY_URL)
     page.wait_for_timeout(300 if _chain_fast() else 600)
+    inv_count = _thdso_summary_queue_count(page, r"needs\s+invoicing")
+    if inv_count == 0:
+        _record_skip("Depot Special Orders invoicing", "Summary shows 0 needs invoicing")
+        return False
     needs_inv = page.locator(
         "a[href*='merchant=thdso'][href*='web_quickinvoice'], "
         "a[href*='gotoOrderRealmForm.do?action=web_quickinvoice'][href*='merchant=thdso']"
@@ -894,7 +947,9 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
         return False
 
     if not _wait_for_special_order_invoice_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
-        if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders invoicing", r"needs\s+invoicing"
+        ):
             return False
         _record_skip("Depot Special Orders invoicing", "Queue not ready")
         return False
@@ -1002,10 +1057,14 @@ def _fill_special_order_invoice_quantities(page: Page) -> int:
 
 
 def _process_depot_special_order_invoice_page(page: Page) -> bool:
-    if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
+    if _skip_if_special_order_empty(
+        page, "Depot Special Orders invoicing", r"needs\s+invoicing"
+    ):
         return False
     if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
-        if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
+        if _skip_if_special_order_empty(
+            page, "Depot Special Orders invoicing", r"needs\s+invoicing"
+        ):
             return False
         _record_skip("Depot Special Orders invoicing", "Timed out waiting for invoice page")
         return False
@@ -1040,7 +1099,7 @@ def _process_depot_special_order_invoice_page(page: Page) -> bool:
         except Exception:
             pass
         if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
-            if _rithum_empty_queue(page):
+            if _rithum_criteria_empty(page):
                 return False
             return False
         page.wait_for_timeout(500 if _chain_fast() else 900)

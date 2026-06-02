@@ -1,8 +1,10 @@
 """
 Detect CommerceHub / Rithum empty order queues across Depot, Lowe's, and Special Orders.
 
-Shows as div.fw_widget_windowtag_body:
-  "No order(s) found that match the supplied criteria."
+Authoritative signal: Transaction Request Notification widget
+  div.fw_widget_windowtag_body — "No order(s) found that match the supplied criteria."
+
+Do not treat summary/dashboard pages (no form fields yet) as empty — those are not empty queues.
 """
 
 from __future__ import annotations
@@ -16,21 +18,6 @@ from playwright.sync_api import Frame, Page
 NO_ORDERS_CRITERIA_RE = re.compile(
     r"no\s+orders?\s*\(?s?\)?\s*found.*(?:supplied\s+criteria|criteria)",
     re.I,
-)
-
-_EMPTY_BODY_PHRASES = (
-    "no order(s) found",
-    "match the supplied criteria",
-    "supplied criteria",
-    "no orders",
-    "0 orders",
-    "there are no orders",
-    "no open orders",
-    "no unacknowledged",
-    "no records",
-    "no results",
-    "0 record",
-    "did not match",
 )
 
 
@@ -53,8 +40,8 @@ def rithum_no_orders_criteria(root: Page | Frame) -> bool:
     return False
 
 
-def rithum_empty_queue(page: Page) -> bool:
-    """True when Rithum shows no orders to process on the current page."""
+def rithum_criteria_empty(page: Page) -> bool:
+    """True only when Rithum shows the explicit no-orders criteria notification."""
     for root in (page, *page.frames):
         try:
             if hasattr(root, "is_detached") and root.is_detached():
@@ -70,26 +57,14 @@ def rithum_empty_queue(page: Page) -> bool:
         return False
     if not body:
         return False
-    if any(p in body for p in _EMPTY_BODY_PHRASES):
+    if "no order(s) found" in body and "supplied criteria" in body:
         return True
-    try:
-        if (
-            page.locator("select[name*='.shippingmethod']").count() == 0
-            and page.locator("a[href*='gotoOrderDetail']").count() == 0
-            and page.locator("input[name*='.trackingnumber']").count() == 0
-            and page.locator("input[name$='.invoicenumber.autofill']").count() == 0
-            and page.locator("input[name*='.contactInfo']").count() == 0
-        ):
-            if "order" in body and (
-                "queue" in body
-                or "quickship" in body
-                or "quickinvoice" in body
-                or "quickack" in body
-            ):
-                return True
-    except Exception:
-        pass
-    return False
+    return bool(NO_ORDERS_CRITERIA_RE.search(body))
+
+
+def rithum_empty_queue(page: Page) -> bool:
+    """Alias for criteria-only empty detection (avoids false skips on summary pages)."""
+    return rithum_criteria_empty(page)
 
 
 def log_rithum_empty_skip(step: str) -> None:
@@ -104,7 +79,7 @@ def log_rithum_empty_skip(step: str) -> None:
 
 def skip_if_rithum_empty(page: Page, step: str) -> bool:
     """Return True when the step should be skipped because the queue is empty."""
-    if rithum_empty_queue(page):
+    if rithum_criteria_empty(page):
         log_rithum_empty_skip(step)
         return True
     return False
@@ -127,7 +102,7 @@ def wait_for_selector_or_empty(
     deadline = time.monotonic() + max(500, timeout_ms) / 1000.0
     loc = page.locator(selector)
     while time.monotonic() < deadline:
-        if rithum_empty_queue(page):
+        if rithum_criteria_empty(page):
             log_rithum_empty_skip(step)
             return "empty"
         try:
@@ -136,7 +111,7 @@ def wait_for_selector_or_empty(
         except Exception:
             pass
         page.wait_for_timeout(poll_ms)
-    if rithum_empty_queue(page):
+    if rithum_criteria_empty(page):
         log_rithum_empty_skip(step)
         return "empty"
     return "timeout"
