@@ -73,6 +73,18 @@ def main() -> int:
     cdp_url = f"http://127.0.0.1:{cdp_port}"
     step_errors: list[str] = []
 
+    from automation.workflow_run_report import (  # noqa: E402
+        log_and_record_skip,
+        print_final_summary,
+        record_error,
+        report_file_path,
+    )
+
+    if report_file_path() is None:
+        from automation.workflow_run_report import init_run_report
+
+        init_run_report(_HERE / ".workflow_run_report.jsonl")
+
     def _run_step(title: str, fn) -> None:
         try:
             fn()
@@ -80,6 +92,10 @@ def main() -> int:
             msg = f"{title}: {exc}"
             print(f"WARN: {msg}")
             step_errors.append(msg)
+            record_error(title, str(exc))
+
+    def _lane_skip(step: str, reason: str) -> None:
+        log_and_record_skip(step, reason)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -134,6 +150,7 @@ def main() -> int:
                 )
             else:
                 print("\n=== SPS inventory skipped ===")
+                _lane_skip("SPS inventory", "Disabled via --skip-inventory")
 
             if not args.skip_tracking:
                 if not args.skip_tractor:
@@ -168,6 +185,7 @@ def main() -> int:
                     )
             else:
                 print("\n=== SPS tracking skipped ===")
+                _lane_skip("SPS tracking", "Disabled via --skip-tracking")
 
             try:
                 context.storage_state(path=str(state_path))
@@ -178,10 +196,9 @@ def main() -> int:
             context.close()
             browser.close()
 
+    if os.environ.get("WORKFLOW_RUN_REPORT_SUPPRESS_SUMMARY") != "1":
+        print_final_summary(extra_errors=step_errors, success=not step_errors)
     if step_errors:
-        print("\nSPS lane completed with warnings:")
-        for err in step_errors:
-            print(f"  - {err}")
         return 1
     print("\nSPS lane complete.")
     return 0

@@ -105,6 +105,19 @@ def main() -> int:
         automation.load_csv_index()
         step_errors: list[str] = []
 
+        from automation.workflow_run_report import (  # noqa: E402
+            log_and_record_skip,
+            print_final_summary,
+            record_error,
+            record_skip,
+            report_file_path,
+        )
+
+        if report_file_path() is None:
+            from automation.workflow_run_report import init_run_report
+
+            init_run_report(_INVENTORY / ".workflow_run_report.jsonl")
+
         def _run_step(title: str, fn) -> None:
             try:
                 fn()
@@ -112,6 +125,10 @@ def main() -> int:
                 msg = f"{title}: {exc}"
                 print(f"WARN: {msg}")
                 step_errors.append(msg)
+                record_error(title, str(exc))
+
+        def _chain_skip(step: str, reason: str) -> None:
+            log_and_record_skip(step, reason)
 
         invoice_report_day: date | None = None
         if args.invoice_report_date:
@@ -152,6 +169,7 @@ def main() -> int:
 
                 if args.skip_inventory:
                     print("\n=== Rithum inventory skipped (--skip-inventory) ===")
+                    _chain_skip("Rithum inventory", "Disabled via --skip-inventory")
                 else:
                     print("\n=== Rithum inventory (Lowe's + Home Depot) ===")
                     _run_step(
@@ -161,6 +179,8 @@ def main() -> int:
 
                 if args.skip_depot:
                     print("\n=== Home Depot tracking/invoicing skipped (--skip-depot) ===")
+                    _chain_skip("Depot tracking", "Disabled via --skip-depot")
+                    _chain_skip("Depot invoicing", "Disabled via --skip-depot")
                 else:
                     print("\n=== Home Depot tracking ===")
                     _run_step("Depot tracking", lambda: run_depot_tracking_with_page(page))
@@ -170,6 +190,7 @@ def main() -> int:
 
                 if args.skip_lowes:
                     print("\n=== Lowe's workflows skipped (--skip-lowes) ===")
+                    _chain_skip("Lowe's workflows", "Disabled via --skip-lowes")
                 else:
                     print("\n=== Lowe's workflows (all) ===")
                     _run_step(
@@ -186,6 +207,7 @@ def main() -> int:
                     print(
                         "Depot Special Orders: skipped (Depot and Lowe's tracking both disabled)."
                     )
+                    _chain_skip("Depot Special Orders", "Disabled via --skip-depot and --skip-lowes")
                 else:
                     _run_step(
                         "Depot Special Orders",
@@ -202,11 +224,9 @@ def main() -> int:
 
         print("\nCommerceHub chain complete.")
         print(json.dumps(automation.stats, indent=2))
-        if step_errors:
-            print("\nCommerceHub completed with warnings:")
-            for err in step_errors:
-                print(f"  - {err}")
-        return 0
+        if os.environ.get("WORKFLOW_RUN_REPORT_SUPPRESS_SUMMARY") != "1":
+            print_final_summary(extra_errors=step_errors, success=not step_errors)
+        return 0 if not step_errors else 1
     except Exception as exc:
         print(f"CommerceHub chain error: {exc}")
         return 1

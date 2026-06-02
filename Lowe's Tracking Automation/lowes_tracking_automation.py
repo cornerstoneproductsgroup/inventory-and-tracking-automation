@@ -73,6 +73,22 @@ def _skip_if_rithum_empty(page: Page, step: str) -> bool:
         return False
 
 
+def _lowes_step_label(workflow_name: str) -> str:
+    w = (workflow_name or "").strip().strip("[]")
+    return f"Lowe's {w.replace('_', ' ')}"
+
+
+def _record_lowes_skip(workflow_name: str, reason: str) -> None:
+    step = _lowes_step_label(workflow_name)
+    _ensure_inventory_submissions_on_path()
+    try:
+        from automation.workflow_run_report import log_and_record_skip  # type: ignore
+
+        log_and_record_skip(step, reason)
+    except ImportError:
+        print(f"{step}: Skipped — {reason}", flush=True)
+
+
 def _login_probe_timeout_ms() -> int:
     ch = _commercehub_timeouts()
     if ch:
@@ -862,7 +878,7 @@ class LowesTrackingAutomation:
         if _fast:
             idle_sleep_seconds = min(idle_sleep_seconds, 1)
         po_row_timeout_ms = _lowes_po_row_timeout_ms()
-        step_label = f"[{workflow_name}]"
+        step_label = _lowes_step_label(workflow_name)
 
         while True:
             if _skip_if_rithum_empty(page, step_label):
@@ -873,7 +889,7 @@ class LowesTrackingAutomation:
             if outcome == "empty":
                 return
             if outcome != "ready":
-                print(f"[{workflow_name}] No order rows currently visible.")
+                _record_lowes_skip(workflow_name, "No order rows on page")
                 if run_until_queue_empty:
                     return
                 if do_submit and run_until_stopped:
@@ -989,7 +1005,7 @@ class LowesTrackingAutomation:
                 continue
 
             if do_submit and run_until_queue_empty:
-                print(f"[{workflow_name}] No orders filled this pass; exiting queue-empty mode.")
+                _record_lowes_skip(workflow_name, "No orders filled this pass")
                 return
 
             print(f"[{workflow_name}] Dry run mode: list values filled, submit skipped.")
@@ -1023,7 +1039,7 @@ class LowesTrackingAutomation:
         page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
         if _fast:
             page.wait_for_timeout(200)
-        step_label = f"[{workflow_name}]"
+        step_label = _lowes_step_label(workflow_name)
         if _skip_if_rithum_empty(page, step_label):
             return
 
@@ -1038,14 +1054,14 @@ class LowesTrackingAutomation:
             if outcome == "empty":
                 return
             if outcome != "ready":
-                print(f"[{workflow_name}] Invoice UI not found (select all). Done or wrong page.")
+                _record_lowes_skip(workflow_name, "Invoice UI not found")
                 return
 
             autofill_count = page.locator(autofill_sel).count()
             if autofill_count == 0:
                 if _skip_if_rithum_empty(page, step_label):
                     return
-                print(f"[{workflow_name}] No invoice Auto Fill buttons on page; invoicing queue empty.")
+                _record_lowes_skip(workflow_name, "No invoice Auto Fill buttons on page")
                 return
 
             print(

@@ -15,8 +15,8 @@ Use ``--sequential-lanes`` to run CommerceHub fully, then SPS. Invoice-only runs
 Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 --skip-depot, --skip-lowes, --skip-invoice-report.
 
-If any step fails (e.g. no invoices for a closed day), later phases still run; errors are
-summarized at the end.
+If any step fails (e.g. no invoices for a closed day), later phases still run. At the end,
+a WORKFLOW RUN SUMMARY lists skipped steps (e.g. empty Rithum queues) and all errors.
 Use --invoice-report-only to run only phase 0 (combine with --invoice-report-modes).
 Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
@@ -216,12 +216,46 @@ def resolve_invoice_report_python(invoice_dir: Path) -> tuple[list[str], str | N
     return [], err
 
 
+def _workflow_report_init() -> None:
+    if str(INVENTORY_DIR) not in sys.path:
+        sys.path.insert(0, str(INVENTORY_DIR))
+    try:
+        from automation.workflow_run_report import init_run_report
+
+        init_run_report(ROOT / ".workflow_run_report.jsonl")
+        os.environ["WORKFLOW_RUN_REPORT_SUPPRESS_SUMMARY"] = "1"
+    except ImportError:
+        pass
+
+
+def _workflow_report_finish(errors: list[str], *, success: bool) -> None:
+    if str(INVENTORY_DIR) not in sys.path:
+        sys.path.insert(0, str(INVENTORY_DIR))
+    try:
+        from automation.workflow_run_report import print_final_summary
+
+        print_final_summary(extra_errors=errors, success=success)
+    except ImportError:
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+        elif success:
+            print("\nAll workflow steps completed successfully.")
+
+
+def _finish_and_return(code: int, errors: list[str] | None = None) -> int:
+    errs = errors or []
+    _workflow_report_finish(errs, success=(code == 0 and not errs))
+    return code
+
+
 def run_step(title: str, cmd: list[str], cwd: Path) -> tuple[bool, str]:
     print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
     if not cwd.is_dir():
         return False, f"Working directory does not exist: {cwd}"
     try:
-        result = subprocess.run(cmd, cwd=str(cwd), check=False)
+        result = subprocess.run(cmd, cwd=str(cwd), check=False, env=os.environ.copy())
     except OSError as exc:
         return False, str(exc)
     if result.returncode != 0:
@@ -362,6 +396,14 @@ def _run_single(title: str, cmd: list[str], cwd: Path) -> list[str]:
         return []
     msg = f"{title}: {err_detail}"
     print(f"[ERROR] {msg}")
+    if str(INVENTORY_DIR) not in sys.path:
+        sys.path.insert(0, str(INVENTORY_DIR))
+    try:
+        from automation.workflow_run_report import record_error
+
+        record_error(title, err_detail)
+    except ImportError:
+        pass
     return [msg]
 
 
@@ -668,6 +710,8 @@ def main() -> int:
     else:
         print(f"Using project Python: {python_exe}")
 
+    _workflow_report_init()
+
     if pull_orders_only:
         pull_script = INVENTORY_DIR / "run_pull_orders.py"
         if not pull_script.is_file():
@@ -685,14 +729,11 @@ def main() -> int:
         pull_cmd = [python_exe, str(pull_script)]
         if args.invoice_report_date:
             pull_cmd.extend(["--date", args.invoice_report_date.strip()])
-        errors = _run_single("Pull Orders", pull_cmd, INVENTORY_DIR)
-        if errors:
-            print("\nCompleted with errors:")
-            for e in errors:
-                print(f"  - {e}")
-            return 1
+        pull_errors = _run_single("Pull Orders", pull_cmd, INVENTORY_DIR)
+        if pull_errors:
+            return _finish_and_return(1, pull_errors)
         print("\nPull orders completed successfully.")
-        return 0
+        return _finish_and_return(0)
 
     if fedex_batch_only:
         fedex_script = INVENTORY_DIR / "run_fedex_batch.py"
@@ -1016,14 +1057,7 @@ def main() -> int:
             )
         )
 
-    if errors:
-        print("\nCompleted with errors:")
-        for e in errors:
-            print(f"  - {e}")
-        return 1
-
-    print("\nAll workflow steps completed successfully.")
-    return 0
+    return _finish_and_return(1 if errors else 0, errors)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,15 @@ from automation.rithum_empty_queue import (  # noqa: E402
     skip_if_rithum_empty as _skip_if_rithum_empty,
 )
 
+
+def _record_skip(step: str, reason: str) -> None:
+    try:
+        from automation.workflow_run_report import log_and_record_skip
+
+        log_and_record_skip(step, reason)
+    except ImportError:
+        print(f"{step}: Skipped — {reason}", flush=True)
+
 ORDER_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
     "&tabContext=web_quickship&status=open&substatus=no-activity&merchant=thehomedepot"
@@ -172,9 +181,9 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
             if _rithum_empty_queue(page):
                 _log_rithum_empty_skip("Depot tracking")
             else:
-                print(
-                    f"Depot tracking: no ship list after retry and {int(_SHIP_LIST_TIMEOUT_MS / 1000)}s wait; "
-                    "moving on."
+                _record_skip(
+                    "Depot tracking",
+                    f"No ship list after {int(_SHIP_LIST_TIMEOUT_MS / 1000)}s wait",
                 )
             return False
 
@@ -184,7 +193,7 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
     po_links = page.locator("a[href*='gotoOrderDetail']")
     n = po_links.count()
     if n == 0:
-        print("Depot tracking: no PO rows on page; moving on.")
+        _record_skip("Depot tracking", "No PO rows on page")
         return False
 
     touched = False
@@ -266,7 +275,7 @@ def _process_depot_tracking_page(page: Page, tracking_dict: dict) -> bool:
             print(f"Depot tracking: error on PO row: {exc}")
 
     if matched_po_count == 0:
-        print("Depot tracking: loaded page has no PO matches in CSV; moving on to invoicing.")
+        _record_skip("Depot tracking", "No PO matches in tracking CSV")
         return False
 
     if not touched:
@@ -410,7 +419,7 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
         if summary_link.count() > 0:
             txt = (summary_link.inner_text() or "").strip()
             if txt.isdigit() and int(txt) == 0:
-                print("Depot Special Orders ack: summary shows 0 orders; skipping.")
+                _record_skip("Depot Special Orders ack", "Summary shows 0 orders")
                 return False
     except Exception:
         pass
@@ -422,7 +431,7 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
     if open_unack.count() == 0:
         open_unack = page.get_by_role("link", name=re.compile(r"open\s*/\s*unacknowledged", re.I)).first
     if open_unack.count() == 0:
-        print("Depot Special Orders ack: no Open/Unacknowledged link; skipping.")
+        _record_skip("Depot Special Orders ack", "No Open/Unacknowledged link")
         return False
     try:
         open_unack.click()
@@ -433,7 +442,7 @@ def _open_depot_special_order_quickack(page: Page) -> bool:
 
     if not _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         if not _skip_if_rithum_empty(page, "Depot Special Orders ack"):
-            print("Depot Special Orders ack: queue not ready; skipping.")
+            _record_skip("Depot Special Orders ack", "Queue not ready")
         return False
     return True
 
@@ -487,7 +496,7 @@ def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]
     if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
         if _skip_if_rithum_empty(page, "Depot Special Orders ack"):
             return False
-        print("Depot Special Orders ack: timed out waiting for order list; moving on.")
+        _record_skip("Depot Special Orders ack", "Timed out waiting for order list")
         return False
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -496,7 +505,7 @@ def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]
     skus_by_order = _group_vendor_skus_by_order(page)
     order_ids = _special_order_ack_order_ids(page)
     if not order_ids:
-        print("Depot Special Orders ack: no orders on page; moving on.")
+        _record_skip("Depot Special Orders ack", "No orders on page")
         return False
 
     touched = False
@@ -633,7 +642,7 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
         if summary_link.count() > 0:
             txt = (summary_link.inner_text() or "").strip()
             if txt.isdigit() and int(txt) == 0:
-                print("Depot Special Orders: summary shows 0 orders; skipping.")
+                _record_skip("Depot Special Orders tracking", "Summary shows 0 orders")
                 return False
     except Exception:
         pass
@@ -645,7 +654,7 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
     if open_accepted.count() == 0:
         open_accepted = page.get_by_role("link", name=re.compile(r"open\s*/\s*accepted", re.I)).first
     if open_accepted.count() == 0:
-        print("Depot Special Orders: no Open/Accepted link; skipping.")
+        _record_skip("Depot Special Orders tracking", "No Open/Accepted link")
         return False
     try:
         open_accepted.click()
@@ -656,7 +665,7 @@ def _open_depot_special_order_quickship(page: Page) -> bool:
 
     if not _wait_for_special_order_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         if not _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
-            print("Depot Special Orders tracking: queue not ready; skipping.")
+            _record_skip("Depot Special Orders tracking", "Queue not ready")
         return False
     return True
 
@@ -667,7 +676,7 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
     if not _wait_for_special_order_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
         if _skip_if_rithum_empty(page, "Depot Special Orders tracking"):
             return False
-        print("Depot Special Orders tracking: timed out waiting for order list; moving on.")
+        _record_skip("Depot Special Orders tracking", "Timed out waiting for order list")
         return False
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -676,7 +685,7 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
     po_links = page.locator("a.simple_link[href*='gotoOrderDetail'], a[href*='gotoOrderDetail']")
     n = po_links.count()
     if n == 0:
-        print("Depot Special Orders: no PO rows on page; moving on.")
+        _record_skip("Depot Special Orders tracking", "No PO rows on page")
         return False
 
     est_date = _special_order_estimated_delivery_date()
@@ -785,7 +794,7 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
             print(f"Depot Special Orders: error on PO {po!r}: {exc}")
 
     if matched_po_count == 0:
-        print("Depot Special Orders: no PO matches in CSV on this page; moving on.")
+        _record_skip("Depot Special Orders tracking", "No PO matches in tracking CSV")
         return False
 
     if not touched:
@@ -875,7 +884,7 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
     if needs_inv.count() == 0:
         needs_inv = page.get_by_role("link", name=re.compile(r"needs\s+invoicing", re.I)).first
     if needs_inv.count() == 0:
-        print("Depot Special Orders invoicing: no Needs Invoicing link; skipping.")
+        _record_skip("Depot Special Orders invoicing", "No Needs Invoicing link")
         return False
     try:
         needs_inv.click()
@@ -887,7 +896,7 @@ def _open_depot_special_order_quickinvoice(page: Page) -> bool:
     if not _wait_for_special_order_invoice_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
         if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
             return False
-        print("Depot Special Orders invoicing: queue not ready; skipping.")
+        _record_skip("Depot Special Orders invoicing", "Queue not ready")
         return False
     return True
 
@@ -998,7 +1007,7 @@ def _process_depot_special_order_invoice_page(page: Page) -> bool:
     if not _wait_for_special_order_invoice_page_ready(page, _INVOICE_AUTOFILL_TIMEOUT_MS):
         if _skip_if_rithum_empty(page, "Depot Special Orders invoicing"):
             return False
-        print("Depot Special Orders invoicing: timed out waiting for invoice page; moving on.")
+        _record_skip("Depot Special Orders invoicing", "Timed out waiting for invoice page")
         return False
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -1006,7 +1015,7 @@ def _process_depot_special_order_invoice_page(page: Page) -> bool:
 
     order_ids = _special_order_invoice_order_ids(page)
     if not order_ids:
-        print("Depot Special Orders invoicing: no orders on page; moving on.")
+        _record_skip("Depot Special Orders invoicing", "No orders on page")
         return False
 
     touched = False
@@ -1111,12 +1120,12 @@ def _process_depot_invoice_page(page: Page) -> bool:
             if _rithum_empty_queue(page):
                 _log_rithum_empty_skip("Depot invoicing")
             else:
-                print("Depot invoicing: no invoice rows or queue empty; moving on.")
+                _record_skip("Depot invoicing", "No invoice rows or queue empty")
             return False
 
     invoice_frame = _wait_invoice_form_frame(page, _INVOICE_AUTOFILL_TIMEOUT_MS)
     if invoice_frame is None:
-        print("Depot invoicing: no invoice rows or queue empty; moving on.")
+        _record_skip("Depot invoicing", "No invoice form controls found")
         return False
 
     page.wait_for_timeout(200 if _chain_fast() else 400)

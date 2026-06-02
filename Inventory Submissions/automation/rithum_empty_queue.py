@@ -93,9 +93,13 @@ def rithum_empty_queue(page: Page) -> bool:
 
 
 def log_rithum_empty_skip(step: str) -> None:
-    print(
-        f"{step}: no orders (Rithum: 'No order(s) found that match the supplied criteria'); moving on."
-    )
+    reason = "No orders found"
+    try:
+        from automation.workflow_run_report import log_and_record_skip
+
+        log_and_record_skip(step, reason)
+    except ImportError:
+        print(f"{step}: Skipped — {reason}", flush=True)
 
 
 def skip_if_rithum_empty(page: Page, step: str) -> bool:

@@ -102,6 +102,18 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _record_invoice_skip(step: str, reason: str) -> None:
+    try:
+        inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
+        if inv.is_dir() and str(inv) not in sys.path:
+            sys.path.insert(0, str(inv))
+        from automation.workflow_run_report import record_skip
+
+        record_skip(step, reason)
+    except Exception:
+        pass
+
+
 _MENU_KEYS = {"1": "all", "2": "depot", "3": "lowes", "4": "tractor", "5": "retail"}
 
 
@@ -677,6 +689,7 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _open_order_search(page)
     if await _search_results_empty(page):
         _log(f"Depot: no invoices for {report_day} (empty results already); skipping.")
+        _record_invoice_skip("Depot invoice report", "No invoices for report day")
         return None
     _default_saved = "Home Depot Invoice Batch Print by Date"
     if "COMMERCEHUB_SAVED_SEARCH_NAME" in os.environ:
@@ -686,11 +699,13 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _maybe_select_saved_search(page, saved_name)
     if await _search_results_empty(page):
         _log(f"Depot: no invoices for {report_day} — skipping export and print.")
+        _record_invoice_skip("Depot invoice report", "No invoices for report day")
         return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
     if await _search_results_empty(page):
         _log(f"Depot: no invoices for {report_day} — skipping export and print.")
+        _record_invoice_skip("Depot invoice report", "No invoices for report day")
         return None
     await _sort_by_po_number(page)
     path = await _export_excel(page, download_dir, local_filename_stem="commercehub_depot")
@@ -705,6 +720,7 @@ async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _open_order_search(page)
     if await _search_results_empty(page):
         _log(f"Lowe's: no invoices for {report_day} (empty results already); skipping.")
+        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
         return None
     await _open_lowes_saved_search(page)
     lowes_saved = (
@@ -714,11 +730,13 @@ async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _maybe_select_saved_search(page, lowes_saved)
     if await _search_results_empty(page):
         _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
+        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
         return None
     await _set_invoice_criteria(page, report_day)
     await _run_search(page)
     if await _search_results_empty(page):
         _log(f"Lowe's: no invoices for {report_day} — skipping export and print.")
+        _record_invoice_skip("Lowe's invoice report", "No invoices for report day")
         return None
     await _sort_by_po_number(page)
     path_l = await _export_excel(page, download_dir, local_filename_stem="commercehub_lowes")
