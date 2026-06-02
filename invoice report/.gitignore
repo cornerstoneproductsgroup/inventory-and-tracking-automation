@@ -6,3 +6,5 @@ __pycache__/
 playwright/.auth/
 debug_*.png
 commercehub_run.log
+amazon_seller_storage_state.json
+amazon_watcher.log

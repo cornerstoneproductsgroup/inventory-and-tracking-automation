@@ -22,7 +22,8 @@ Use --invoice-report-only to run only phase 0 (combine with --invoice-report-mod
 Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report day (Depot, Lowe's, Tractor).
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
-Use --worldship-import-only to run only UPS WorldShip Batch Import (through Import/Export Preview).
+Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
+Use --amazon-seller-download-only to download Amazon Deferred Transaction CSV to the Input share.
 
 Each Inventory Submissions step uses Inventory Submissions\\.venv when present.
 Invoice report picks the first interpreter that can import dotenv, playwright, and pandas:
@@ -415,6 +416,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--amazon-seller-download-only",
+        action="store_true",
+        help=(
+            "Run only Amazon Seller Central download: Deferred Transaction CSV to "
+            "Invoice Reports\\Amazon\\Input (previous day filename)."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -478,11 +487,20 @@ def main() -> int:
         parser.error("--fedex-batch-only cannot be combined with --worldship-import-only")
     if args.fedex_batch_only and args.pull_orders_only:
         parser.error("--fedex-batch-only cannot be combined with --pull-orders-only")
+    if args.amazon_seller_download_only and args.invoice_report_only:
+        parser.error("--amazon-seller-download-only cannot be combined with --invoice-report-only")
+    if args.amazon_seller_download_only and args.worldship_import_only:
+        parser.error("--amazon-seller-download-only cannot be combined with --worldship-import-only")
+    if args.amazon_seller_download_only and args.pull_orders_only:
+        parser.error("--amazon-seller-download-only cannot be combined with --pull-orders-only")
+    if args.amazon_seller_download_only and args.fedex_batch_only:
+        parser.error("--amazon-seller-download-only cannot be combined with --fedex-batch-only")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
     pull_orders_only = bool(args.pull_orders_only)
     worldship_import_only = bool(args.worldship_import_only)
     fedex_batch_only = bool(args.fedex_batch_only)
+    amazon_seller_download_only = bool(args.amazon_seller_download_only)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -599,6 +617,42 @@ def main() -> int:
                 print(f"  - {e}")
             return 1
         print("\nFedEx batch completed successfully.")
+        return 0
+
+    if amazon_seller_download_only:
+        invoice_report_dir, invoice_search_tried = discover_invoice_report_directory(args.invoice_report_dir)
+        amazon_script = invoice_report_dir / "run_amazon_seller_download.py"
+        if not amazon_script.is_file():
+            tried = "\n".join(f"  - {p}" for p in invoice_search_tried) if invoice_search_tried else ""
+            print(
+                f"\nERROR: Missing Amazon seller download script:\n  {amazon_script}\n"
+                f"Searched:\n{tried}\n"
+                "Update/pull invoice report folder and retry."
+            )
+            return 1
+        inv_py_parts, invoice_py_err = resolve_invoice_report_python(invoice_report_dir)
+        if invoice_py_err:
+            print(f"\n{invoice_py_err}")
+            return 1
+        if not inv_py_parts:
+            print("\nERROR: Could not resolve Python for Amazon seller download.")
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nAmazon Seller — Deferred Transaction CSV download\n"
+            + "=" * 60
+        )
+        amazon_cmd = [*inv_py_parts, str(amazon_script)]
+        if args.invoice_report_date:
+            amazon_cmd.extend(["--date", args.invoice_report_date.strip()])
+        errors = _run_single("Amazon Seller download", amazon_cmd, invoice_report_dir)
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nAmazon seller download step finished (may be on hold — see script output).")
         return 0
 
     if worldship_import_only:

@@ -1,0 +1,29 @@
+{
+  "browser": {
+    "headless": false,
+    "slow_mo_ms": 60,
+    "default_timeout_ms": 120000
+  },
+  "amazon": {
+    "login_url": "https://sellercentral.amazon.com/ap/signin",
+    "reports_url": "https://sellercentral.amazon.com/payments/reports-repository",
+    "report_type": "Deferred Transaction"
+  },
+  "selectors": {
+    "hamburger_menu": "button[aria-label*='menu' i], button[aria-label*='navigation' i], kat-button[aria-label*='menu' i], #sc-navbar-container button:has(svg), header button:has(path)",
+    "payments_menu_item": ".menu__button-item-label:has-text('Payments'), span.menu__button-item-label:has-text('Payments'), text=Payments",
+    "reports_repository_tab": "span[slot='label']:has-text('Reports Repository'), role=tab[name='Reports Repository'], text=Reports Repository",
+    "report_type_dropdown": ".select-header, [part='dropdown-header'], kat-dropdown .select-header",
+    "report_type_option": "text=Deferred Transaction, kat-option:has-text('Deferred Transaction'), [role='option']:has-text('Deferred Transaction')",
+    "request_report_button": "button:has-text('Request Report'), kat-button:has-text('Request Report'), text=Request Report",
+    "payments_report_row": "table tbody tr, kat-table-row, tr[data-testid*='report']",
+    "status_ready": "text=Ready",
+    "status_in_progress": "text=In Progress",
+    "download_csv": "text=Download CSV, button:has-text('Download CSV'), kat-button:has-text('Download CSV')",
+    "refresh_button": "button:has-text('Refresh'), text=Refresh",
+    "username_input": "#ap_email, input#ap_email[name='email'], input[type='email'][name='email']",
+    "password_input": "#ap_password, input#ap_password[name='password'], input[type='password'][name='password']",
+    "login_continue": "input#continue, button#continue, button:has-text('Continue')",
+    "login_submit": "input#signInSubmit, button#signInSubmit, button[type='submit']:has-text('Sign in')"
+  }
+}

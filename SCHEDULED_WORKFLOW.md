@@ -9,6 +9,8 @@ Runs a fixed sequence of automation steps on a daily schedule (default **5:00 AM
 3. **All Invoice Reports** — Depot, Lowe's, Tractor Supply (previous business day)  
 4. **All Inventories** — CommerceHub Rithum + SPS Tractor Supply (no tracking/invoicing)
 
+**On hold (not scheduled):** Amazon Seller CSV download — see `scheduled_workflow.json` → `_on_hold_steps` and `invoice report/AMAZON_SELLER_DOWNLOAD.md`.
+
 Later steps continue even if invoice reports fail (same as the full workflow). Pull Orders and FedEx Batch stop the chain on failure.
 
 ## Quick start

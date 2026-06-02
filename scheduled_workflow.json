@@ -46,6 +46,18 @@
       ]
     }
   ],
+  "_on_hold_steps": [
+    {
+      "id": "amazon_seller_download",
+      "label": "Amazon Seller — Deferred Transaction CSV to Input share",
+      "enabled": false,
+      "on_hold_reason": "Seller Central requires phone 2FA on every fresh Playwright session. Re-enable when manual OTP or persistent browser profile is wired up.",
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": ["--amazon-seller-download-only"],
+      "reenable": "Set AMAZON_SELLER_DOWNLOAD_ENABLED=true in invoice report/.env and move this block back into steps[]"
+    }
+  ],
   "_future_steps_examples": [
     {
       "id": "worldship_import",
