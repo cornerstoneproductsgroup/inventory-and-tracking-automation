@@ -17,7 +17,12 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from depot_tracking1 import MAX_SHIP_PAGES, TRACKING_CSV, load_tracking_csv  # noqa: E402
+from depot_tracking1 import (  # noqa: E402
+    MAX_SHIP_PAGES,
+    TRACKING_CSV,
+    load_tracking_csv,
+    lookup_po_tracking,
+)
 from home_depot_invoice import MAX_INVOICE_PAGES  # noqa: E402
 from automation.commercehub_timeouts import (  # noqa: E402
     chain_fast as _chain_fast,
@@ -293,17 +298,50 @@ def _special_order_estimated_delivery_date() -> str:
     return (date.today() + timedelta(days=5)).strftime("%m/%d/%Y")
 
 
+_PO_NUMBER_RE = re.compile(
+    r"PO\s*(?:Number|#)?\s*:?\s*([0-9]{1,4}[_\-\s]+[0-9]{5,}|[0-9]{8,})",
+    re.I,
+)
+
+
 def _lookup_special_order_tracking(tracking_dict: dict[str, str], po_raw: str) -> str | None:
-    po = (po_raw or "").strip()
-    if not po:
-        return None
-    candidates = {po, po.upper(), po.lower(), po.replace(" ", "")}
-    if po.isdigit():
-        candidates.add(po.zfill(9))
-    for key in candidates:
-        hit = tracking_dict.get(key)
-        if hit:
-            return hit
+    return lookup_po_tracking(tracking_dict, po_raw)
+
+
+def _po_text_from_order_link(page: Page, po_elem) -> str:
+    """PO as shown on thdso quickship (link text or PO Number: line in the order block)."""
+    po = (po_elem.inner_text() or "").strip()
+    if po and po.lower() not in ("detail", "view", "order"):
+        return po
+    for xpath in (
+        "xpath=ancestor::table[1]",
+        "xpath=ancestor::tr[1]",
+        "xpath=ancestor::div[contains(@class,'order')][1]",
+    ):
+        try:
+            block = po_elem.locator(xpath)
+            if block.count() == 0:
+                continue
+            text = block.first.inner_text(timeout=3_000) or ""
+            match = _PO_NUMBER_RE.search(text)
+            if match:
+                return match.group(1).strip()
+        except Exception:
+            continue
+    return po
+
+
+def _special_order_tracking_input(page: Page, order_id: str):
+    """thdso may use box(1) or a single order-level tracking field."""
+    for sel in (
+        f"input[name='order({order_id}).box(1).trackingnumber']",
+        f"input[id='order({order_id}).box(1).trackingnumber']",
+        f"input[name*='order({order_id})'][name*='trackingnumber']",
+        f"input[id*='order({order_id})'][id*='trackingnumber']",
+    ):
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            return loc.first
     return None
 
 
@@ -607,20 +645,22 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
     for i in range(n):
         po_elem = po_links.nth(i)
         try:
-            po = (po_elem.inner_text() or "").strip()
+            po = _po_text_from_order_link(page, po_elem)
             tracking = _lookup_special_order_tracking(tracking_dict, po)
             if not tracking:
+                print(f"Depot Special Orders: no CSV match for PO {po!r}; skipping.")
                 continue
             matched_po_count += 1
             href = po_elem.get_attribute("href") or ""
             if "Hub_PO=" not in href:
+                print(f"Depot Special Orders: PO {po!r} link has no Hub_PO; skipping.")
                 continue
             order_id = href.split("Hub_PO=")[-1].split("&")[0]
 
-            track_sel = f"[id='order({order_id}).box(1).trackingnumber']"
-            bol_sel = f"[id='order({order_id}).box(1).billOfLading']"
-            contact_sel = f"[id='order({order_id}).contactInfo']"
-            ship_sel = f"[id='order({order_id}).box(1).shippingmethod']"
+            track_input = _special_order_tracking_input(page, order_id)
+            bol_sel = f"input[name='order({order_id}).box(1).billOfLading'], input[id*='order({order_id})'][id*='billOfLading']"
+            contact_sel = f"input[name='order({order_id}).contactInfo'], input[id*='order({order_id}).contactInfo']"
+            ship_sel = f"select[name='order({order_id}).box(1).shippingmethod'], select[id*='order({order_id})'][id*='shippingmethod']"
 
             qty_inputs = page.locator(
                 f"input[name^='order({order_id}).box(1).item'][name$='.shipped']"
@@ -661,15 +701,31 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
                 contact.fill(SPECIAL_ORDER_CONTACT_NAME)
                 touched = True
 
-            if not _filled_input(page, track_sel):
-                page.locator(track_sel).fill("")
-                page.locator(track_sel).fill(tracking)
-                touched = True
+            if track_input is not None:
+                try:
+                    current = (track_input.input_value() or "").strip()
+                except Exception:
+                    current = ""
+                if not current:
+                    track_input.fill("")
+                    track_input.fill(tracking)
+                    touched = True
+                    print(f"Depot Special Orders: filled tracking for PO {po!r} → {tracking}")
+            else:
+                print(
+                    f"Depot Special Orders: WARN: no tracking field found for PO {po!r} "
+                    f"(order {order_id}); CSV had {tracking!r}."
+                )
 
-            if not _filled_input(page, bol_sel):
-                page.locator(bol_sel).fill("")
-                page.locator(bol_sel).fill(tracking)
-                touched = True
+            bol = page.locator(bol_sel).first
+            if bol.count() > 0:
+                try:
+                    if not (bol.input_value() or "").strip():
+                        bol.fill("")
+                        bol.fill(tracking)
+                        touched = True
+                except Exception:
+                    pass
 
             est_inputs = page.locator(
                 f"input[name^='order({order_id}).box(1).item'][name$='.estimatedDeliveryDate']"
@@ -722,6 +778,7 @@ def run_depot_special_order_tracking_with_page(
     if not tracking_dict:
         print(f"Depot Special Orders: no tracking rows loaded from {path}; skipping.")
         return
+    print(f"Depot Special Orders: loaded {len(tracking_dict)} tracking lookup key(s) from {path}")
 
     if not _open_depot_special_order_quickship(page):
         return

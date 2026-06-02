@@ -1,4 +1,5 @@
 
+import re
 import time
 import csv
 import os
@@ -28,6 +29,58 @@ def _norm_header(s):
 def _looks_like_ups_tracking(s):
     t = s.strip().upper().replace(" ", "")
     return len(t) >= 10 and t.startswith("1Z")
+
+
+def po_tracking_aliases(raw: str) -> set[str]:
+    """
+    Keys for matching CommerceHub PO text to CSV rows.
+    Handles 41_21549259 vs 41-21549259 vs 21549259 and spaces in store/PO.
+    """
+    text = (raw or "").strip()
+    out: set[str] = set()
+    if not text:
+        return out
+    out.add(text)
+    out.add(text.upper())
+    compact = re.sub(r"\s+", "", text)
+    if compact:
+        out.add(compact)
+    normalized = re.sub(r"[\s\-]+", "_", text.strip())
+    if normalized:
+        out.add(normalized)
+        out.add(normalized.replace("_", "-"))
+    match = re.match(r"^(\d{1,4})[_\-\s]+(\d{5,})$", text)
+    if match:
+        store, num = match.group(1), match.group(2)
+        out.add(f"{store}_{num}")
+        out.add(f"{store}-{num}")
+        out.add(num)
+        if num.isdigit():
+            out.add(num.zfill(9))
+    elif text.isdigit():
+        out.add(text.zfill(9))
+    digits = re.sub(r"\D", "", text)
+    if digits:
+        out.add(digits)
+        if len(digits) >= 9:
+            out.add(digits[-9:])
+    return {k for k in out if k}
+
+
+def register_po_tracking(tracking_dict: dict[str, str], po_raw: str, tracking: str) -> None:
+    track = (tracking or "").strip().split()[0]
+    if not track:
+        return
+    for key in po_tracking_aliases(po_raw):
+        tracking_dict[key] = track
+
+
+def lookup_po_tracking(tracking_dict: dict[str, str], po_raw: str) -> str | None:
+    for key in po_tracking_aliases(po_raw):
+        hit = tracking_dict.get(key)
+        if hit:
+            return hit
+    return None
 
 
 def _pick_po_field(fieldnames):
@@ -141,8 +194,7 @@ def load_tracking_csv(path):
         po_token = po_raw.split()[0]
         if not po_token:
             continue
-        po = po_token.zfill(9) if po_token.isdigit() else po_token
-        tracking_dict[po] = track_raw.split()[0]
+        register_po_tracking(tracking_dict, po_token, track_raw)
     return tracking_dict
 
 
