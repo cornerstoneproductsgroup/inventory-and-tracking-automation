@@ -35,6 +35,44 @@ def _chain_fast() -> bool:
     return os.environ.get("COMMERCEHUB_CHAIN_FAST") == "1"
 
 
+def _ensure_inventory_submissions_on_path() -> None:
+    inv = Path(__file__).resolve().parent.parent / "Inventory Submissions"
+    if inv.is_dir() and str(inv) not in sys.path:
+        sys.path.insert(0, str(inv))
+
+
+def _wait_rithum_work_or_empty(
+    page: Page,
+    selector: str,
+    step: str,
+    timeout_ms: int,
+) -> str:
+    """Return 'ready', 'empty', or 'timeout' (same as automation.rithum_empty_queue)."""
+    _ensure_inventory_submissions_on_path()
+    try:
+        from automation.rithum_empty_queue import wait_for_selector_or_empty  # type: ignore
+
+        return wait_for_selector_or_empty(
+            page, selector, step=step, timeout_ms=timeout_ms
+        )
+    except ImportError:
+        try:
+            page.locator(selector).first.wait_for(timeout=timeout_ms)
+            return "ready"
+        except Exception:
+            return "timeout"
+
+
+def _skip_if_rithum_empty(page: Page, step: str) -> bool:
+    _ensure_inventory_submissions_on_path()
+    try:
+        from automation.rithum_empty_queue import skip_if_rithum_empty  # type: ignore
+
+        return skip_if_rithum_empty(page, step)
+    except ImportError:
+        return False
+
+
 def _login_probe_timeout_ms() -> int:
     ch = _commercehub_timeouts()
     if ch:
@@ -816,17 +854,25 @@ class LowesTrackingAutomation:
         _fast = _chain_fast()
         if _fast:
             page.wait_for_timeout(200)
+        if _skip_if_rithum_empty(page, f"[{workflow_name}]"):
+            return
         run_until_stopped = bool(workflow_cfg.get("run_until_stopped", False))
         run_until_queue_empty = bool(workflow_cfg.get("run_until_queue_empty", False))
         idle_sleep_seconds = int(workflow_cfg.get("idle_sleep_seconds", 10))
         if _fast:
             idle_sleep_seconds = min(idle_sleep_seconds, 1)
         po_row_timeout_ms = _lowes_po_row_timeout_ms()
+        step_label = f"[{workflow_name}]"
 
         while True:
-            try:
-                page.locator(po_links_selector).first.wait_for(timeout=po_row_timeout_ms)
-            except Exception:
+            if _skip_if_rithum_empty(page, step_label):
+                return
+            outcome = _wait_rithum_work_or_empty(
+                page, po_links_selector, step_label, po_row_timeout_ms
+            )
+            if outcome == "empty":
+                return
+            if outcome != "ready":
                 print(f"[{workflow_name}] No order rows currently visible.")
                 if run_until_queue_empty:
                     return
@@ -928,6 +974,8 @@ class LowesTrackingAutomation:
                 print(f"[{workflow_name}] Submitted page with {processed_for_submit} order(s).")
                 if run_until_stopped or run_until_queue_empty:
                     page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+                    if _fast:
+                        page.wait_for_timeout(200)
                     continue
                 return
 
@@ -975,18 +1023,28 @@ class LowesTrackingAutomation:
         page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
         if _fast:
             page.wait_for_timeout(200)
+        step_label = f"[{workflow_name}]"
+        if _skip_if_rithum_empty(page, step_label):
+            return
 
         invoice_select_timeout_ms = _lowes_invoice_select_timeout_ms()
 
         while True:
-            try:
-                page.locator(select_all_sel).first.wait_for(timeout=invoice_select_timeout_ms)
-            except Exception:
+            if _skip_if_rithum_empty(page, step_label):
+                return
+            outcome = _wait_rithum_work_or_empty(
+                page, select_all_sel, step_label, invoice_select_timeout_ms
+            )
+            if outcome == "empty":
+                return
+            if outcome != "ready":
                 print(f"[{workflow_name}] Invoice UI not found (select all). Done or wrong page.")
                 return
 
             autofill_count = page.locator(autofill_sel).count()
             if autofill_count == 0:
+                if _skip_if_rithum_empty(page, step_label):
+                    return
                 print(f"[{workflow_name}] No invoice Auto Fill buttons on page; invoicing queue empty.")
                 return
 

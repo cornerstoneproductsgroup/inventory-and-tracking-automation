@@ -42,7 +42,8 @@ def depot_queue_probe_timeout_ms() -> int:
 
 def depot_invoice_ready_timeout_ms() -> int:
     """Poll until quickinvoice form is ready (exits early when loaded)."""
-    return ms("DEPOT_INVOICE_READY_TIMEOUT_MS", 240_000)
+    default = 45_000 if chain_fast() else 240_000
+    return ms("DEPOT_INVOICE_READY_TIMEOUT_MS", default)
 
 
 def rithum_ibl_timeout_ms() -> int:
