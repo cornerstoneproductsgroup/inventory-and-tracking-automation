@@ -17,20 +17,25 @@ from automation.pull_orders_config import (
     RETAILERS,
     csv_filename,
     merchant_column_to_key,
+    partner_text_to_key,
     pdf_filename,
 )
 
-# Exact CommerceHub control (see packing slips / order files table).
-DOWNLOAD_SPAN_SELECTOR = (
-    "span.download-dialog-info__element:has-text('Download'), "
-    "span.ch-icon-export.download-dialog-info__element:has-text('Download'), "
-    "span.chub-chui-chicon.ch-icon-export.download-dialog-info__element"
+# Row-scoped controls (avoid hidden dialog templates that also contain "Download").
+ROW_DOWNLOAD_SELECTORS = (
+    "a:has-text('Download')",
+    "span.download-dialog-info__element:has-text('Download')",
+    "span.ch-icon-export",
+    "span.chub-chui-chicon.ch-icon-export",
+    "input[type='button'][value*='ownload' i]",
+    "input[type='submit'][value*='ownload' i]",
 )
 
 # thdso before depot so "Home Depot Special Order" is not matched as depot.
 RETAILER_PULL_ORDER = ("thdso", "depot", "lowes")
 
 DOWNLOAD_TIMEOUT_MS = 120_000
+FILE_RESPONSE_TIMEOUT_MS = 90_000
 
 
 def _log(msg: str) -> None:
@@ -45,19 +50,58 @@ def _all_frames(page: Page) -> list[Frame | Page]:
     return frames
 
 
-def _resolve_table_frame(page: Page) -> Frame | Page:
-    """CommerceHub tables often live in an iframe — find the frame with Download controls."""
-    for fr in _all_frames(page):
+def _frame_score(fr: Frame | Page) -> int:
+    """Prefer the frame that has visible retailer table rows, not hidden dialog templates."""
+    score = 0
+    try:
+        rows = fr.locator("table tbody tr")
+        n = rows.count()
+    except Exception:
+        return 0
+    for i in range(n):
+        row = rows.nth(i)
         try:
-            count = fr.locator(DOWNLOAD_SPAN_SELECTOR).count()
+            if not row.is_visible():
+                continue
         except Exception:
             continue
-        if count > 0:
-            name = fr.url if hasattr(fr, "url") else "main"
-            _log(f"Using CommerceHub table frame ({count} Download control(s)): {name}")
-            return fr
-    _log("WARN: Download controls not found in any frame; using main page.")
-    return page
+        try:
+            text = row.inner_text(timeout=2_000)
+        except Exception:
+            text = ""
+        if partner_text_to_key(text):
+            score += 20
+        for sel in ROW_DOWNLOAD_SELECTORS:
+            try:
+                loc = row.locator(sel)
+                if loc.count() and loc.first.is_visible():
+                    score += 5
+                    break
+            except Exception:
+                continue
+    return score
+
+
+def _resolve_table_frame(page: Page) -> Frame | Page:
+    """CommerceHub tables often live in an iframe — pick the frame with real retailer rows."""
+    best: Frame | Page = page
+    best_score = _frame_score(page)
+    for fr in _all_frames(page):
+        if fr is page:
+            continue
+        try:
+            score = _frame_score(fr)
+        except Exception:
+            continue
+        if score > best_score:
+            best_score = score
+            best = fr
+    name = getattr(best, "url", "main")
+    if best_score > 0:
+        _log(f"Using CommerceHub table frame (score={best_score}): {name}")
+    else:
+        _log(f"WARN: no retailer rows scored; using main frame ({name}).")
+    return best
 
 
 def _goto_packslips(page: Page) -> Frame | Page:
@@ -92,17 +136,6 @@ def _wait_for_download_table(frame: Frame | Page) -> None:
     frame.wait_for_timeout(1500)
 
 
-def _row_matches_retailer(key: str, row_text: str) -> bool:
-    t = (row_text or "").lower()
-    if key == "thdso":
-        return "special" in t and "home depot" in t
-    if key == "lowes":
-        return "lowe" in t
-    if key == "depot":
-        return "home depot" in t and "special" not in t
-    return False
-
-
 def _retailer_row_locator(frame: Frame | Page, key: str):
     if key == "thdso":
         return frame.locator("tr").filter(has_text=re.compile(r"special\s+order", re.I))
@@ -113,30 +146,15 @@ def _retailer_row_locator(frame: Frame | Page, key: str):
     )
 
 
-def _download_button_in_row(row):
-    for sel in (
-        "span.download-dialog-info__element:has-text('Download')",
-        "span.ch-icon-export.download-dialog-info__element",
-        "span.chub-chui-chicon.ch-icon-export.download-dialog-info__element",
-    ):
-        loc = row.locator(sel)
-        if loc.count() > 0:
-            btn = loc.first
-            try:
-                if btn.is_visible():
-                    return btn
-            except Exception:
-                return btn
-    return None
-
-
-def _row_export_trigger(row):
-    """Table-row export icon (opens dialog); not the final Download label in the dialog."""
-    for sel in (
-        "span.ch-icon-export:not(.download-dialog-info__element)",
-        "span.chub-chui-chicon.ch-icon-export:not(.download-dialog-info__element)",
-        ".ch-icon-export:not(.download-dialog-info__element)",
-    ):
+def _row_click_target(row):
+    """Visible download/export control inside a retailer table row."""
+    try:
+        link = row.get_by_role("link", name=re.compile(r"download", re.I))
+        if link.count() and link.first.is_visible():
+            return link.first
+    except Exception:
+        pass
+    for sel in ROW_DOWNLOAD_SELECTORS:
         loc = row.locator(sel)
         if loc.count() == 0:
             continue
@@ -149,15 +167,18 @@ def _row_export_trigger(row):
     return None
 
 
-def _visible_dialog_download(page: Page):
-    """First visible Download / export-confirm control in any frame."""
-    for fr in _all_frames(page):
+def _visible_dialog_download(page: Page, frame: Frame | Page | None = None):
+    """Visible Download / export-confirm in page or table frame (not hidden templates)."""
+    roots: list[Frame | Page] = []
+    if frame is not None:
+        roots.append(frame)
+    roots.extend(fr for fr in _all_frames(page) if fr not in roots)
+    for fr in roots:
         for sel in (
             'input[data-test="form-export-button"]',
             "span.download-dialog-info__element:visible",
-            "span.download-dialog-info__element:has-text('Download')",
-            "button:has-text('Download')",
-            "a:has-text('Download')",
+            "a:visible:has-text('Download')",
+            "button:visible:has-text('Download')",
         ):
             try:
                 loc = fr.locator(sel)
@@ -174,142 +195,230 @@ def _visible_dialog_download(page: Page):
     return None
 
 
-def _find_retailer_download(frame: Frame | Page, key: str):
-    rows = _retailer_row_locator(frame, key)
-    n = rows.count()
-    if n == 0:
-        return None, None
-    for i in range(n):
+def _log_table_scan(frame: Frame | Page) -> None:
+    try:
+        rows = frame.locator("table tbody tr")
+        n = rows.count()
+    except Exception:
+        n = 0
+    _log(f"Table scan: {n} tbody row(s) in selected frame.")
+    for i in range(min(n, 8)):
         row = rows.nth(i)
+        try:
+            vis = row.is_visible()
+            text = (row.inner_text(timeout=2_000) or "").replace("\n", " ")[:100]
+            key = partner_text_to_key(text)
+            has_btn = _row_click_target(row) is not None
+            _log(f"  row {i}: visible={vis} partner={key!r} control={has_btn} text={text!r}")
+        except Exception as exc:
+            _log(f"  row {i}: could not read ({exc})")
+
+
+def _iter_retailer_downloads(frame: Frame | Page):
+    """Yield (retailer_key, row, click_target) from visible table rows."""
+    seen: set[str] = set()
+    _log_table_scan(frame)
+
+    try:
+        body_rows = frame.locator("table tbody tr")
+        n = body_rows.count()
+    except Exception:
+        n = 0
+
+    for i in range(n):
+        row = body_rows.nth(i)
         try:
             if not row.is_visible():
                 continue
         except Exception:
             continue
-        btn = _download_button_in_row(row)
-        if btn is not None:
-            return row, btn
-    return None, None
-
-
-def _iter_retailer_downloads(frame: Frame | Page):
-    """Yield (retailer_key, row, download_control) for each retailer with a visible control."""
-    seen: set[str] = set()
-    # Prefer scanning visible Download controls and mapping rows by text (matches "3 Download" UI).
-    try:
-        buttons = frame.locator(DOWNLOAD_SPAN_SELECTOR)
-        n = buttons.count()
-    except Exception:
-        n = 0
-    if n > 0:
-        for i in range(n):
-            btn = buttons.nth(i)
-            try:
-                if not btn.is_visible():
-                    continue
-            except Exception:
-                continue
-            row = btn.locator("xpath=ancestor::tr[1]")
-            if row.count() == 0:
-                continue
-            try:
-                row_text = row.first.inner_text(timeout=5_000)
-            except Exception:
-                row_text = ""
-            key = None
-            for candidate in RETAILER_PULL_ORDER:
-                if candidate in seen:
-                    continue
-                if _row_matches_retailer(candidate, row_text):
-                    key = candidate
-                    break
-            if key is None:
-                continue
-            seen.add(key)
-            _log(f"Ready to download for {RETAILERS[key].label} (row match).")
-            yield key, row.first, btn
+        try:
+            row_text = row.inner_text(timeout=5_000)
+        except Exception:
+            continue
+        key = partner_text_to_key(row_text)
+        if not key or key not in RETAILER_PULL_ORDER or key in seen:
+            continue
+        target = _row_click_target(row)
+        if target is None:
+            _log(f"WARN: row for {RETAILERS[key].label} has no visible download control.")
+            continue
+        seen.add(key)
+        _log(f"Ready to download for {RETAILERS[key].label}.")
+        yield key, row, target
 
     for key in RETAILER_PULL_ORDER:
         if key in seen:
             continue
-        row, btn = _find_retailer_download(frame, key)
-        if btn is None:
-            _log(f"No Download button found for {RETAILERS[key].label}.")
-            continue
-        _log(f"Ready to download for {RETAILERS[key].label}.")
-        yield key, row, btn
-
-
-def _click_download(page: Page, row, download_btn) -> object:
-    """Start a CommerceHub file download (direct click or export dialog + Download)."""
-    download_btn.scroll_into_view_if_needed(timeout=10_000)
-    page.wait_for_timeout(250)
-
-    def _try_direct_click() -> object | None:
-        try:
-            with page.expect_download(timeout=45_000) as dl_info:
-                download_btn.click(timeout=15_000)
-            return dl_info.value
-        except PlaywrightTimeout:
-            return None
-
-    got = _try_direct_click()
-    if got is not None:
-        return got
-
-    export = _row_export_trigger(row) if row is not None else None
-    if export is not None:
-        _log("Opening export dialog from row icon…")
-        export.click(timeout=15_000)
-        page.wait_for_timeout(900)
-        dialog_dl = _visible_dialog_download(page)
-        if dialog_dl is not None:
+        rows = _retailer_row_locator(frame, key)
+        for i in range(rows.count()):
+            row = rows.nth(i)
             try:
-                with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-                    dialog_dl.click(timeout=15_000)
-                return dl_info.value
-            except PlaywrightTimeout:
-                pass
-
-    _log("Retrying Download with dialog / popup handling…")
-    try:
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-            download_btn.click(timeout=15_000, force=True)
-            page.wait_for_timeout(700)
-            dialog_dl = _visible_dialog_download(page)
-            if dialog_dl is not None:
-                dialog_dl.click(timeout=15_000, force=True)
-            else:
-                try:
-                    with page.expect_popup(timeout=12_000) as pop_info:
-                        download_btn.click(timeout=10_000, force=True)
-                    popup = pop_info.value
-                    popup.wait_for_load_state("domcontentloaded", timeout=60_000)
-                    for sel in (
-                        'input[data-test="form-export-button"]',
-                        "span.download-dialog-info__element:has-text('Download')",
-                        "button:has-text('Download')",
-                    ):
-                        btn = popup.locator(sel).first
-                        if btn.count() and btn.is_visible():
-                            btn.click(timeout=30_000)
-                            break
-                except PlaywrightTimeout:
-                    pass
-        return dl_info.value
-    except PlaywrightTimeout as exc:
-        raise PlaywrightTimeout(
-            "CommerceHub download did not start after clicking Download "
-            "(tried direct click, export dialog, and popup)."
-        ) from exc
+                if not row.is_visible():
+                    continue
+            except Exception:
+                continue
+            target = _row_click_target(row)
+            if target is None:
+                continue
+            seen.add(key)
+            _log(f"Ready to download for {RETAILERS[key].label} (fallback row filter).")
+            yield key, row, target
+            break
+        if key not in seen:
+            _log(f"No Download control found for {RETAILERS[key].label}.")
 
 
-def _save_download(download, dest: Path) -> Path:
+def _is_file_response(response) -> bool:
+    if response.status not in (200, 206):
+        return False
+    cd = (response.headers.get("content-disposition") or "").lower()
+    if "attachment" in cd or "filename=" in cd:
+        return True
+    ct = (response.headers.get("content-type") or "").lower()
+    if any(token in ct for token in ("pdf", "octet-stream", "csv", "text/plain")):
+        return True
+    url = (response.url or "").lower()
+    return any(url.endswith(ext) for ext in (".pdf", ".csv", ".neworders", ".zip"))
+
+
+def _filename_from_response(response) -> str:
+    cd = response.headers.get("content-disposition") or ""
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\n]+)', cd, re.I)
+    if match:
+        return match.group(1).strip().strip('"')
+    url = response.url or ""
+    name = url.rsplit("/", 1)[-1].split("?", 1)[0]
+    return name or "download.bin"
+
+
+def _save_response_body(response, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(response.body())
+    if not dest.is_file() or dest.stat().st_size < 100:
+        raise RuntimeError(f"HTTP response did not save a valid file: {dest}")
+    return dest
+
+
+def _save_download_object(download, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     download.save_as(str(dest))
     if not dest.is_file() or dest.stat().st_size < 100:
         raise RuntimeError(f"Download did not save a valid file: {dest}")
     return dest
+
+
+def _try_native_save_as(dest: Path) -> bool:
+    try:
+        from automation.windows_save_as import fill_save_as_dialog
+    except ImportError:
+        return False
+    return bool(fill_save_as_dialog(dest, timeout_s=25))
+
+
+def _perform_click(target) -> None:
+    target.scroll_into_view_if_needed(timeout=10_000)
+    try:
+        target.click(timeout=15_000)
+        return
+    except Exception:
+        pass
+    try:
+        target.click(timeout=15_000, force=True)
+        return
+    except Exception:
+        pass
+    target.evaluate(
+        """el => {
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            if (typeof el.click === 'function') el.click();
+        }"""
+    )
+
+
+def _click_row_and_capture(page: Page, frame: Frame | Page, row, target, dest: Path):
+    """Click row download control; return Playwright Download or save via HTTP / Save As."""
+
+    def _click_target() -> None:
+        _perform_click(target)
+
+    def _click_dialog_if_open() -> None:
+        dialog = _visible_dialog_download(page, frame)
+        if dialog is not None:
+            _perform_click(dialog)
+
+    # 1) Direct click → browser download event
+    try:
+        with page.expect_download(timeout=45_000) as dl_info:
+            _click_target()
+        return _save_download_object(dl_info.value, dest)
+    except PlaywrightTimeout:
+        pass
+
+    # 2) Click opens dialog → confirm Download
+    _click_target()
+    page.wait_for_timeout(900)
+    dialog = _visible_dialog_download(page, frame)
+    if dialog is not None:
+        _log("Confirming export dialog Download…")
+        try:
+            with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+                _perform_click(dialog)
+            return _save_download_object(dl_info.value, dest)
+        except PlaywrightTimeout:
+            pass
+
+    # 3) HTTP response with file body (common on older CommerceHub pages)
+    try:
+        with page.expect_response(_is_file_response, timeout=FILE_RESPONSE_TIMEOUT_MS) as resp_info:
+            _click_target()
+            _click_dialog_if_open()
+        resp = resp_info.value
+        suggested = _filename_from_response(resp)
+        out = dest
+        if suggested and "." in suggested:
+            out = dest.with_name(suggested)
+        _log(f"Saved from HTTP response ({resp.status}): {out.name}")
+        return _save_response_body(resp, out)
+    except PlaywrightTimeout:
+        pass
+
+    # 4) Popup window (invoice-export style)
+    try:
+        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+            with page.expect_popup(timeout=12_000) as pop_info:
+                _click_target()
+            popup = pop_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=60_000)
+            for sel in (
+                'input[data-test="form-export-button"]',
+                "span.download-dialog-info__element:has-text('Download')",
+                "a:has-text('Download')",
+            ):
+                btn = popup.locator(sel).first
+                if btn.count() and btn.is_visible():
+                    btn.click(timeout=30_000)
+                    break
+        return _save_download_object(dl_info.value, dest)
+    except PlaywrightTimeout:
+        pass
+
+    # 5) Native Windows Save As
+    _click_target()
+    page.wait_for_timeout(600)
+    _click_dialog_if_open()
+    page.wait_for_timeout(800)
+    if _try_native_save_as(dest):
+        _log(f"Saved via Windows Save As dialog: {dest.name}")
+        return dest
+
+    raise PlaywrightTimeout(
+        "CommerceHub file did not download (tried browser download, dialog, HTTP response, popup, Save As)."
+    )
+
+
+def _download_retailer_file(page: Page, frame: Frame | Page, row, target, dest: Path) -> Path:
+    return _click_row_and_capture(page, frame, row, target, dest)
 
 
 def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
@@ -325,14 +434,13 @@ def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None
     saved: list[Path] = []
     found_keys: set[str] = set()
 
-    for key, row, download_btn in _iter_retailer_downloads(frame):
+    for key, row, click_target in _iter_retailer_downloads(frame):
         found_keys.add(key)
         cfg = RETAILERS[key]
         dest = cfg.pdf_dir / pdf_filename(cfg.label, order_date)
         _log(f"Downloading packing slip for {cfg.label} → {dest}")
         try:
-            download = _click_download(page, row, download_btn)
-            path = _save_download(download, dest)
+            path = _download_retailer_file(page, frame, row, click_target, dest)
             saved.append(path)
             _log(f"Saved {path.name} ({path.stat().st_size:,} bytes)")
         except PlaywrightTimeout:
@@ -388,16 +496,15 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
     saved: list[Path] = []
     found_keys: set[str] = set()
 
-    for key, row, download_btn in _iter_retailer_downloads(frame):
+    for key, row, click_target in _iter_retailer_downloads(frame):
         found_keys.add(key)
         cfg = RETAILERS[key]
         _log(f"Downloading order CSV for {cfg.label}")
         try:
-            download = _click_download(page, row, download_btn)
             with tempfile.TemporaryDirectory() as tmp:
-                raw_name = download.suggested_filename or "order.neworders"
-                raw_path = Path(tmp) / raw_name
-                download.save_as(str(raw_path))
+                raw_path = Path(tmp) / "order.neworders"
+                saved_path = _download_retailer_file(page, frame, row, click_target, raw_path)
+                raw_path = saved_path
                 csv_path = _neworders_to_csv(raw_path)
                 detected = _read_csv_merchant_key(csv_path)
                 if detected and detected != key:
@@ -430,8 +537,19 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
     return saved
 
 
+def _accept_js_dialogs(page: Page) -> None:
+    def _handler(dialog) -> None:
+        try:
+            dialog.accept()
+        except Exception:
+            pass
+
+    page.on("dialog", _handler)
+
+
 def pull_commercehub_all(page: Page, *, order_date: date | None = None) -> tuple[list[Path], list[Path]]:
     """Packing slips first, then order CSV files."""
+    _accept_js_dialogs(page)
     pdfs = pull_commercehub_packing_slips(page, order_date=order_date)
     page.goto(COMMERCEHUB_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(500)

@@ -37,6 +37,10 @@ INVOICE_URL = (
     "&tabContext=web_quickinvoice&merchant=thehomedepot"
 )
 SPECIAL_ORDER_SUMMARY_URL = "https://dsm.commercehub.com/dsm/gotoOpenOrders.do?PID=thdso"
+SPECIAL_ORDER_QUICKACK_URL = (
+    "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickack"
+    "&tabContext=web_quickack&status=open&substatus=unacknowledged&merchant=thdso"
+)
 SPECIAL_ORDER_QUICKSHIP_URL = (
     "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship"
     "&tabContext=web_quickship&status=open&substatus=accepted&merchant=thdso"
@@ -303,6 +307,222 @@ def _lookup_special_order_tracking(tracking_dict: dict[str, str], po_raw: str) -
     return None
 
 
+def _wait_for_special_order_ack_page_ready(page: Page, timeout_ms: int) -> bool:
+    deadline = time.monotonic() + max(1000, timeout_ms) / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass
+        try:
+            if page.locator("td.or_sku[id*='vendorSku'], td[id*='vendorSku']").count() > 0:
+                return True
+            if page.locator("input[name*='.contactInfo']").count() > 0:
+                return True
+            body = (page.inner_text("body") or "").lower()
+            if "special orders" in body and "no orders" in body:
+                return False
+        except Exception:
+            pass
+        page.wait_for_timeout(_POLL_MS)
+    return False
+
+
+def _open_depot_special_order_quickack(page: Page) -> bool:
+    """Navigate to thdso Open/Unacknowledged quickack. Returns False when queue is empty."""
+    print("Depot Special Orders: opening Open/Unacknowledged acknowledgment queue...")
+    _goto(page, SPECIAL_ORDER_QUICKACK_URL)
+    page.wait_for_timeout(250 if _chain_fast() else 500)
+    if _wait_for_special_order_ack_page_ready(page, _QUEUE_PROBE_TIMEOUT_MS):
+        return True
+
+    _goto(page, SPECIAL_ORDER_SUMMARY_URL)
+    page.wait_for_timeout(300 if _chain_fast() else 600)
+    summary_link = page.locator("a[href*='gotoOpenOrders.do?PID=thdso']").first
+    try:
+        if summary_link.count() > 0:
+            txt = (summary_link.inner_text() or "").strip()
+            if txt.isdigit() and int(txt) == 0:
+                print("Depot Special Orders ack: summary shows 0 orders; skipping.")
+                return False
+    except Exception:
+        pass
+
+    open_unack = page.locator(
+        "a[href*='merchant=thdso'][href*='web_quickack'], "
+        "a[href*='merchant=thdso'][href*='substatus=unacknowledged']"
+    ).filter(has_text=re.compile(r"open\s*/\s*unacknowledged", re.I)).first
+    if open_unack.count() == 0:
+        open_unack = page.get_by_role("link", name=re.compile(r"open\s*/\s*unacknowledged", re.I)).first
+    if open_unack.count() == 0:
+        print("Depot Special Orders ack: no Open/Unacknowledged link; skipping.")
+        return False
+    try:
+        open_unack.click()
+        page.wait_for_load_state("domcontentloaded")
+    except Exception as exc:
+        print(f"Depot Special Orders ack: could not open queue ({exc}); skipping.")
+        return False
+
+    if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+        print("Depot Special Orders ack: queue empty or not ready; skipping.")
+        return False
+    return True
+
+
+def _parse_order_id_from_token(token: str) -> str | None:
+    match = re.search(r"order\((\d+)\)", token or "")
+    return match.group(1) if match else None
+
+
+def _group_vendor_skus_by_order(page: Page) -> dict[str, list[str]]:
+    by_order: dict[str, list[str]] = {}
+    cells = page.locator("td.or_sku[id*='vendorSku'], td[id*='.vendorSku']")
+    for i in range(cells.count()):
+        cell = cells.nth(i)
+        cell_id = cell.get_attribute("id") or ""
+        order_id = _parse_order_id_from_token(cell_id)
+        if not order_id:
+            continue
+        sku = (cell.inner_text() or "").strip()
+        if not sku:
+            continue
+        bucket = by_order.setdefault(order_id, [])
+        if sku not in bucket:
+            bucket.append(sku)
+    return by_order
+
+
+def _special_order_ack_order_ids(page: Page) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for sku_order in _group_vendor_skus_by_order(page):
+        if sku_order not in seen:
+            seen.add(sku_order)
+            ids.append(sku_order)
+    for sel in ("input[name*='.contactInfo']", "input[id*='contactInfo']"):
+        loc = page.locator(sel)
+        for i in range(loc.count()):
+            token = (loc.nth(i).get_attribute("name") or loc.nth(i).get_attribute("id") or "").strip()
+            order_id = _parse_order_id_from_token(token)
+            if order_id and order_id not in seen:
+                seen.add(order_id)
+                ids.append(order_id)
+    return ids
+
+
+def _process_depot_special_order_ack_page(page: Page, vendor_map: dict[str, str]) -> bool:
+    from automation.worldship_vendor_map import is_sku_in_vendor_map
+
+    if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+        print("Depot Special Orders ack: timed out waiting for order list; moving on.")
+        return False
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(SCROLL_WAIT_MS)
+
+    skus_by_order = _group_vendor_skus_by_order(page)
+    order_ids = _special_order_ack_order_ids(page)
+    if not order_ids:
+        print("Depot Special Orders ack: no orders on page; moving on.")
+        return False
+
+    touched = False
+    ack_count = 0
+    skip_count = 0
+
+    for order_id in order_ids:
+        skus = skus_by_order.get(order_id, [])
+        if not skus:
+            print(f"Depot Special Orders ack: order {order_id} has no vendor SKU cells; skipping.")
+            skip_count += 1
+            continue
+        if not any(is_sku_in_vendor_map(sku, vendor_map) for sku in skus):
+            print(
+                f"Depot Special Orders ack: order {order_id} SKU(s) {skus!r} not in vendor map; skipping."
+            )
+            skip_count += 1
+            continue
+
+        contact_sel = (
+            f"input[name='order({order_id}).contactInfo'], "
+            f"input[id*='order({order_id}).contactInfo']"
+        )
+        contact = page.locator(contact_sel).first
+        if contact.count() == 0:
+            print(f"Depot Special Orders ack: no Supplier Contact field for order {order_id}; skipping.")
+            skip_count += 1
+            continue
+
+        if not _filled_input(page, contact_sel):
+            contact.fill("")
+            contact.fill(SPECIAL_ORDER_CONTACT_NAME)
+            touched = True
+        ack_count += 1
+
+        checkbox = page.locator(
+            f"input[type='checkbox'][name='order({order_id})'], "
+            f"input[type='checkbox'][id*='order({order_id})']"
+        ).first
+        try:
+            if checkbox.count() > 0 and not checkbox.is_checked():
+                checkbox.check()
+                touched = True
+        except Exception:
+            pass
+
+    if ack_count == 0:
+        print("Depot Special Orders ack: no orders matched vendor SKUs on this page.")
+        return False
+
+    if not touched:
+        print("Depot Special Orders ack: matched orders already filled; submitting batch...")
+    else:
+        print(f"Depot Special Orders ack: submitting {ack_count} order(s) ({skip_count} skipped)...")
+
+    try:
+        page.locator("#confirmbtn, input#confirmbtn[name='confirmbtn']").first.click(
+            no_wait_after=True, timeout=120_000
+        )
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=120_000)
+        except Exception:
+            pass
+        if not _wait_for_special_order_ack_page_ready(page, _SHIP_LIST_TIMEOUT_MS):
+            # After submit the page may switch to tracking/empty — that is OK.
+            body = (page.inner_text("body") or "").lower()
+            if "no orders" in body:
+                return False
+        page.wait_for_timeout(500 if _chain_fast() else 900)
+        return True
+    except Exception as exc:
+        print(f"Depot Special Orders ack: submit failed: {exc}")
+        return False
+
+
+def run_depot_special_order_acknowledgment_with_page(page: Page) -> None:
+    """Acknowledge thdso orders whose vendor SKU is in our vendor map (contact name Joey)."""
+    try:
+        from automation.worldship_vendor_map import load_vendor_map
+
+        vendor_map = load_vendor_map(retailer_key="thdso")
+    except Exception as exc:
+        print(f"Depot Special Orders ack: could not load vendor map ({exc}); skipping.")
+        return
+
+    if not _open_depot_special_order_quickack(page):
+        return
+
+    for batch in range(1, MAX_SHIP_PAGES + 1):
+        if not _process_depot_special_order_ack_page(page, vendor_map):
+            print("Depot Special Orders ack: finished.")
+            break
+        print(f"Depot Special Orders ack: submitted batch {batch}.")
+        page.wait_for_timeout(POST_SUBMIT_MS)
+    else:
+        print(f"Depot Special Orders ack: stopped after {MAX_SHIP_PAGES} batches (safety cap).")
+
+
 def _wait_for_special_order_page_ready(page: Page, timeout_ms: int) -> bool:
     deadline = time.monotonic() + max(1000, timeout_ms) / 1000.0
     while time.monotonic() < deadline:
@@ -494,7 +714,9 @@ def _process_depot_special_order_page(page: Page, tracking_dict: dict[str, str])
 def run_depot_special_order_tracking_with_page(
     page: Page, tracking_csv_path: str | None = None
 ) -> None:
-    """Home Depot Special Orders (thdso): tracking only; skips quietly when queue is empty."""
+    """Home Depot Special Orders (thdso): acknowledge unacknowledged, then Open/Accepted tracking."""
+    run_depot_special_order_acknowledgment_with_page(page)
+
     path = tracking_csv_path or TRACKING_CSV
     tracking_dict = load_tracking_csv(str(path))
     if not tracking_dict:

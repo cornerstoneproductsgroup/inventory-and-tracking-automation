@@ -172,6 +172,19 @@ def load_vendor_map(path: Path | None = None, *, retailer_key: str | None = None
     return mapping
 
 
+def is_sku_in_vendor_map(sku: str, mapping: dict[str, str]) -> bool:
+    """True when SKU matches the vendor map (exact or longest-prefix match)."""
+    key = (sku or "").strip().upper()
+    if not key:
+        return False
+    if key in mapping:
+        return True
+    for prefix in sorted(mapping, key=len, reverse=True):
+        if key.startswith(prefix):
+            return True
+    return False
+
+
 def lookup_vendor_folder(sku: str, mapping: dict[str, str]) -> str:
     key = (sku or "").strip().upper()
     if not key:

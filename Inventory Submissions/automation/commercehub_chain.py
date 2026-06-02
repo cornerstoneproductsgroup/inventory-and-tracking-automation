@@ -6,7 +6,7 @@ One Playwright browser session for CommerceHub (Rithum):
 3. Home Depot quickship tracking (UPS CSV).
 4. Home Depot quickinvoice.
 5. Lowe's workflows from config (ship to store, ship to customer, invoice).
-6. Home Depot Special Orders tracking + invoicing (thdso; skips when queue empty).
+6. Home Depot Special Orders acknowledgment (thdso SKUs in vendor map), tracking + invoicing.
 
 SPS / Tractor Supply is a different site — run separately (e.g. run_full_workflow.py).
 """
@@ -142,14 +142,14 @@ def main() -> int:
                         ),
                     )
 
-                print("\n=== Home Depot Special Orders tracking ===")
+                print("\n=== Home Depot Special Orders (acknowledge, track, invoice) ===")
                 if args.skip_depot and args.skip_lowes:
                     print(
                         "Depot Special Orders: skipped (Depot and Lowe's tracking both disabled)."
                     )
                 else:
                     _run_step(
-                        "Depot Special Orders tracking",
+                        "Depot Special Orders",
                         lambda: run_depot_special_order_tracking_with_page(page),
                     )
                     print("\n=== Home Depot Special Orders invoicing ===")
