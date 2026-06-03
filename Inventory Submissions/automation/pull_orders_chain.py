@@ -72,7 +72,7 @@ def run_pull_orders(
     skip_warehouse_print: bool = False,
     skip_warehouse_wait: bool = False,
 ) -> int:
-    from automation.pull_orders_commercehub import pull_commercehub_all
+    from automation.pull_orders_commercehub import login_commercehub_for_pull, pull_commercehub_all
     from automation.pull_orders_sps import pull_sps_all
     from automation.pull_orders_warehouse_print import print_warehouse_files, settle_after_downloads
     from run_sps_tracking import DEFAULT_STORAGE_STATE, ensure_sps_session
@@ -89,7 +89,7 @@ def run_pull_orders(
                 context.set_default_timeout(120_000)
                 context.set_default_navigation_timeout(120_000)
                 page = context.new_page()
-                automation.login(page)
+                login_commercehub_for_pull(page, automation)
                 pdfs, csvs = pull_commercehub_all(page, order_date=order_date)
                 _log(
                     f"CommerceHub saved {len(pdfs)} PDF(s) and {len(csvs)} CSV(s)."

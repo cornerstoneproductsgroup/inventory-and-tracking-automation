@@ -88,6 +88,8 @@ def _frame_score(fr: Frame | Page) -> int:
             text = ""
         if partner_text_to_key(text):
             score += 20
+        if row.locator("td.characterdata").count():
+            score += 5
         for sel in ROW_DOWNLOAD_SELECTORS:
             try:
                 loc = row.locator(sel)
@@ -123,9 +125,11 @@ def _resolve_table_frame(page: Page) -> Frame | Page:
 
 def _goto_packslips(page: Page) -> Frame | Page:
     page.goto(COMMERCEHUB_PACKSLIPS_URL, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(400)
     try:
-        page.locator("text=/packing slip/i").first.wait_for(state="visible", timeout=60_000)
+        page.locator("td.characterdata, text=/packing slip/i").first.wait_for(
+            state="visible", timeout=45_000
+        )
     except PlaywrightTimeout:
         pass
     frame = _resolve_table_frame(page)
@@ -135,9 +139,11 @@ def _goto_packslips(page: Page) -> Frame | Page:
 
 def _goto_order_files(page: Page) -> Frame | Page:
     page.goto(COMMERCEHUB_ORDER_FILES_URL, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(400)
     try:
-        page.locator("text=/order file/i").first.wait_for(state="visible", timeout=60_000)
+        page.locator("td.characterdata, text=/order file/i").first.wait_for(
+            state="visible", timeout=45_000
+        )
     except PlaywrightTimeout:
         pass
     frame = _resolve_table_frame(page)
@@ -147,13 +153,41 @@ def _goto_order_files(page: Page) -> Frame | Page:
 
 def _wait_for_download_table(frame: Frame | Page) -> None:
     try:
-        frame.locator("table tbody tr").first.wait_for(state="visible", timeout=60_000)
+        frame.locator("table tbody tr td.characterdata").first.wait_for(
+            state="visible", timeout=45_000
+        )
     except PlaywrightTimeout:
-        frame.locator("table tr").first.wait_for(state="visible", timeout=30_000)
-    frame.wait_for_timeout(1500)
+        try:
+            frame.locator("table tbody tr").first.wait_for(state="visible", timeout=30_000)
+        except PlaywrightTimeout:
+            frame.locator("table tr").first.wait_for(state="visible", timeout=15_000)
+    frame.wait_for_timeout(500)
+
+
+def _characterdata_label_pattern(key: str) -> re.Pattern | None:
+    if key == "lowes":
+        return re.compile(r"Lowe'?s?", re.I)
+    if key == "thdso":
+        return re.compile(r"special\s+order", re.I)
+    if key == "depot":
+        return re.compile(r"Home\s+Depot", re.I)
+    return None
 
 
 def _retailer_row_locator(frame: Frame | Page, key: str):
+    """Rows identified by td.characterdata partner name (CommerceHub packing slip table)."""
+    pat = _characterdata_label_pattern(key)
+    if pat is not None:
+        if key == "depot":
+            rows = frame.locator("tr").filter(
+                has=frame.locator("td.characterdata", has_text=pat)
+            ).filter(has_not=frame.locator("td.characterdata", has_text=re.compile(r"special", re.I)))
+        else:
+            rows = frame.locator("tr").filter(
+                has=frame.locator("td.characterdata", has_text=pat)
+            )
+        if rows.count():
+            return rows
     if key == "thdso":
         return frame.locator("tr").filter(has_text=re.compile(r"special\s+order", re.I))
     if key == "lowes":
@@ -163,8 +197,70 @@ def _retailer_row_locator(frame: Frame | Page, key: str):
     )
 
 
-def _row_click_target(row):
-    """Visible download/export control inside a retailer table row."""
+def _partner_key_from_row(row) -> str | None:
+    """Read partner from td.characterdata cells (e.g. <td class=\"characterdata\">Lowe's</td>)."""
+    try:
+        cells = row.locator("td.characterdata")
+        for i in range(cells.count()):
+            text = (cells.nth(i).inner_text(timeout=2_000) or "").strip()
+            key = partner_text_to_key(text)
+            if key:
+                return key
+    except Exception:
+        pass
+    try:
+        return partner_text_to_key(row.inner_text(timeout=3_000))
+    except Exception:
+        return None
+
+
+def _row_click_target(row, partner_key: str | None = None):
+    """Download/export control — usually in a td.characterdata column after the partner name."""
+    try:
+        cells = row.locator("td.characterdata")
+        n = cells.count()
+        for i in range(n):
+            cell = cells.nth(i)
+            try:
+                cell_text = (cell.inner_text(timeout=2_000) or "").strip()
+            except Exception:
+                cell_text = ""
+            if partner_key and partner_text_to_key(cell_text) == partner_key:
+                continue
+            if partner_text_to_key(cell_text) and not partner_key:
+                continue
+            try:
+                link = cell.get_by_role("link", name=re.compile(r"download", re.I))
+                if link.count() and link.first.is_visible():
+                    return link.first
+            except Exception:
+                pass
+            for sel in ROW_DOWNLOAD_SELECTORS:
+                loc = cell.locator(sel)
+                if loc.count() == 0:
+                    continue
+                btn = loc.first
+                try:
+                    if btn.is_visible():
+                        return btn
+                except Exception:
+                    return btn
+            for icon_sel in ("span.ch-icon-export", "span.chub-chui-chicon", ".ch-icon-export"):
+                icon = cell.locator(icon_sel)
+                if icon.count():
+                    try:
+                        if icon.first.is_visible():
+                            return icon.first
+                    except Exception:
+                        return icon.first
+        if n > 0:
+            last = cells.nth(n - 1)
+            for sel in ROW_DOWNLOAD_SELECTORS + ("a",):
+                loc = last.locator(sel)
+                if loc.count():
+                    return loc.first
+    except Exception:
+        pass
     try:
         link = row.get_by_role("link", name=re.compile(r"download", re.I))
         if link.count() and link.first.is_visible():
@@ -251,45 +347,29 @@ def _log_table_scan(frame: Frame | Page) -> None:
         try:
             vis = row.is_visible()
             text = (row.inner_text(timeout=2_000) or "").replace("\n", " ")[:100]
-            key = partner_text_to_key(text)
-            has_btn = _row_click_target(row) is not None
-            _log(f"  row {i}: visible={vis} partner={key!r} control={has_btn} text={text!r}")
+            key = _partner_key_from_row(row)
+            has_btn = _row_click_target(row, key) is not None
+            partner_cell = ""
+            try:
+                for j in range(row.locator("td.characterdata").count()):
+                    t = (row.locator("td.characterdata").nth(j).inner_text(timeout=1_000) or "").strip()
+                    if partner_text_to_key(t):
+                        partner_cell = t
+                        break
+            except Exception:
+                pass
+            _log(
+                f"  row {i}: visible={vis} partner={key!r} cell={partner_cell!r} "
+                f"control={has_btn} text={text!r}"
+            )
         except Exception as exc:
             _log(f"  row {i}: could not read ({exc})")
 
 
 def _iter_retailer_downloads(frame: Frame | Page):
-    """Yield (retailer_key, row, click_target) from visible table rows."""
+    """Yield (retailer_key, row, click_target) from td.characterdata partner rows."""
     seen: set[str] = set()
     _log_table_scan(frame)
-
-    try:
-        body_rows = frame.locator("table tbody tr")
-        n = body_rows.count()
-    except Exception:
-        n = 0
-
-    for i in range(n):
-        row = body_rows.nth(i)
-        try:
-            if not row.is_visible():
-                continue
-        except Exception:
-            continue
-        try:
-            row_text = row.inner_text(timeout=5_000)
-        except Exception:
-            continue
-        key = partner_text_to_key(row_text)
-        if not key or key not in RETAILER_PULL_ORDER or key in seen:
-            continue
-        target = _row_click_target(row)
-        if target is None:
-            _log(f"WARN: row for {RETAILERS[key].label} has no visible download control.")
-            continue
-        seen.add(key)
-        _log(f"Ready to download for {RETAILERS[key].label}.")
-        yield key, row, target
 
     for key in RETAILER_PULL_ORDER:
         if key in seen:
@@ -302,15 +382,44 @@ def _iter_retailer_downloads(frame: Frame | Page):
                     continue
             except Exception:
                 continue
-            target = _row_click_target(row)
+            row_key = _partner_key_from_row(row) or key
+            if row_key != key:
+                continue
+            target = _row_click_target(row, partner_key=key)
             if target is None:
+                _log(f"WARN: {RETAILERS[key].label} row has no download control in characterdata cells.")
                 continue
             seen.add(key)
-            _log(f"Ready to download for {RETAILERS[key].label} (fallback row filter).")
+            _log(f"Ready to download for {RETAILERS[key].label} (td.characterdata).")
             yield key, row, target
             break
         if key not in seen:
-            _log(f"No Download control found for {RETAILERS[key].label}.")
+            _log(f"No row with td.characterdata for {RETAILERS[key].label}.")
+
+    try:
+        body_rows = frame.locator("table tbody tr:has(td.characterdata)")
+        n = body_rows.count()
+    except Exception:
+        n = 0
+
+    for i in range(n):
+        if len(seen) >= len(RETAILER_PULL_ORDER):
+            break
+        row = body_rows.nth(i)
+        try:
+            if not row.is_visible():
+                continue
+        except Exception:
+            continue
+        key = _partner_key_from_row(row)
+        if not key or key not in RETAILER_PULL_ORDER or key in seen:
+            continue
+        target = _row_click_target(row, partner_key=key)
+        if target is None:
+            continue
+        seen.add(key)
+        _log(f"Ready to download for {RETAILERS[key].label}.")
+        yield key, row, target
 
 
 def _is_file_response(response) -> bool:
@@ -711,12 +820,66 @@ def _accept_js_dialogs(page: Page) -> None:
     page.on("dialog", _handler)
 
 
+def _wait_commercehub_ready_fast(page: Page, selectors: dict) -> None:
+    """After profile click — short waits only (pull-orders; avoids long selector polling)."""
+    quick_selectors = [
+        (selectors.get("logged_in_ready") or "").strip(),
+        "a[href*='gotoHome.do']",
+        "a[href*='gotoViewPackslips.do']",
+        "a[href*='gotoViewOrders.do']",
+        "a[href*='gotoOpenOrders.do']",
+    ]
+    for sel in quick_selectors:
+        if not sel:
+            continue
+        try:
+            page.locator(sel).first.wait_for(state="visible", timeout=5_000)
+            _log("CommerceHub home ready.")
+            return
+        except Exception:
+            continue
+    url = (page.url or "").lower()
+    if "dsm.commercehub.com" in url and not any(
+        x in url for x in ("login", "signin", "okta", "auth0", "microsoftonline")
+    ):
+        _log("CommerceHub ready (by URL).")
+        return
+    raise TimeoutError("CommerceHub login not confirmed within fast pull-orders timeout.")
+
+
+def login_commercehub_for_pull(page: Page, automation) -> None:
+    """
+    Log in for pull-orders with shorter delays and a fast post-profile ready check.
+    """
+    os.environ["COMMERCEHUB_CHAIN_FAST"] = "1"
+    rithum = automation.config.setdefault("rithum", {})
+    delays = dict(rithum.get("login_delays_ms") or {})
+    delays.update(
+        {
+            "after_email_continue": 350,
+            "after_password_continue": 450,
+            "before_profile_selector": 150,
+        }
+    )
+    rithum["login_delays_ms"] = delays
+
+    orig_wait = automation._wait_for_commercehub_logged_in
+    try:
+        automation._wait_for_commercehub_logged_in = (
+            lambda p, s: _wait_commercehub_ready_fast(p, s)
+        )
+        _log("Logging into CommerceHub (pull-orders fast login)…")
+        automation.login(page)
+    finally:
+        automation._wait_for_commercehub_logged_in = orig_wait
+
+
 def pull_commercehub_all(page: Page, *, order_date: date | None = None) -> tuple[list[Path], list[Path]]:
     """Packing slips first, then order CSV files."""
     _accept_js_dialogs(page)
     pdfs = pull_commercehub_packing_slips(page, order_date=order_date)
     page.goto(COMMERCEHUB_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(300)
     csvs = pull_commercehub_order_csvs(page, order_date=order_date)
 
     if not pdfs and not csvs:

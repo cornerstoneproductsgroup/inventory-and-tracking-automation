@@ -92,11 +92,14 @@ def csv_filename(label: str, d: date | None = None) -> str:
 
 
 def partner_text_to_key(partner_text: str) -> str | None:
+    """Map retailer label (e.g. td.characterdata \"Lowe's\") to config key."""
     t = (partner_text or "").strip().lower()
     if not t:
         return None
-    if "special" in t and "home depot" in t:
+    if "special" in t and ("home depot" in t or "thdso" in t):
         return "thdso"
+    if t in ("lowe's", "lowes", "lowe s"):
+        return "lowes"
     if "lowe" in t:
         return "lowes"
     if "home depot" in t:
