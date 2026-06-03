@@ -24,15 +24,28 @@ from automation.pull_orders_config import (
     pdf_filename,
 )
 
-# Row-scoped controls (avoid hidden dialog templates that also contain "Download").
-ROW_DOWNLOAD_SELECTORS = (
-    "a:has-text('Download')",
+# Row export icon / "Download" label on packing-slip & order-file tables (not the modal confirm).
+ROW_EXPORT_SELECTORS = (
     "span.download-dialog-info__element:has-text('Download')",
+    "span.ch-icon-export.download-dialog-info__element",
+    "span.chub-chui-chicon.ch-icon-export.download-dialog-info__element",
     "span.ch-icon-export",
     "span.chub-chui-chicon.ch-icon-export",
+)
+
+ROW_DOWNLOAD_SELECTORS = ROW_EXPORT_SELECTORS + (
+    "a:has-text('Download')",
+    "a[href*='download' i]",
+    "a[href*='export' i]",
+    "a[href*='packslip' i]",
     "input[type='button'][value*='ownload' i]",
     "input[type='submit'][value*='ownload' i]",
 )
+
+# Modal confirm — same control invoice reports use after opening Export Search.
+FORM_EXPORT_BUTTON = 'input[data-test="form-export-button"], button[data-test="form-export-button"]'
+
+_READY_TO_DOWNLOAD = re.compile(r"ready\s+to\s+download", re.I)
 
 # thdso before depot so "Home Depot Special Order" is not matched as depot.
 RETAILER_PULL_ORDER = ("thdso", "depot", "lowes")
@@ -42,14 +55,11 @@ FILE_RESPONSE_TIMEOUT_MS = 90_000
 DIALOG_WAIT_MS = 20_000
 SAVE_AS_WAIT_S = 55.0
 
-# Export modal (row click opens this; user must confirm Download — not the row click alone).
+# Export modal confirm (do not use row-level span.download-dialog-info__element here).
 DIALOG_DOWNLOAD_SELECTORS = (
-    'input[data-test="form-export-button"]',
-    'button[data-test="form-export-button"]',
-    "span.download-dialog-info__element",
+    FORM_EXPORT_BUTTON,
     "button.ch-button-primary:has-text('Download')",
     "button:has-text('Download')",
-    "a:has-text('Download')",
     "input[type='button'][value*='Download' i]",
     "input[type='submit'][value*='Download' i]",
 )
@@ -123,15 +133,25 @@ def _resolve_table_frame(page: Page) -> Frame | Page:
     return best
 
 
+def _wait_page_table_hint(page: Page, *, hint: str) -> None:
+    """Wait for retailer table cells without invalid mixed CSS/text selectors."""
+    try:
+        page.locator("td.characterdata").first.wait_for(state="visible", timeout=45_000)
+        return
+    except PlaywrightTimeout:
+        pass
+    except Exception:
+        pass
+    try:
+        page.get_by_text(re.compile(hint, re.I)).first.wait_for(state="visible", timeout=15_000)
+    except Exception:
+        pass
+
+
 def _goto_packslips(page: Page) -> Frame | Page:
     page.goto(COMMERCEHUB_PACKSLIPS_URL, wait_until="domcontentloaded", timeout=120_000)
     page.wait_for_timeout(400)
-    try:
-        page.locator("td.characterdata, text=/packing slip/i").first.wait_for(
-            state="visible", timeout=45_000
-        )
-    except PlaywrightTimeout:
-        pass
+    _wait_page_table_hint(page, hint=r"packing\s+slip|ready\s+to\s+download")
     frame = _resolve_table_frame(page)
     _wait_for_download_table(frame)
     return frame
@@ -140,12 +160,7 @@ def _goto_packslips(page: Page) -> Frame | Page:
 def _goto_order_files(page: Page) -> Frame | Page:
     page.goto(COMMERCEHUB_ORDER_FILES_URL, wait_until="domcontentloaded", timeout=120_000)
     page.wait_for_timeout(400)
-    try:
-        page.locator("td.characterdata, text=/order file/i").first.wait_for(
-            state="visible", timeout=45_000
-        )
-    except PlaywrightTimeout:
-        pass
+    _wait_page_table_hint(page, hint=r"order\s+file|ready\s+to\s+download")
     frame = _resolve_table_frame(page)
     _wait_for_download_table(frame)
     return frame
@@ -214,8 +229,63 @@ def _partner_key_from_row(row) -> str | None:
         return None
 
 
+def _clickable_in_cell(cell):
+    for sel in ROW_EXPORT_SELECTORS:
+        loc = cell.locator(sel)
+        if loc.count() == 0:
+            continue
+        btn = loc.first
+        try:
+            if btn.is_visible():
+                return btn
+        except Exception:
+            return btn
+    return None
+
+
+def _row_download_control(row):
+    """CommerceHub row export control (packing slips / order files) — not the partner name cell."""
+    for sel in ROW_EXPORT_SELECTORS:
+        loc = row.locator(sel)
+        n = loc.count()
+        for i in range(n):
+            btn = loc.nth(i)
+            try:
+                if btn.is_visible():
+                    return btn
+            except Exception:
+                return btn
+    try:
+        dl = row.get_by_text(re.compile(r"^\s*download\s*$", re.I))
+        if dl.count() and dl.first.is_visible():
+            return dl.first
+    except Exception:
+        pass
+    return None
+
+
+def _find_form_export_button(page: Page, timeout_ms: int = 12_000):
+    """Visible export confirm — same data-test button as commercehub_invoice_export."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for fr in _all_frames(page):
+            loc = fr.locator(FORM_EXPORT_BUTTON)
+            for i in range(loc.count()):
+                btn = loc.nth(i)
+                try:
+                    if btn.is_visible():
+                        return btn
+                except Exception:
+                    return btn
+        page.wait_for_timeout(300)
+    return None
+
+
 def _row_click_target(row, partner_key: str | None = None):
-    """Download/export control — usually in a td.characterdata column after the partner name."""
+    """Download/export control — row icon/Download span, then td.characterdata action column."""
+    hit = _row_download_control(row)
+    if hit is not None:
+        return hit
     try:
         cells = row.locator("td.characterdata")
         n = cells.count()
@@ -229,36 +299,24 @@ def _row_click_target(row, partner_key: str | None = None):
                 continue
             if partner_text_to_key(cell_text) and not partner_key:
                 continue
+            if _READY_TO_DOWNLOAD.search(cell_text):
+                hit = _clickable_in_cell(cell)
+                if hit is not None:
+                    return hit
             try:
                 link = cell.get_by_role("link", name=re.compile(r"download", re.I))
                 if link.count() and link.first.is_visible():
                     return link.first
             except Exception:
                 pass
-            for sel in ROW_DOWNLOAD_SELECTORS:
-                loc = cell.locator(sel)
-                if loc.count() == 0:
-                    continue
-                btn = loc.first
-                try:
-                    if btn.is_visible():
-                        return btn
-                except Exception:
-                    return btn
-            for icon_sel in ("span.ch-icon-export", "span.chub-chui-chicon", ".ch-icon-export"):
-                icon = cell.locator(icon_sel)
-                if icon.count():
-                    try:
-                        if icon.first.is_visible():
-                            return icon.first
-                    except Exception:
-                        return icon.first
+            hit = _clickable_in_cell(cell)
+            if hit is not None:
+                return hit
         if n > 0:
             last = cells.nth(n - 1)
-            for sel in ROW_DOWNLOAD_SELECTORS + ("a",):
-                loc = last.locator(sel)
-                if loc.count():
-                    return loc.first
+            hit = _clickable_in_cell(last)
+            if hit is not None:
+                return hit
     except Exception:
         pass
     try:
@@ -348,7 +406,7 @@ def _log_table_scan(frame: Frame | Page) -> None:
             vis = row.is_visible()
             text = (row.inner_text(timeout=2_000) or "").replace("\n", " ")[:100]
             key = _partner_key_from_row(row)
-            has_btn = _row_click_target(row, key) is not None
+            has_btn = _row_download_control(row) is not None or _row_click_target(row, key) is not None
             partner_cell = ""
             try:
                 for j in range(row.locator("td.characterdata").count()):
@@ -568,13 +626,26 @@ def _click_row_and_capture(
         _perform_click(dialog)
         return True
 
-    # 1) Primary path: row → wait for export modal → Download (with retries)
+    # 1) Same two-step pattern as invoice reports: row export → form-export-button (or Save As for PDF)
     _log(f"{label}: clicking row export control…")
     _click_target()
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(800)
+
+    export_btn = _find_form_export_button(page, timeout_ms=12_000)
+    if export_btn is not None:
+        _log(f"{label}: export modal open; clicking form-export-button (invoice-report control)…")
+        try:
+            with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+                _perform_click(export_btn)
+            return _save_download_object(dl_info.value, dest)
+        except PlaywrightTimeout:
+            _log(f"{label}: form-export-button did not start browser download; trying Save As…")
+            if _try_native_save_as(dest):
+                _log(f"{label}: saved via Save As after form-export-button.")
+                return dest
 
     for attempt in range(1, 5):
-        dialog = _wait_for_export_dialog(page, frame, timeout_ms=8_000)
+        dialog = _wait_for_export_dialog(page, frame, timeout_ms=6_000)
         if dialog is not None:
             _log(f"{label}: export dialog open (attempt {attempt}); clicking Download…")
             try:
@@ -592,10 +663,16 @@ def _click_row_and_capture(
                     return _save_download_object(dl_info.value, dest)
                 except PlaywrightTimeout:
                     pass
+            if _try_native_save_as(dest):
+                _log(f"{label}: saved via Save As after modal Download.")
+                return dest
         else:
             _log(f"{label}: no export dialog yet (attempt {attempt}); re-clicking row…")
+            if attempt == 2 and _try_native_save_as(dest):
+                _log(f"{label}: saved via Save As (no modal).")
+                return dest
         _click_target()
-        page.wait_for_timeout(900)
+        page.wait_for_timeout(700)
 
     # 2) Row + dialog together while listening for HTTP file body
     _log(f"{label}: trying HTTP file response…")
