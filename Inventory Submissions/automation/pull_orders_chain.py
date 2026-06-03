@@ -86,6 +86,8 @@ def run_pull_orders(
             with sync_playwright() as p:
                 browser = _browser_launch(p)
                 context = browser.new_context(accept_downloads=True)
+                context.set_default_timeout(120_000)
+                context.set_default_navigation_timeout(120_000)
                 page = context.new_page()
                 automation.login(page)
                 pdfs, csvs = pull_commercehub_all(page, order_date=order_date)

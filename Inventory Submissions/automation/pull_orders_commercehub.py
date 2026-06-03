@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
+import shutil
 import tempfile
+import time
 from datetime import date
 from pathlib import Path
 
@@ -36,6 +39,20 @@ RETAILER_PULL_ORDER = ("thdso", "depot", "lowes")
 
 DOWNLOAD_TIMEOUT_MS = 120_000
 FILE_RESPONSE_TIMEOUT_MS = 90_000
+DIALOG_WAIT_MS = 20_000
+SAVE_AS_WAIT_S = 55.0
+
+# Export modal (row click opens this; user must confirm Download — not the row click alone).
+DIALOG_DOWNLOAD_SELECTORS = (
+    'input[data-test="form-export-button"]',
+    'button[data-test="form-export-button"]',
+    "span.download-dialog-info__element",
+    "button.ch-button-primary:has-text('Download')",
+    "button:has-text('Download')",
+    "a:has-text('Download')",
+    "input[type='button'][value*='Download' i]",
+    "input[type='submit'][value*='Download' i]",
+)
 
 
 def _log(msg: str) -> None:
@@ -168,18 +185,13 @@ def _row_click_target(row):
 
 
 def _visible_dialog_download(page: Page, frame: Frame | Page | None = None):
-    """Visible Download / export-confirm in page or table frame (not hidden templates)."""
+    """Visible Download / export-confirm in page or any frame (not hidden templates)."""
     roots: list[Frame | Page] = []
     if frame is not None:
         roots.append(frame)
     roots.extend(fr for fr in _all_frames(page) if fr not in roots)
     for fr in roots:
-        for sel in (
-            'input[data-test="form-export-button"]',
-            "span.download-dialog-info__element:visible",
-            "a:visible:has-text('Download')",
-            "button:visible:has-text('Download')",
-        ):
+        for sel in DIALOG_DOWNLOAD_SELECTORS:
             try:
                 loc = fr.locator(sel)
                 n = loc.count()
@@ -193,6 +205,38 @@ def _visible_dialog_download(page: Page, frame: Frame | Page | None = None):
                 except Exception:
                     continue
     return None
+
+
+def _wait_for_export_dialog(page: Page, frame: Frame | Page, timeout_ms: int = DIALOG_WAIT_MS):
+    """Row click often opens an export modal (e.g. batch count) before any file is offered."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        dlg = _visible_dialog_download(page, frame)
+        if dlg is not None:
+            return dlg
+        for fr in _all_frames(page):
+            try:
+                shell = fr.locator(
+                    ".modal, [role='dialog'], .ch-modal, .download-dialog"
+                ).filter(has_text=re.compile(r"download|export", re.I))
+                if shell.count() and shell.first.is_visible():
+                    inner = _visible_dialog_download(page, frame)
+                    if inner is not None:
+                        return inner
+            except Exception:
+                continue
+        page.wait_for_timeout(350)
+    return None
+
+
+def _failure_screenshot(page: Page, label: str) -> Path | None:
+    try:
+        snap = Path(__file__).resolve().parent.parent / f"pull_orders_ch_{label.replace(' ', '_')}.png"
+        page.screenshot(path=str(snap), full_page=True)
+        _log(f"Debug screenshot: {snap}")
+        return snap
+    except Exception:
+        return None
 
 
 def _log_table_scan(frame: Frame | Page) -> None:
@@ -310,10 +354,61 @@ def _save_download_object(download, dest: Path) -> Path:
 
 def _try_native_save_as(dest: Path) -> bool:
     try:
-        from automation.windows_save_as import fill_save_as_dialog
+        from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
     except ImportError:
         return False
-    return bool(fill_save_as_dialog(dest, timeout_s=25))
+    deadline = time.monotonic() + SAVE_AS_WAIT_S
+    while time.monotonic() < deadline:
+        if wait_for_save_as_dialog(timeout_s=2.0):
+            remaining = max(10.0, deadline - time.monotonic())
+            if fill_save_as_dialog(dest, timeout_s=remaining):
+                return dest.is_file() and dest.stat().st_size >= 100
+        time.sleep(0.35)
+    return False
+
+
+def _import_recent_browser_download(dest: Path, *, since: float) -> Path | None:
+    """If the browser saved to Downloads silently, copy the newest matching file to dest."""
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    watch_dirs = [
+        home / "Downloads",
+        dest.parent,
+    ]
+    want_ext = dest.suffix.lower()
+    extra_ext = {".pdf", ".csv", ".neworders", ".zip"}
+    if want_ext:
+        extra_ext.add(want_ext)
+
+    best: Path | None = None
+    best_mtime = since - 1.0
+    for folder in watch_dirs:
+        if not folder.is_dir():
+            continue
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in extra_ext:
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if st.st_size < 100 or st.st_mtime < since - 3:
+                continue
+            if st.st_mtime > best_mtime:
+                best_mtime = st.st_mtime
+                best = path
+
+    if best is None:
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best, dest)
+    _log(f"Copied recent file from {best.parent} → {dest.name} ({dest.stat().st_size:,} bytes)")
+    return dest
 
 
 def _perform_click(target) -> None:
@@ -336,89 +431,144 @@ def _perform_click(target) -> None:
     )
 
 
-def _click_row_and_capture(page: Page, frame: Frame | Page, row, target, dest: Path):
-    """Click row download control; return Playwright Download or save via HTTP / Save As."""
+def _click_row_and_capture(
+    page: Page,
+    frame: Frame | Page,
+    row,
+    target,
+    dest: Path,
+    *,
+    retailer_label: str = "",
+) -> Path:
+    """
+    Click row export, then confirm the export dialog Download, then save to dest.
+
+    CommerceHub usually shows a modal after the row click (batch / count) — the file
+    only starts after the modal Download button, not from the row click alone.
+    """
+    started = time.monotonic()
+    label = retailer_label or "retailer"
 
     def _click_target() -> None:
         _perform_click(target)
 
-    def _click_dialog_if_open() -> None:
+    def _click_dialog_if_open() -> bool:
         dialog = _visible_dialog_download(page, frame)
-        if dialog is not None:
-            _perform_click(dialog)
+        if dialog is None:
+            return False
+        _perform_click(dialog)
+        return True
 
-    # 1) Direct click → browser download event
-    try:
-        with page.expect_download(timeout=45_000) as dl_info:
-            _click_target()
-        return _save_download_object(dl_info.value, dest)
-    except PlaywrightTimeout:
-        pass
-
-    # 2) Click opens dialog → confirm Download
+    # 1) Primary path: row → wait for export modal → Download (with retries)
+    _log(f"{label}: clicking row export control…")
     _click_target()
-    page.wait_for_timeout(900)
-    dialog = _visible_dialog_download(page, frame)
-    if dialog is not None:
-        _log("Confirming export dialog Download…")
-        try:
-            with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-                _perform_click(dialog)
-            return _save_download_object(dl_info.value, dest)
-        except PlaywrightTimeout:
-            pass
+    page.wait_for_timeout(1200)
 
-    # 3) HTTP response with file body (common on older CommerceHub pages)
+    for attempt in range(1, 5):
+        dialog = _wait_for_export_dialog(page, frame, timeout_ms=8_000)
+        if dialog is not None:
+            _log(f"{label}: export dialog open (attempt {attempt}); clicking Download…")
+            try:
+                with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+                    _perform_click(dialog)
+                return _save_download_object(dl_info.value, dest)
+            except PlaywrightTimeout:
+                _log(
+                    f"{label}: Download in modal did not start a browser download "
+                    f"(attempt {attempt}); trying Enter key…"
+                )
+                try:
+                    with page.expect_download(timeout=25_000) as dl_info:
+                        page.keyboard.press("Enter")
+                    return _save_download_object(dl_info.value, dest)
+                except PlaywrightTimeout:
+                    pass
+        else:
+            _log(f"{label}: no export dialog yet (attempt {attempt}); re-clicking row…")
+        _click_target()
+        page.wait_for_timeout(900)
+
+    # 2) Row + dialog together while listening for HTTP file body
+    _log(f"{label}: trying HTTP file response…")
     try:
         with page.expect_response(_is_file_response, timeout=FILE_RESPONSE_TIMEOUT_MS) as resp_info:
             _click_target()
+            page.wait_for_timeout(800)
             _click_dialog_if_open()
         resp = resp_info.value
         suggested = _filename_from_response(resp)
-        out = dest
-        if suggested and "." in suggested:
-            out = dest.with_name(suggested)
+        out = dest.with_name(suggested) if suggested and "." in suggested else dest
         _log(f"Saved from HTTP response ({resp.status}): {out.name}")
         return _save_response_body(resp, out)
     except PlaywrightTimeout:
         pass
 
-    # 4) Popup window (invoice-export style)
+    # 3) Direct download on row click (some tenants)
     try:
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
-            with page.expect_popup(timeout=12_000) as pop_info:
-                _click_target()
-            popup = pop_info.value
-            popup.wait_for_load_state("domcontentloaded", timeout=60_000)
-            for sel in (
-                'input[data-test="form-export-button"]',
-                "span.download-dialog-info__element:has-text('Download')",
-                "a:has-text('Download')",
-            ):
-                btn = popup.locator(sel).first
-                if btn.count() and btn.is_visible():
-                    btn.click(timeout=30_000)
-                    break
+        with page.expect_download(timeout=25_000) as dl_info:
+            _click_target()
         return _save_download_object(dl_info.value, dest)
     except PlaywrightTimeout:
         pass
 
-    # 5) Native Windows Save As
+    # 4) Popup export window
+    try:
+        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
+            with page.expect_popup(timeout=15_000) as pop_info:
+                _click_target()
+                page.wait_for_timeout(600)
+                _click_dialog_if_open()
+            popup = pop_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=60_000)
+            for sel in DIALOG_DOWNLOAD_SELECTORS:
+                btn = popup.locator(sel).first
+                if btn.count():
+                    try:
+                        if btn.is_visible():
+                            btn.click(timeout=30_000)
+                            break
+                    except Exception:
+                        btn.click(timeout=30_000, force=True)
+                        break
+        return _save_download_object(dl_info.value, dest)
+    except PlaywrightTimeout:
+        pass
+
+    # 5) Native Save As (packing slips often use "Save Print Output As")
+    _log(f"{label}: trying Windows Save As → {dest}")
     _click_target()
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(700)
     _click_dialog_if_open()
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(500)
     if _try_native_save_as(dest):
-        _log(f"Saved via Windows Save As dialog: {dest.name}")
+        _log(f"{label}: saved via Save As dialog.")
         return dest
 
+    # 6) File may have landed in user Downloads
+    copied = _import_recent_browser_download(dest, since=started)
+    if copied is not None:
+        return copied
+
+    _failure_screenshot(page, label)
     raise PlaywrightTimeout(
-        "CommerceHub file did not download (tried browser download, dialog, HTTP response, popup, Save As)."
+        f"{label}: file was not saved to {dest}. "
+        "Row export was found but Download/Save As did not complete. "
+        "See debug screenshot in Inventory Submissions folder."
     )
 
 
-def _download_retailer_file(page: Page, frame: Frame | Page, row, target, dest: Path) -> Path:
-    return _click_row_and_capture(page, frame, row, target, dest)
+def _download_retailer_file(
+    page: Page,
+    frame: Frame | Page,
+    row,
+    target,
+    dest: Path,
+    *,
+    retailer_label: str,
+) -> Path:
+    return _click_row_and_capture(
+        page, frame, row, target, dest, retailer_label=retailer_label
+    )
 
 
 def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
@@ -440,11 +590,18 @@ def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None
         dest = cfg.pdf_dir / pdf_filename(cfg.label, order_date)
         _log(f"Downloading packing slip for {cfg.label} → {dest}")
         try:
-            path = _download_retailer_file(page, frame, row, click_target, dest)
+            path = _download_retailer_file(
+                page,
+                frame,
+                row,
+                click_target,
+                dest,
+                retailer_label=cfg.label,
+            )
             saved.append(path)
             _log(f"Saved {path.name} ({path.stat().st_size:,} bytes)")
         except PlaywrightTimeout:
-            _log(f"WARN: no download started for {cfg.label}; skipping.")
+            _log(f"WARN: download did not complete for {cfg.label}; skipping.")
         except Exception as exc:
             _log(f"WARN: {cfg.label} packing slip failed: {exc}")
         page.wait_for_timeout(800)
@@ -503,7 +660,14 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 raw_path = Path(tmp) / "order.neworders"
-                saved_path = _download_retailer_file(page, frame, row, click_target, raw_path)
+                saved_path = _download_retailer_file(
+                    page,
+                    frame,
+                    row,
+                    click_target,
+                    raw_path,
+                    retailer_label=cfg.label,
+                )
                 raw_path = saved_path
                 csv_path = _neworders_to_csv(raw_path)
                 detected = _read_csv_merchant_key(csv_path)
