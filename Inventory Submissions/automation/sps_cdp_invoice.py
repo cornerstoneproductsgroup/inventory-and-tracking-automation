@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from datetime import date
 from pathlib import Path
+
+from automation.async_bridge import run_async
 
 
 def _invoice_report_dir() -> Path:
@@ -70,4 +71,4 @@ def run_tractor_invoice_via_cdp(
             )
         print("SPS Tractor Supply invoice report complete.", flush=True)
 
-    asyncio.run(_run())
+    run_async(_run())

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from datetime import date
 from pathlib import Path
+
+from automation.async_bridge import run_async
 
 
 def _invoice_report_dir() -> Path:
@@ -72,4 +73,4 @@ def run_retail_invoices_via_cdp(
             await _run_lowes_invoice_flow(page, download_dir, day)
         print("CommerceHub invoice reports (Depot + Lowe's) complete.", flush=True)
 
-    asyncio.run(_run())
+    run_async(_run())
