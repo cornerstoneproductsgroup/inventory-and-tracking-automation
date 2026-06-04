@@ -1126,7 +1126,7 @@ def _build_label_destination(order, vendor_maps: "VendorMapRegistry"):
 def _save_shipping_labels() -> int:
     from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
     from automation.worldship_cornerstone_master import load_cornerstone_orders
-    from automation.worldship_label_config import save_dialog_timeout_s
+    from automation.worldship_label_config import label_save_gap_s, save_dialog_timeout_s
     from automation.worldship_vendor_map import VendorMapRegistry
 
     orders = None
@@ -1167,14 +1167,17 @@ def _save_shipping_labels() -> int:
             f"Saving row {order.row_number}: PO {order.po!r}, SKU {order.sku!r}, "
             f"retailer {order.retailer_raw!r}"
         )
-        _log(f"  → {dest}")
-        if not fill_save_as_dialog(dest, timeout_s=30.0):
+        _log(f"  → folder: {dest.parent}")
+        _log(f"  → file:   {dest.name}")
+        if not fill_save_as_dialog(dest, timeout_s=45.0):
             raise RuntimeError(f"Failed to save label for PO {order.po!r} to {dest}")
         saved += 1
         _log(f"Saved label {saved}/{len(orders)}: {dest.name}")
         if saved >= len(orders):
             break
-        time.sleep(0.5)
+        gap_s = label_save_gap_s()
+        _log(f"Waiting {gap_s:.0f}s for next Save Print Output dialog…")
+        time.sleep(gap_s)
 
     if orders is None:
         raise RuntimeError("No save dialogs appeared — nothing to save.")

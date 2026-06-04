@@ -7,13 +7,13 @@ format columns, save, and print (landscape + gridlines).
 Drop a new raw .csv/.xlsx into the Amazon **Input** share folder. Formatted output is saved to
 **Output** as ``{same base name} Output.xlsx`` (then printed).
 
-Date rules (by run date = today unless overridden) — **calendar date only**; time of day is ignored:
-  Tue–Fri: keep Order rows whose date/time column is **yesterday's calendar date** (any time).
-  Monday: keep Order rows on the previous **Friday, Saturday, and Sunday** (any time).
+Date rules (by run date = today unless overridden) — match the **start** of the date/time cell
+(e.g. ``Jun 3, 2026``); times from 12:00 AM through 11:59 PM on that day all count.
 
-  Optional (default on): also include the **prior settlement calendar day** (Tue–Fri only).
-  Amazon often labels many of yesterday's sales with the previous date in the export; disable with
-  ``AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY=false`` if you only want the strict yesterday date.
+  Tue–Fri: **yesterday only** (run on Jun 4 → keep rows starting with ``Jun 3, 2026``).
+  Monday: previous **Friday, Saturday, and Sunday** calendar dates.
+
+  Optional: ``AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY=true`` also keeps day-before-yesterday on Tue–Fri.
 """
 
 from __future__ import annotations
@@ -83,17 +83,21 @@ def output_path_for_source(source: Path, output_dir: Path | None = None) -> Path
 
 
 def _include_prior_settlement_day() -> bool:
-    """Default true — see module docstring."""
-    v = (os.environ.get("AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY") or "true").strip().lower()
-    return v not in ("0", "false", "no", "")
+    """Off by default — see module docstring."""
+    v = (os.environ.get("AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY") or "false").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _amazon_date_label(d: date) -> str:
+    """Leading text in the date/time column: ``Jun 3, 2026`` (matches Amazon export)."""
+    return f"{d.strftime('%b')} {d.day}, {d.year}"
 
 
 def transaction_dates_to_keep(run_day: date | None = None) -> set[date]:
     """
-    Calendar dates to keep (time of day is not used).
+    Calendar dates to keep (matched at the start of the date/time cell).
 
-    Tue–Fri: yesterday; also day-before-yesterday when ``AMAZON_INCLUDE_PRIOR_SETTLEMENT_DAY`` is true.
-    Monday: previous Fri, Sat, and Sun.
+    Tue–Fri: yesterday only. Monday: previous Fri, Sat, Sun.
     """
     d = run_day or date.today()
     if d.weekday() == 0:
@@ -102,6 +106,10 @@ def transaction_dates_to_keep(run_day: date | None = None) -> set[date]:
     if _include_prior_settlement_day():
         days.add(d - timedelta(days=2))
     return days
+
+
+def _keep_date_labels(keep_dates: set[date]) -> str:
+    return ", ".join(_amazon_date_label(d) for d in sorted(keep_dates))
 
 
 def parse_amazon_transaction_datetime(value: object) -> datetime | None:
@@ -130,8 +138,17 @@ def parse_amazon_transaction_date(value: object) -> date | None:
 
 
 def _row_matches_keep_dates(row: tuple, keep_dates: set[date]) -> bool:
-    """True when the row's calendar date is in *keep_dates* (any time on that day counts)."""
-    tx_date = parse_amazon_transaction_date(row[0] if row else None)
+    """True when date/time cell starts with a kept day label (e.g. Jun 3, 2026)."""
+    cell = row[0] if row else None
+    if cell is None:
+        return False
+    s = str(cell).strip()
+    if not s:
+        return False
+    for d in keep_dates:
+        if s.startswith(_amazon_date_label(d)):
+            return True
+    tx_date = parse_amazon_transaction_date(cell)
     return tx_date is not None and tx_date in keep_dates
 
 
@@ -661,10 +678,10 @@ def _log_source_date_coverage(
     for d in sorted(keep_dates):
         times = sorted(by_date.get(d, []))
         if not times:
-            print(f"[amazon]   Source export: 0 Order rows dated {d.isoformat()}", flush=True)
+            print(f"[amazon]   Source export: 0 Order rows dated {_amazon_date_label(d)}", flush=True)
             continue
         print(
-            f"[amazon]   Source export: {len(times)} Order row(s) dated {d.isoformat()} "
+            f"[amazon]   Source export: {len(times)} Order row(s) dated {_amazon_date_label(d)} "
             f"(times {times[0].strftime('%I:%M:%S %p')} – {times[-1].strftime('%I:%M:%S %p')}; "
             f"all times on that calendar date are kept)",
             flush=True,
@@ -768,7 +785,7 @@ def process_amazon_export(
     headers, selected = _select_columns(header, body, raw_indices)
     selected = _forward_fill_transaction_dates(selected)
     selected = _forward_fill_po_and_sku(selected)
-    print(f"[amazon] Date filter (calendar days only): {', '.join(sorted(d.isoformat() for d in keep_dates))}", flush=True)
+    print(f"[amazon] Date filter (date/time starts with): {_keep_date_labels(keep_dates)}", flush=True)
     _log_source_date_coverage(selected, headers, keep_dates, run_day)
     filtered = _filter_rows(headers, selected, keep_dates=keep_dates)
     filtered = _sort_rows_by_transaction_datetime(filtered)
