@@ -22,6 +22,16 @@ Example (6 shipments):
 1. **Phase 1** — Every SAVE row: wait for a **new** Save dialog → set vendor folder → full `PURCHASE_ORDER` filename → Save → verify file on disk and dialog closed. Stops on first failure (no silent skip).
 2. **Phase 2** — Warehouse-print rows: wait for print; dismiss any unexpected Save dialog.
 
+## Automatic Processing Progress — do not click Stop
+
+While WorldShip shows **Automatic Processing Progress**, the batch runs shipment-by-shipment. After you save one label, WorldShip must **keep processing** so the next **Save Print Output As** dialog appears.
+
+- **Do not click Stop** — that halts the batch; remaining shipments will not get Save dialogs.
+- **Only click Save** on each Save Print Output As window (the script does this when automation runs).
+- The script never sends **Alt+S** (that shortcut is **Stop** on the progress window if focus is wrong).
+
+If you already clicked Stop, close the import, re-run the batch, and let processing run through all save labels without stopping.
+
 ## Verification
 
 - Filename must match the PO cell before Save is clicked.

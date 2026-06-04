@@ -261,25 +261,31 @@ def _filename_matches(edit_hwnd: int, dest: Path) -> bool:
 
 
 def _click_save_button(hwnd: int) -> bool:
+    """
+    Click the Save button on the Save Print Output As dialog only.
+
+    Never send Alt+S or Enter — Alt+S activates Stop on Automatic Processing Progress
+    if that window has focus, which halts the rest of the batch.
+    """
     import win32con
     import win32gui
 
     _focus_dialog(hwnd)
-    time.sleep(0.15)
-    btn = _find_save_button_hwnd(hwnd)
-    if btn:
-        try:
-            win32gui.SendMessage(btn, win32con.BM_CLICK, 0, 0)
-        except Exception:
-            try:
-                win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
-            except Exception:
-                pass
-    else:
-        _send_alt_key("s")
     time.sleep(0.2)
-    _send_vk(win32con.VK_RETURN)
-    _log("Clicked Save (button + Enter).")
+    btn = _find_save_button_hwnd(hwnd)
+    if not btn:
+        _log("ERROR: Save button not found on Save Print Output As dialog.")
+        return False
+    try:
+        win32gui.SendMessage(btn, win32con.BM_CLICK, 0, 0)
+    except Exception:
+        try:
+            win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+        except Exception:
+            _log("ERROR: could not click Save button.")
+            return False
+    time.sleep(0.25)
+    _log("Clicked Save button (no keyboard shortcuts).")
     return True
 
 
@@ -492,7 +498,8 @@ def _worldship_save_once(
         return False
     time.sleep(0.25)
     save_clicked_at = time.time()
-    _click_save_button(hwnd)
+    if not _click_save_button(hwnd):
+        return False
     time.sleep(0.6)
     dismiss_overwrite_prompt()
     if _wait_for_save_result(
@@ -508,7 +515,8 @@ def _worldship_save_once(
     if _dialog_still_open(hwnd) and _set_filename_only(hwnd, dest):
         _log("Retrying Save click on same dialog…")
         save_clicked_at = time.time()
-        _click_save_button(hwnd)
+        if not _click_save_button(hwnd):
+            return False
         time.sleep(0.6)
         dismiss_overwrite_prompt()
         return _wait_for_save_result(

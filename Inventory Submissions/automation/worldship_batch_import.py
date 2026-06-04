@@ -856,6 +856,112 @@ def _has_processing_progress_window() -> bool:
     return False
 
 
+def _find_processing_progress() -> tuple[int, dict[str, int]] | None:
+    for hwnd, title in _enum_visible_modal_hwnds():
+        if "automatic processing progress" in title.lower():
+            return hwnd, _parse_progress_stats(hwnd)
+    return None
+
+
+def _try_resume_batch_processing(progress_hwnd: int) -> bool:
+    """If the batch was paused (e.g. after Stop), try Process/Continue when offered."""
+    for label in ("Process", "Continue", "Resume"):
+        if _click_button_win32(progress_hwnd, label):
+            _log(f"Clicked {label!r} on Automatic Processing Progress to resume batch.")
+            return True
+    return False
+
+
+def _wait_for_processing_after_save(
+    *,
+    saves_completed: int,
+    saves_total: int,
+    timeout_s: float,
+) -> None:
+    """
+    WorldShip must keep processing shipments after each Save dialog.
+
+    Do NOT click Stop on Automatic Processing Progress — that ends the batch and
+    no further Save Print Output dialogs will appear.
+    """
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    if saves_completed >= saves_total:
+        return
+
+    _log(
+        "Let Automatic Processing continue — do NOT click Stop. "
+        "Only respond to each Save Print Output As dialog."
+    )
+    prog = _find_processing_progress()
+    prev_remaining = prog[1].get("remaining") if prog else None
+    prev_success = prog[1].get("successful") if prog else None
+
+    deadline = time.monotonic() + timeout_s
+    stalled_at: float | None = None
+    resume_attempted = False
+
+    while time.monotonic() < deadline:
+        if find_save_as_dialog_hwnd(log=False):
+            _log("Next Save Print Output dialog is ready.")
+            return
+
+        prog = _find_processing_progress()
+        if prog:
+            hwnd, stats = prog
+            remaining = stats.get("remaining")
+            successful = stats.get("successful")
+            total = stats.get("total")
+
+            if (
+                remaining == 0
+                and total is not None
+                and total > 0
+                and saves_completed < saves_total
+            ):
+                raise RuntimeError(
+                    f"Automatic Processing shows 0 remaining after only "
+                    f"{saves_completed}/{saves_total} label(s) saved. "
+                    "If you clicked Stop on Automatic Processing Progress, the batch "
+                    "stopped early — close WorldShip, re-import the batch, and do not "
+                    "click Stop; save each label when prompted."
+                )
+
+            if prev_remaining is not None and remaining is not None and remaining < prev_remaining:
+                _log(f"Processing next shipment (remaining {prev_remaining} → {remaining}).")
+                return
+            if prev_success is not None and successful is not None and successful > prev_success:
+                _log(f"Processing next shipment (successful {prev_success} → {successful}).")
+                return
+
+            if remaining is not None and remaining == prev_remaining:
+                now = time.monotonic()
+                if stalled_at is None:
+                    stalled_at = now
+                elif now - stalled_at >= 18.0:
+                    if not resume_attempted and _try_resume_batch_processing(hwnd):
+                        resume_attempted = True
+                        stalled_at = None
+                        time.sleep(1.0)
+                        continue
+                    raise RuntimeError(
+                        "WorldShip batch processing stalled (remaining count not decreasing). "
+                        "Do not click Stop — wait for the next Save Print Output As dialog. "
+                        f"Remaining={remaining}, saved {saves_completed}/{saves_total}."
+                    )
+            else:
+                stalled_at = None
+        else:
+            stalled_at = None
+
+        time.sleep(0.4)
+
+    raise TimeoutError(
+        f"Timed out waiting for WorldShip to process the next shipment after save "
+        f"{saves_completed}/{saves_total}. Do not click Stop on Automatic Processing Progress."
+    )
+
+
 def _wait_for_optional_smart_pickup() -> None:
     from automation.windows_save_as import find_save_as_dialog_hwnd
 
@@ -1193,6 +1299,11 @@ def _run_save_label_phase(plan) -> int:
         return 0
 
     _log(f"=== Phase 1/2: SAVE {len(items)} label(s) to share ===")
+    _log(
+        "IMPORTANT: While Automatic Processing Progress is open, do NOT click Stop. "
+        "WorldShip will pause the batch and later Save dialogs will not appear. "
+        "Only click Save on each Save Print Output As window."
+    )
     last_hwnd = 0
     saved = 0
 
@@ -1209,6 +1320,11 @@ def _run_save_label_phase(plan) -> int:
         else:
             _wait_until_save_dialog_gone(max_s=30.0)
             timeout_s = save_dialog_timeout_s(first=False)
+            _wait_for_processing_after_save(
+                saves_completed=saved,
+                saves_total=len(items),
+                timeout_s=timeout_s,
+            )
             _log(
                 f"Waiting for next Save dialog — save {item.index}/{len(items)}, "
                 f"row {order.row_number}, PO {order.po!r}…"
@@ -1377,7 +1493,19 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     from automation.worldship_label_config import processing_timeout_s
 
-    proc_timeout = processing_timeout_s(order_count=4)
+    from automation.worldship_cornerstone_master import load_cornerstone_orders
+    from automation.worldship_label_work_plan import partition_worldship_label_rows
+    from automation.worldship_vendor_map import VendorMapRegistry
+
+    try:
+        _orders = load_cornerstone_orders()
+        _plan = partition_worldship_label_rows(
+            _orders, VendorMapRegistry(), build_destination=_build_label_destination
+        )
+        _proc_count = len(_plan.save_items) + len(_plan.print_orders)
+    except Exception:
+        _proc_count = 4
+    proc_timeout = processing_timeout_s(order_count=_proc_count or 4)
     _advance_after_preview_next(processing_timeout_s=proc_timeout)
 
     labels_saved = _save_shipping_labels()
