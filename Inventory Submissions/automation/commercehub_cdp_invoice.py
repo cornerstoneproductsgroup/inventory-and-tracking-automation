@@ -43,6 +43,7 @@ def run_retail_invoices_via_cdp(
         if str(inv_dir) not in sys.path:
             sys.path.insert(0, str(inv_dir))
         from commercehub_invoice_export import (  # noqa: WPS433
+            _prepare_page_for_cdp_invoices,
             _run_depot_invoice_flow,
             _run_lowes_invoice_flow,
             load_project_dotenv,
@@ -69,8 +70,15 @@ def run_retail_invoices_via_cdp(
                 raise RuntimeError("CDP browser has no contexts after connect.")
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else await context.new_page()
-            await _run_depot_invoice_flow(page, download_dir, day)
-            await _run_lowes_invoice_flow(page, download_dir, day)
-        print("CommerceHub invoice reports (Depot + Lowe's) complete.", flush=True)
+            await _prepare_page_for_cdp_invoices(page)
+            try:
+                await _run_depot_invoice_flow(page, download_dir, day)
+            except Exception as exc:
+                print(f"WARN: Depot invoice report failed: {exc}", flush=True)
+            try:
+                await _run_lowes_invoice_flow(page, download_dir, day)
+            except Exception as exc:
+                print(f"WARN: Lowe's invoice report failed: {exc}", flush=True)
+        print("CommerceHub invoice reports (Depot + Lowe's) finished.", flush=True)
 
     run_async(_run())

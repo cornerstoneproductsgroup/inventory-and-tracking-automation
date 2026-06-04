@@ -33,7 +33,11 @@ from commercehub_previous_business_day import (
     parse_report_date,
     previous_business_day,
 )
-from depot_invoice_postprocess import process_invoice_download, save_tractor_supply_csv
+from depot_invoice_postprocess import (
+    InvoiceExportEmpty,
+    process_invoice_download,
+    save_tractor_supply_csv,
+)
 from sps_commerce_flow import (
     load_sps_env_from_inventory_project,
     run_sps_tractor_transactions_and_advanced_search,
@@ -857,6 +861,45 @@ async def _failure_screenshot(context, page) -> None:
     _log("Could not capture failure screenshot.")
 
 
+def _postprocess_retail_export(
+    downloaded: Path, report_day, retailer: str, *, retailer_label: str
+) -> Path | None:
+    """Build workbook + print; return None on empty day or unreadable export (do not fail chain)."""
+    try:
+        out = process_invoice_download(downloaded, report_day, retailer)
+        _log(f"{retailer_label} workbook: {out}")
+        return out
+    except InvoiceExportEmpty as exc:
+        _log(f"{retailer_label}: {exc} — skipping post-process and print.")
+        _record_invoice_skip(f"{retailer_label} invoice report", "No invoice rows in export")
+        return None
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Could not find header row" in msg or "looks like HTML" in msg:
+            _log(f"WARN: {retailer_label} export format unexpected — {msg}")
+            try:
+                preview = downloaded.read_text(encoding="utf-8", errors="replace")[:400]
+                _log(f"  File preview: {preview!r}")
+            except Exception:
+                pass
+            _record_invoice_skip(f"{retailer_label} invoice report", msg[:200])
+            return None
+        raise
+
+
+async def _prepare_page_for_cdp_invoices(page) -> None:
+    """CDP attach may land on a non-search page after chain login — open home first."""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if "gotohome.do" in url or "gotoview" in url:
+        return
+    _log("Invoice CDP: navigating to CommerceHub home before Order Search…")
+    await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT_MS)
+
+
 async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
     _log("Depot invoicing: Order Search → saved search → export…")
     await _open_order_search(page)
@@ -873,9 +916,7 @@ async def _run_depot_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _sort_by_po_number(page)
     path = await _export_excel(page, download_dir, local_filename_stem="commercehub_depot")
     _log(f"Downloaded export: {path}")
-    depot_path = process_invoice_download(path, report_day, "depot")
-    _log(f"Depot workbook: {depot_path}")
-    return depot_path
+    return _postprocess_retail_export(path, report_day, "depot", retailer_label="Depot")
 
 
 async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path | None:
@@ -894,9 +935,7 @@ async def _run_lowes_invoice_flow(page, download_dir: Path, report_day) -> Path 
     await _sort_by_po_number(page)
     path_l = await _export_excel(page, download_dir, local_filename_stem="commercehub_lowes")
     _log(f"Downloaded Lowe's export: {path_l}")
-    lowes_path = process_invoice_download(path_l, report_day, "lowes")
-    _log(f"Lowe's workbook: {lowes_path}")
-    return lowes_path
+    return _postprocess_retail_export(path_l, report_day, "lowes", retailer_label="Lowe's")
 
 
 async def _run_sps_tractor_phase(

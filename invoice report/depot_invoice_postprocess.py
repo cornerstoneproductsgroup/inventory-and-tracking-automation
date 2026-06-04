@@ -318,6 +318,45 @@ def parse_order_line(value) -> int | None:
     return None
 
 
+class InvoiceExportEmpty(Exception):
+    """CommerceHub export has no invoice table (empty search day or summary-only file)."""
+
+
+def _line_looks_like_invoice_header(line: str) -> bool:
+    low = (line or "").lower()
+    if "order line number" in low:
+        return True
+    if "order" in low and "line" in low and ("po" in low or "vendor" in low or "sku" in low):
+        return True
+    parts = re.split(r"[,\t;]", line)
+    joined = " ".join(p.strip().lower() for p in parts if p.strip())
+    if "order" in joined and "line" in joined and ("po" in joined or "vendor" in joined):
+        return True
+    return False
+
+
+def _find_csv_header_index(lines: list[str]) -> int | None:
+    for i, line in enumerate(lines[:60]):
+        if _line_looks_like_invoice_header(line):
+            return i
+    return None
+
+
+def _text_indicates_no_invoices(text: str) -> bool:
+    low = (text or "").lower()
+    needles = (
+        "no record",
+        "no results",
+        "0 records",
+        "no orders found",
+        "search returned no",
+        "did not match",
+        "no matching",
+        "there are no",
+    )
+    return any(n in low for n in needles)
+
+
 def _find_column(columns: list[str], *must_contain: str, must_not_contain: tuple[str, ...] = ()) -> str:
     cols = [str(c).strip() for c in columns]
     for c in cols:
@@ -329,6 +368,10 @@ def _find_column(columns: list[str], *must_contain: str, must_not_contain: tuple
 
 def read_invoice_export(path: Path) -> tuple[list[str], pd.DataFrame]:
     """Split metadata lines (above table) from the tabular data."""
+    raw = path.read_bytes()
+    if raw[:2] == b"PK":
+        return _read_invoice_xlsx(path)
+
     suf = path.suffix.lower()
     if suf in (".xlsx", ".xlsm"):
         return _read_invoice_xlsx(path)
@@ -338,7 +381,6 @@ def read_invoice_export(path: Path) -> tuple[list[str], pd.DataFrame]:
             "or install xlrd and extend depot_invoice_postprocess."
         )
 
-    raw = path.read_bytes()
     text = None
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
@@ -349,17 +391,22 @@ def read_invoice_export(path: Path) -> tuple[list[str], pd.DataFrame]:
     if text is None:
         raise RuntimeError(f"Could not decode export file: {path}")
 
-    lines = text.splitlines()
-    header_i = None
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if "order" in low and "line" in low and ("po" in low or "vendor" in low or "sku" in low):
-            header_i = i
-            break
+    if "<html" in text[:500].lower():
+        raise RuntimeError(
+            f"Export file looks like HTML, not a CommerceHub invoice CSV: {path}"
+        )
+
+    lines = [ln for ln in text.splitlines() if ln is not None]
+    header_i = _find_csv_header_index(lines)
     if header_i is None:
+        if _text_indicates_no_invoices(text) or len(lines) < 12:
+            raise InvoiceExportEmpty(
+                f"No invoice rows in export (empty day or summary-only): {path}"
+            )
+        preview = "\n".join(lines[:6])
         raise RuntimeError(
             f"Could not find header row (Order Line / PO / Vendor) in {path}. "
-            "Check the export format."
+            f"Check the export format. First lines:\n{preview}"
         )
 
     meta = lines[:header_i]
