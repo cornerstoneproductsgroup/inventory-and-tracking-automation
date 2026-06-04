@@ -19,7 +19,17 @@ Example (6 shipments):
 
 ## Phases
 
-1. **Phase 1** — Every SAVE row: wait for a **new** Save dialog → enter **PO filename** → set **vendor folder** → **re-enter PO** (folder nav clears it) → Save → verify on disk. One automatic retry if Save does not complete.
+1. **Phase 1** — Every SAVE row: verify PO/SKU/folder → change **folder** → pause **1s** → enter **PO filename** → verify (retry entry if empty) → **Save** → confirm on disk. One full retry only if Save fails.
+
+## Save dialog steps (automation)
+
+1. Save window opens — log expected PO, SKU, folder, filename  
+2. Change folder (Alt+D to vendor path)  
+3. Pause ~1 second (`WORLDSHIP_SAVE_AFTER_FOLDER_S`)  
+4. Enter PO in **File name**  
+5. Read back field — if empty/wrong, try again (up to 3 times)  
+6. Click **Save** only when filename is confirmed non-empty  
+7. One retry of the full sequence if the dialog stays open
 2. **Phase 2** — Warehouse-print rows: wait for print; dismiss any unexpected Save dialog.
 
 ## Automatic Processing Progress — do not click Stop
@@ -44,6 +54,8 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 ## Env tuning
 
 - `WORLDSHIP_SAVE_BETWEEN_LABELS_S` — pause between save dialogs (default 2)
-- `WORLDSHIP_SAVE_FOLDER_NAV_S` — max wait after folder path Enter (default 1.0; skipped when vendor folder unchanged)
-- `WORLDSHIP_SAVE_FILENAME_SETTLE_S` — brief pause after setting filename (default 0.25)
+- `WORLDSHIP_SAVE_AFTER_FOLDER_S` — pause after folder path Enter before typing PO (default 1.0)
+- `WORLDSHIP_SAVE_FILENAME_ATTEMPTS` — tries to enter PO if field empty (default 3)
+- `WORLDSHIP_SAVE_FOLDER_NAV_S` — max wait for folder to load (default 1.2)
+- `WORLDSHIP_SAVE_FILENAME_SETTLE_S` — pause after typing filename (default 0.35)
 - `WORLDSHIP_FIRST_SAVE_TIMEOUT_S` / `WORLDSHIP_SAVE_TIMEOUT_S` — wait for dialog

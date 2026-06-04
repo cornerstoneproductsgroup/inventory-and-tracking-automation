@@ -1382,7 +1382,13 @@ def _run_save_label_phase(plan) -> int:
         _log(f"  → folder: {dest.parent}")
         _log(f"  → file:   {dest.name}")
 
-        if not fill_save_as_dialog(dest, timeout_s=90.0, dialog_hwnd=dialog_hwnd):
+        if not fill_save_as_dialog(
+            dest,
+            timeout_s=90.0,
+            dialog_hwnd=dialog_hwnd,
+            po=order.po,
+            sku=order.sku,
+        ):
             raise RuntimeError(
                 f"Failed to save label {item.index}/{len(items)} for PO {order.po!r} "
                 f"(row {order.row_number}) to:\n  {dest}"
