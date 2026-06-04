@@ -85,7 +85,10 @@ Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
 - `ORDER_SPLITTER_V2_DIR` / `ORDER_SPLITTER_WATCHER_PY` — where to read `WAREHOUSE_VENDORS` (see above)
 - `FEDEX_WAREHOUSE_LABEL_PRINTER` — Zebra name override (falls back to `PULL_ORDERS_SOS_LABEL_PRINTER`, then auto-detect **Zebra ZP 450**)
 - `FEDEX_AFTER_ROW_SELECT_MS` — pause after row checkboxes before **Finalize** (default 2000; or `timing.after_row_select_ms` in `fedex_batch.json`)
-- `FEDEX_AFTER_NAV_MS` / `FEDEX_AFTER_COOKIE_MS` — wait for page load after open/cookie accept before login fields (defaults 2000 / 2500)
+- `FEDEX_INITIAL_WAIT_MS` — one short wait after first page open (default 1200)
+- `FEDEX_AFTER_COOKIE_MS` — pause after Accept cookies (default 600)
+- `FEDEX_MICRO_PAUSE_MS` — small pauses between quick login steps (default 350)
+- `selectors.load_retry_button` — Retry on FedEx “failed to load” pages (auto re-login after click)
 
 ### Warehouse-print vendors (same as Order Splitter)
 

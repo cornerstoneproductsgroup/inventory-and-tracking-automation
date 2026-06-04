@@ -25,7 +25,8 @@
     "finalize_print_manual": "span.mat-mdc-menu-item-text:text-matches('Finalize and print manually', 'i')",
     "select_all_checkbox": "thead label.fdx-c-form-group__label[data-test-id='label'], thead label[for^='fedex-checkbox-']",
     "download_button": "button:has-text('DOWNLOAD'), a:has-text('DOWNLOAD')",
-    "shipment_report_menu": "span.mat-mdc-menu-item-text:has-text('Shipment report (.xlsx file)')"
+    "shipment_report_menu": "span.mat-mdc-menu-item-text:has-text('Shipment report (.xlsx file)')",
+    "load_retry_button": "button:has-text('Retry'), .fdx-c-button:has-text('Retry')"
   },
   "label_save": {
     "use_native_save_dialog": true,
@@ -33,7 +34,8 @@
   },
   "timing": {
     "after_row_select_ms": 2000,
-    "after_navigation_ms": 2000,
-    "after_cookie_accept_ms": 2500
+    "initial_wait_ms": 1200,
+    "after_cookie_accept_ms": 600,
+    "micro_pause_ms": 350
   }
 }
