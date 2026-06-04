@@ -875,27 +875,7 @@ def _wait_for_optional_smart_pickup() -> None:
     _log("No Smart Pickup prompt — continuing.")
 
 
-def _advance_after_preview_next(*, processing_timeout_s: float) -> None:
-    """
-    Optional Smart Pickup Yes, then wait for processing — unless save/processing
-    is already underway (pickup prompt skipped on repeat runs).
-    """
-    from automation.windows_save_as import find_save_as_dialog_hwnd
-
-    if find_save_as_dialog_hwnd():
-        _log("Save Print Output dialog already open — skipping pickup and processing wait.")
-        return
-
-    if _has_processing_progress_window():
-        _log("Automatic Processing Progress already open.")
-    else:
-        _wait_for_optional_smart_pickup()
-
-    if find_save_as_dialog_hwnd():
-        _log("Save Print Output dialog ready.")
-        return
-
-    _wait_for_automatic_processing(timeout_s=processing_timeout_s)
+def _wait_for_automatic_processing(*, timeout_s: float) -> None:
     """Wait until batch processing finishes and label save dialogs are ready."""
     from automation.windows_save_as import find_save_as_dialog_hwnd
 
@@ -934,6 +914,29 @@ def _advance_after_preview_next(*, processing_timeout_s: float) -> None:
     raise TimeoutError(
         f"Automatic Processing Progress did not appear within {timeout_s:.0f}s."
     )
+
+
+def _advance_after_preview_next(*, processing_timeout_s: float) -> None:
+    """
+    Optional Smart Pickup Yes, then wait for processing — unless save/processing
+    is already underway (pickup prompt skipped on repeat runs).
+    """
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    if find_save_as_dialog_hwnd():
+        _log("Save Print Output dialog already open — skipping pickup and processing wait.")
+        return
+
+    if _has_processing_progress_window():
+        _log("Automatic Processing Progress already open.")
+    else:
+        _wait_for_optional_smart_pickup()
+
+    if find_save_as_dialog_hwnd():
+        _log("Save Print Output dialog ready.")
+        return
+
+    _wait_for_automatic_processing(timeout_s=processing_timeout_s)
 
 
 def _click_button_win32(hwnd: int, button_text: str) -> bool:
