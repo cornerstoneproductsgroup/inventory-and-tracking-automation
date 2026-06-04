@@ -243,11 +243,37 @@ def _cookie_accept_selectors(cfg: dict[str, Any]) -> list[str]:
     return deduped
 
 
+def _timing_ms(cfg: dict[str, Any], key: str, env_key: str, default: int) -> int:
+    timing = cfg.get("timing") or {}
+    raw = str(timing.get(key) or os.environ.get(env_key) or default).strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _settle_fedex_page(page: Page, cfg: dict[str, Any], *, reason: str) -> None:
+    """Wait for navigation/load to finish before looking for login or batch UI."""
+    extra_ms = _timing_ms(cfg, "after_navigation_ms", "FEDEX_AFTER_NAV_MS", 2000)
+    _log(f"Waiting for FedEx page to load ({reason})…")
+    if extra_ms > 0:
+        page.wait_for_timeout(extra_ms)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=90_000)
+    except PlaywrightTimeout:
+        _log("WARN: domcontentloaded timeout — continuing.")
+    try:
+        page.wait_for_load_state("networkidle", timeout=35_000)
+    except PlaywrightTimeout:
+        _log("Page still active (network) — waiting for login or batch UI…")
+
+
 def _maybe_accept_fedex_cookies(page: Page, cfg: dict[str, Any], *, peel_overlays: bool = True) -> bool:
     """Click FedEx OneTrust 'Accept all cookies' when the banner is shown (optional step)."""
     page.wait_for_timeout(400)
     if peel_overlays:
         _fedex_peel_blocking_overlays(page)
+    accepted = False
     for sel in _cookie_accept_selectors(cfg):
         try:
             root = page.locator(sel)
@@ -257,35 +283,39 @@ def _maybe_accept_fedex_cookies(page: Page, cfg: dict[str, Any], *, peel_overlay
             loc.wait_for(state="visible", timeout=2500)
             loc.click(timeout=5000)
             _log(f"Accepted cookies ({sel!r}).")
-            page.wait_for_timeout(600)
-            return True
+            accepted = True
+            break
         except Exception:
             continue
-    try:
-        loc = page.locator("#onetrust-accept-btn-handler").first
-        if loc.count() > 0:
-            loc.click(force=True, timeout=4000)
-            _log("Accepted cookies (force click).")
-            page.wait_for_timeout(600)
-            return True
-    except Exception:
-        pass
-    try:
-        clicked = page.evaluate(
-            """() => {
-            const btn = document.querySelector('#onetrust-accept-btn-handler');
-            if (!btn) return false;
-            btn.click();
-            return true;
-        }"""
-        )
-        if clicked:
-            _log("Accepted cookies (JS click).")
-            page.wait_for_timeout(600)
-            return True
-    except Exception:
-        pass
-    return False
+    if not accepted:
+        try:
+            loc = page.locator("#onetrust-accept-btn-handler").first
+            if loc.count() > 0:
+                loc.click(force=True, timeout=4000)
+                _log("Accepted cookies (force click).")
+                accepted = True
+        except Exception:
+            pass
+    if not accepted:
+        try:
+            clicked = page.evaluate(
+                """() => {
+                const btn = document.querySelector('#onetrust-accept-btn-handler');
+                if (!btn) return false;
+                btn.click();
+                return true;
+            }"""
+            )
+            if clicked:
+                _log("Accepted cookies (JS click).")
+                accepted = True
+        except Exception:
+            pass
+    if accepted:
+        post_ms = _timing_ms(cfg, "after_cookie_accept_ms", "FEDEX_AFTER_COOKIE_MS", 2500)
+        page.wait_for_timeout(post_ms)
+        _settle_fedex_page(page, cfg, reason="after cookie accept")
+    return accepted
 
 
 def _is_batch_page(page: Page) -> bool:
@@ -301,16 +331,17 @@ def _login_scopes(page: Page) -> list[Page | Frame]:
 
 
 def _login_field_locators(
-    scope: Page | Frame, cfg: dict[str, Any]
+    scope: Page | Frame, cfg: dict[str, Any], *, quick: bool = False
 ) -> tuple[Any, Any] | None:
     user_sel = _sel(cfg, "username_input", "#username")
     pass_sel = _sel(cfg, "password_input", "#password")
+    wait_ms = 1500 if quick else 5000
     user_root = scope.locator(user_sel)
     if user_root.count() == 0:
         return None
     user = user_root.first
     try:
-        user.wait_for(state="visible", timeout=2000)
+        user.wait_for(state="visible", timeout=wait_ms)
         if not user.is_enabled():
             return None
     except Exception:
@@ -320,7 +351,7 @@ def _login_field_locators(
         return None
     pw = pw_root.first
     try:
-        pw.wait_for(state="visible", timeout=2000)
+        pw.wait_for(state="visible", timeout=wait_ms)
         if not pw.is_enabled():
             return None
     except Exception:
@@ -329,28 +360,78 @@ def _login_field_locators(
 
 
 def _find_login_form(
-    page: Page, cfg: dict[str, Any]
+    page: Page, cfg: dict[str, Any], *, quick: bool = False
 ) -> tuple[Any, Any, Page | Frame] | None:
     for scope in _login_scopes(page):
-        hit = _login_field_locators(scope, cfg)
+        hit = _login_field_locators(scope, cfg, quick=quick)
         if hit:
             user, pw = hit
             return user, pw, scope
     return None
 
 
-def _wait_for_login_form(page: Page, cfg: dict[str, Any], *, timeout_ms: int = 90_000) -> tuple[Any, Any, Page | Frame]:
+def _wait_for_login_ready(
+    page: Page, cfg: dict[str, Any], *, timeout_ms: int = 120_000
+) -> tuple[Any, Any, Page | Frame] | None:
+    """
+    Wait until username/password are visible, enabled, and stable (not a loading flash).
+    Returns None if the batch page loaded instead (already signed in).
+    """
+    _log("Waiting for FedEx login form to be ready…")
     deadline = time.monotonic() + timeout_ms / 1000.0
+    stable_hits = 0
+    last_url = ""
+
     while time.monotonic() < deadline:
-        hit = _find_login_form(page, cfg)
+        if _is_batch_page(page):
+            _log("Batch uploads page is ready — login not required.")
+            return None
+
+        hit = _find_login_form(page, cfg, quick=True)
         if hit:
-            _log(f"Login form visible ({page.url}).")
-            return hit
-        page.wait_for_timeout(450)
+            user, pw, scope = hit
+            try:
+                ready = (
+                    user.is_visible()
+                    and pw.is_visible()
+                    and user.is_enabled()
+                    and pw.is_enabled()
+                )
+            except Exception:
+                ready = False
+            if ready:
+                stable_hits += 1
+                if stable_hits >= 3:
+                    _log(f"Login form ready ({page.url}).")
+                    return user, pw, scope
+            else:
+                stable_hits = 0
+        else:
+            stable_hits = 0
+
+        url = page.url
+        if url != last_url:
+            _log(f"Login page loading… {url}")
+            last_url = url
+        page.wait_for_timeout(500)
+
     raise FedexBatchError(
-        f"FedEx login form did not stay visible (last URL: {page.url}). "
+        f"FedEx login form did not become ready within {timeout_ms / 1000:.0f}s "
+        f"(last URL: {page.url}). "
         "Use login_url https://www.fedex.com/secure-login/en-us/ in fedex_batch.json."
     )
+
+
+def _wait_for_login_or_batch(page: Page, cfg: dict[str, Any], *, timeout_ms: int = 90_000) -> str:
+    """Return 'batch' if uploads page is ready, 'login' if login form is ready."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        if _is_batch_page(page):
+            return "batch"
+        if _find_login_form(page, cfg, quick=True):
+            return "login"
+        page.wait_for_timeout(500)
+    return ""
 
 
 def _login_submit_selectors(cfg: dict[str, Any]) -> list[str]:
@@ -376,20 +457,31 @@ def _login_submit_selectors(cfg: dict[str, Any]) -> list[str]:
 
 
 def _fill_login_field(field: Any, value: str, *, label: str) -> None:
-    field.click(timeout=15_000)
+    field.wait_for(state="visible", timeout=60_000)
+    for _ in range(30):
+        try:
+            if field.is_enabled():
+                break
+        except Exception:
+            pass
+        pg = getattr(field, "page", None)
+        if pg is not None:
+            pg.wait_for_timeout(200)
+    field.click(timeout=20_000)
     field.fill("")
     page_wait = getattr(field, "page", None)
     if page_wait is not None:
-        page_wait.wait_for_timeout(150)
-    field.fill(value)
+        page_wait.wait_for_timeout(200)
+    field.fill(value, timeout=30_000)
     if page_wait is not None:
-        page_wait.wait_for_timeout(250)
+        page_wait.wait_for_timeout(350)
     try:
         got = (field.input_value() or "").strip()
         want = value.strip()
         if got != want:
-            _log(f"WARN: {label} field value mismatch after fill; retrying once.")
-            field.fill(value)
+            _log(f"WARN: {label} mismatch after fill ({got!r} vs expected); retrying.")
+            field.click(timeout=10_000)
+            field.fill(value, timeout=30_000)
     except Exception:
         pass
 
@@ -434,14 +526,16 @@ def _wait_for_logged_in(page: Page, cfg: dict[str, Any], *, timeout_ms: int = 12
 
 
 def _perform_fedex_login(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
-    user, pw, scope = _wait_for_login_form(page, cfg)
+    hit = _wait_for_login_ready(page, cfg)
+    if hit is None:
+        return
+    user, pw, scope = hit
     _log(f"Entering credentials for {creds.username!r}")
     _fill_login_field(user, creds.username, label="username")
     _fill_login_field(pw, creds.password, label="password")
-    page.wait_for_timeout(400)
+    page.wait_for_timeout(600)
     _click_login_submit(page, scope, cfg)
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(1500)
+    _settle_fedex_page(page, cfg, reason="after Log In click")
     _wait_for_logged_in(page, cfg)
 
 
@@ -466,21 +560,19 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -
 
     _log(f"Opening batch page (will log in if needed): {batch_url}")
     page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(1500)
+    _settle_fedex_page(page, cfg, reason="batch page open")
     _maybe_accept_fedex_cookies(page, cfg)
 
     if _is_batch_page(page):
         _log("Already on batch uploads page (session active).")
         return
 
-    # Batch page may redirect to login; wait briefly before opening another URL.
-    for _ in range(10):
-        if _find_login_form(page, cfg):
-            break
-        page.wait_for_timeout(500)
+    state = _wait_for_login_or_batch(page, cfg, timeout_ms=90_000)
+    if state == "batch":
+        _log("Batch uploads page loaded after cookies/redirect.")
+        return
 
-    # Stay on the current page when FedEx already showed a login form (do not jump to home).
-    if _find_login_form(page, cfg):
+    if state == "login":
         _log("Login form on current page — signing in without leaving.")
         _perform_fedex_login(page, cfg, creds)
         _open_batch_after_login(page, cfg)
@@ -488,8 +580,13 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -
 
     _log(f"Opening FedEx login as {creds.username!r}: {login_url}")
     page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(1200)
+    _settle_fedex_page(page, cfg, reason="login page open")
     _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
+
+    state = _wait_for_login_or_batch(page, cfg, timeout_ms=60_000)
+    if state == "batch":
+        _log("Batch uploads page ready (skipped separate login).")
+        return
 
     _perform_fedex_login(page, cfg, creds)
     _open_batch_after_login(page, cfg)

@@ -32,6 +32,8 @@
     "pause_between_labels_ms": 1000
   },
   "timing": {
-    "after_row_select_ms": 2000
+    "after_row_select_ms": 2000,
+    "after_navigation_ms": 2000,
+    "after_cookie_accept_ms": 2500
   }
 }
