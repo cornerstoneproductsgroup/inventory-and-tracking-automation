@@ -1127,7 +1127,11 @@ def _build_label_destination(order, vendor_maps: "VendorMapRegistry"):
 
 
 def _save_shipping_labels() -> int:
-    from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
+    from automation.windows_save_as import (
+        fill_save_as_dialog,
+        find_save_as_dialog_hwnd,
+        wait_for_save_as_dialog,
+    )
     from automation.worldship_cornerstone_master import load_cornerstone_orders
     from automation.worldship_label_config import label_save_gap_s, save_dialog_timeout_s
     from automation.worldship_vendor_map import VendorMapRegistry
@@ -1172,15 +1176,24 @@ def _save_shipping_labels() -> int:
         )
         _log(f"  → folder: {dest.parent}")
         _log(f"  → file:   {dest.name}")
-        if not fill_save_as_dialog(dest, timeout_s=45.0):
-            raise RuntimeError(f"Failed to save label for PO {order.po!r} to {dest}")
+        if not fill_save_as_dialog(dest, timeout_s=60.0):
+            raise RuntimeError(
+                f"Failed to save label for PO {order.po!r} (SKU {order.sku!r}) to:\n  {dest}"
+            )
+        if not dest.is_file():
+            raise RuntimeError(f"Label file missing after save: {dest}")
         saved += 1
-        _log(f"Saved label {saved}/{len(orders)}: {dest.name}")
+        _log(f"Saved label {saved}/{len(orders)}: {dest}")
         if saved >= len(orders):
             break
         gap_s = label_save_gap_s()
         _log(f"Waiting {gap_s:.0f}s for next Save Print Output dialog…")
         time.sleep(gap_s)
+        # Ensure the previous dialog is gone before waiting for the next one.
+        for _ in range(20):
+            if not find_save_as_dialog_hwnd(log=False):
+                break
+            time.sleep(0.35)
 
     if orders is None:
         raise RuntimeError("No save dialogs appeared — nothing to save.")

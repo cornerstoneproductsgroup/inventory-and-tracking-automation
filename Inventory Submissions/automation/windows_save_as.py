@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import time
 from pathlib import Path
 
@@ -62,6 +63,14 @@ def _send_ctrl_a() -> None:
     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
+def _folder_nav_pause_s() -> float:
+    raw = (os.environ.get("WORLDSHIP_SAVE_FOLDER_NAV_S") or "1.4").strip()
+    try:
+        return max(0.8, float(raw))
+    except ValueError:
+        return 1.4
+
+
 def _dialog_title(hwnd: int) -> str:
     import win32gui
 
@@ -89,8 +98,6 @@ def _score_save_dialog(hwnd: int) -> int:
         score += 40
     if "save as" in title or title == "save":
         score += 20
-    if "save label" in title or "save shipment" in title:
-        score += 15
     return score
 
 
@@ -146,19 +153,7 @@ def _focus_dialog(hwnd: int) -> None:
         pass
 
 
-def _safe_get_dlg_item(parent_hwnd: int, ctrl_id: int) -> int:
-    """GetDlgItem raises error 1421 when the control id does not exist."""
-    import win32gui
-
-    try:
-        child = win32gui.GetDlgItem(parent_hwnd, ctrl_id)
-        return int(child) if child else 0
-    except Exception:
-        return 0
-
-
 def _walk_descendants(parent_hwnd: int, visit) -> None:
-    """Depth-first walk of all child windows (EnumChildWindows is one level only)."""
     import win32gui
 
     def _child_cb(child: int, _) -> bool:
@@ -173,7 +168,6 @@ def _walk_descendants(parent_hwnd: int, visit) -> None:
 
 
 def _find_filename_edit_hwnd(parent_hwnd: int) -> int:
-    """File name field in WorldShip Save Print Output (ComboBoxEx32 chain)."""
     import win32gui
 
     combo_boxes: list[int] = []
@@ -201,17 +195,7 @@ def _find_filename_edit_hwnd(parent_hwnd: int) -> int:
             edits.append(hwnd)
 
     _walk_descendants(parent_hwnd, _visit_edit)
-    if edits:
-        return edits[-1]
-
-    for ctrl_id in (1148, 1152, 1001):
-        child = _safe_get_dlg_item(parent_hwnd, ctrl_id)
-        if not child:
-            continue
-        edit = win32gui.FindWindowEx(child, 0, "Edit", None)
-        if edit:
-            return edit
-    return 0
+    return edits[-1] if edits else 0
 
 
 def _find_save_button_hwnd(parent_hwnd: int) -> int:
@@ -230,14 +214,7 @@ def _find_save_button_hwnd(parent_hwnd: int) -> int:
             save_btn = hwnd
 
     _walk_descendants(parent_hwnd, _visit)
-    if save_btn:
-        return save_btn
-
-    for ctrl_id in (1, 2):
-        btn = _safe_get_dlg_item(parent_hwnd, ctrl_id)
-        if btn:
-            return btn
-    return 0
+    return save_btn
 
 
 def _read_edit_text(edit_hwnd: int) -> str:
@@ -267,36 +244,15 @@ def _set_edit_text(edit_hwnd: int, text: str) -> bool:
         return False
 
 
-def _filename_field_ok(edit_hwnd: int, dest: Path) -> bool:
+def _filename_matches(edit_hwnd: int, dest: Path) -> bool:
     if not edit_hwnd:
         return False
-    current = _read_edit_text(edit_hwnd)
+    current = _read_edit_text(edit_hwnd).strip().lower()
     if not current:
         return False
-    name = dest.name
-    stem = dest.stem
-    cur = current.strip().lower()
-    return name.lower() in cur or stem.lower() in cur or cur.endswith(".pdf")
-
-
-def _paste_into_edit(edit_hwnd: int, text: str, *, parent_hwnd: int) -> bool:
-    import win32gui
-
-    try:
-        win32gui.SetForegroundWindow(parent_hwnd)
-        win32gui.SetFocus(edit_hwnd)
-    except Exception:
-        pass
-    time.sleep(0.15)
-    if _set_edit_text(edit_hwnd, text):
-        time.sleep(0.12)
-        if _read_edit_text(edit_hwnd):
-            return True
-    _set_clipboard(text)
-    _send_ctrl_a()
-    _send_ctrl_v()
-    time.sleep(0.25)
-    return bool(_read_edit_text(edit_hwnd))
+    want = dest.name.strip().lower()
+    stem = dest.stem.strip().lower()
+    return want in current or current == stem or current.endswith(f"{stem}.pdf")
 
 
 def _click_save_button(hwnd: int) -> bool:
@@ -308,140 +264,83 @@ def _click_save_button(hwnd: int) -> bool:
         try:
             win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
         except Exception:
-            try:
-                win32gui.SendMessage(btn, win32con.BM_CLICK, 0, 0)
-            except Exception:
-                pass
-        _log("Clicked Save button.")
+            pass
+        _log("Clicked Save.")
         return True
     _send_alt_key("s")
     _log("Sent Alt+S for Save.")
     return True
 
 
-def _focus_filename_field_keyboard() -> None:
-    """Common dialog accelerator: Alt+N focuses File name."""
-    _send_alt_key("n")
-    time.sleep(0.35)
+def _navigate_to_folder(hwnd: int, folder: Path) -> None:
+    """Always set folder via address bar (Alt+D) — do not assume WorldShip opened the right place."""
+    import win32con
 
-
-def _try_keyboard_filename(hwnd: int, dest: Path) -> bool:
-    """Alt+N → paste PO.pdf → verify → Save (no GetDlgItem)."""
+    folder_str = str(folder)
+    _log(f"Setting folder: {folder_str}")
     _focus_dialog(hwnd)
     time.sleep(0.45)
-    _set_clipboard(dest.name)
-    _focus_filename_field_keyboard()
+    _set_clipboard(folder_str)
+    _send_alt_key("d")
+    time.sleep(0.45)
     _send_ctrl_a()
     _send_ctrl_v()
-    time.sleep(0.35)
-
-    edit = _find_filename_edit_hwnd(hwnd)
-    if edit:
-        current = _read_edit_text(edit)
-        _log(f"File name field: {current!r}")
-        if not _filename_field_ok(edit, dest):
-            _log("WARN: keyboard paste did not set filename — retrying focus.")
-            _focus_dialog(hwnd)
-            _focus_filename_field_keyboard()
-            _send_ctrl_a()
-            _send_ctrl_v()
-            time.sleep(0.35)
-            if not _filename_field_ok(edit, dest):
-                return False
-    else:
-        _log("Filename edit not found; saving after keyboard paste anyway.")
-
-    time.sleep(0.2)
-    _click_save_button(hwnd)
-    return True
+    time.sleep(0.25)
+    _send_vk(win32con.VK_RETURN)
+    time.sleep(_folder_nav_pause_s())
 
 
-def _try_wmset_filename(hwnd: int, dest: Path) -> bool:
-    _focus_dialog(hwnd)
-    time.sleep(0.4)
-    edit = _find_filename_edit_hwnd(hwnd)
-    if not edit:
-        _log("WARN: no filename edit for WM_SETTEXT.")
-        return False
-
-    _log(f"WM_SETTEXT filename {dest.name!r}…")
-    if not _paste_into_edit(edit, dest.name, parent_hwnd=hwnd):
-        return False
-    current = _read_edit_text(edit)
-    _log(f"File name field: {current!r}")
-    if not _filename_field_ok(edit, dest):
-        return False
-    time.sleep(0.2)
-    _click_save_button(hwnd)
-    return True
-
-
-def _try_full_path_keyboard(hwnd: int, dest: Path) -> bool:
-    """Paste full UNC path into File name."""
-    _focus_dialog(hwnd)
-    time.sleep(0.4)
-    _set_clipboard(str(dest))
-    _focus_filename_field_keyboard()
-    _send_ctrl_a()
-    _send_ctrl_v()
-    time.sleep(0.35)
-    edit = _find_filename_edit_hwnd(hwnd)
-    if edit and dest.name.lower() not in _read_edit_text(edit).lower():
-        return False
-    time.sleep(0.2)
-    _click_save_button(hwnd)
-    return True
-
-
-def _navigate_to_folder(hwnd: int, folder: Path) -> None:
+def _clear_filename_field(hwnd: int) -> None:
+    """Clear stale path/PO text before entering the current label."""
     import win32con
 
     _focus_dialog(hwnd)
-    time.sleep(0.35)
-    _set_clipboard(str(folder))
-    _send_alt_key("d")
-    time.sleep(0.35)
+    time.sleep(0.2)
+    edit = _find_filename_edit_hwnd(hwnd)
+    if edit:
+        _set_edit_text(edit, "")
+    _send_alt_key("n")
+    time.sleep(0.3)
+    _send_ctrl_a()
+    _send_vk(win32con.VK_DELETE)
+    time.sleep(0.15)
+
+
+def _set_filename_only(hwnd: int, dest: Path) -> bool:
+    """File name = PO.pdf only (folder must already be set)."""
+    _clear_filename_field(hwnd)
+    edit = _find_filename_edit_hwnd(hwnd)
+    _set_clipboard(dest.name)
+    _send_alt_key("n")
+    time.sleep(0.3)
     _send_ctrl_a()
     _send_ctrl_v()
-    time.sleep(0.2)
-    _send_vk(win32con.VK_RETURN)
-    time.sleep(0.9)
+    time.sleep(0.35)
 
-
-def _try_folder_and_filename(hwnd: int, dest: Path) -> bool:
-    _navigate_to_folder(hwnd, dest.parent)
-    return _try_keyboard_filename(hwnd, dest)
-
-
-def _try_pywinauto_filename(hwnd: int, dest: Path) -> bool:
-    try:
-        from pywinauto import Application
-    except ImportError:
-        return False
-
-    try:
-        app = Application(backend="win32").connect(handle=hwnd, visible_only=True)
-        dlg = app.window(handle=hwnd)
-        dlg.set_focus()
-        time.sleep(0.4)
-        combo = dlg.child_window(class_name="ComboBoxEx32")
-        combo.set_focus()
-        combo.type_keys("^a", pause=0.05)
-        combo.type_keys(dest.name, with_spaces=True, pause=0.02)
-        time.sleep(0.2)
-        edit = _find_filename_edit_hwnd(hwnd)
-        if edit and not _filename_field_ok(edit, dest):
+    if edit:
+        if not _filename_matches(edit, dest):
+            _set_edit_text(edit, dest.name)
+            time.sleep(0.15)
+        current = _read_edit_text(edit)
+        _log(f"File name field: {current!r}")
+        if not _filename_matches(edit, dest):
+            _log(f"ERROR: expected filename {dest.name!r}.")
             return False
-        for btn in dlg.descendants(class_name="Button"):
-            if (btn.window_text() or "").replace("&", "").strip().lower() == "save":
-                btn.click_input()
-                _log("Clicked Save (pywinauto).")
-                return True
-        dlg.type_keys("%s", pause=0.05)
         return True
-    except Exception as exc:
-        _log(f"WARN: pywinauto filename failed: {exc}")
+
+    _log("WARN: cannot read filename field; continuing after keyboard paste.")
+    return True
+
+
+def _dest_file_ready(dest: Path, *, started: float, min_bytes: int) -> bool:
+    if not dest.is_file():
         return False
+    try:
+        size = dest.stat().st_size
+        mtime = dest.stat().st_mtime
+    except OSError:
+        return False
+    return size >= min_bytes and mtime >= started - 8
 
 
 def dismiss_overwrite_prompt(*, timeout_s: float = 4.0) -> None:
@@ -457,29 +356,52 @@ def dismiss_overwrite_prompt(*, timeout_s: float = 4.0) -> None:
         time.sleep(0.15)
 
 
-def _wait_save_complete(
+def _wait_for_save_result(
     hwnd: int,
     dest: Path,
     *,
     started: float,
-    deadline: float,
+    timeout_s: float,
     min_bytes: int,
 ) -> bool:
+    """Dialog must close AND the PDF must exist at the exact target path."""
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if _dest_file_ready(dest, started=started, min_bytes=min_bytes):
+            _log(f"Confirmed on disk: {dest} ({dest.stat().st_size:,} bytes)")
+            return True
         if not _dialog_still_open(hwnd):
-            for _ in range(40):
-                if dest.is_file() and dest.stat().st_size >= min_bytes:
-                    if dest.stat().st_mtime >= started - 10:
-                        _log(f"Saved ({dest.stat().st_size:,} bytes).")
-                        return True
+            for _ in range(50):
+                if _dest_file_ready(dest, started=started, min_bytes=min_bytes):
+                    _log(f"Confirmed on disk: {dest} ({dest.stat().st_size:,} bytes)")
+                    return True
                 time.sleep(0.25)
-            _log("Dialog closed but file not found at destination yet.")
+            _log(
+                "Dialog closed but the PDF is not at the target path "
+                "(wrong folder or save was cancelled)."
+            )
             return False
         time.sleep(0.3)
-
     if _dialog_still_open(hwnd):
-        _log("ERROR: Save dialog still open — filename may be empty or Save was blocked.")
-    return dest.is_file() and dest.stat().st_size >= min_bytes
+        _log("ERROR: Save dialog still open after Save click.")
+    return False
+
+
+def _worldship_save_once(hwnd: int, dest: Path, *, started: float, min_bytes: int) -> bool:
+    """
+    One label, one dialog: navigate folder → clear → PO filename → Save.
+    Never paste a full UNC into File name (that leaks into the next dialog).
+    """
+    _navigate_to_folder(hwnd, dest.parent)
+    if not _set_filename_only(hwnd, dest):
+        return False
+    time.sleep(0.25)
+    _click_save_button(hwnd)
+    time.sleep(0.5)
+    dismiss_overwrite_prompt()
+    return _wait_for_save_result(
+        hwnd, dest, started=started, timeout_s=25.0, min_bytes=min_bytes
+    )
 
 
 def fill_save_as_dialog(
@@ -488,11 +410,10 @@ def fill_save_as_dialog(
     timeout_s: float = 45.0,
     min_bytes: int = 100,
 ) -> bool:
-    """Save Print Output As: PO filename in vendor folder, then confirm."""
+    """Save Print Output As: vendor folder + PO.pdf, verify exact path on disk."""
     dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    deadline = time.monotonic() + timeout_s
 
     hwnd = find_save_as_dialog_hwnd(log=True)
     if not hwnd:
@@ -502,36 +423,23 @@ def fill_save_as_dialog(
     _log(f"Target folder: {dest.parent}")
     _log(f"Target file:   {dest.name}")
 
-    steps = (
-        ("keyboard Alt+N PO", _try_keyboard_filename),
-        ("pywinauto ComboBoxEx32", _try_pywinauto_filename),
-        ("WM_SETTEXT filename", _try_wmset_filename),
-        ("full path keyboard", _try_full_path_keyboard),
-        ("folder + PO keyboard", _try_folder_and_filename),
-    )
+    if _worldship_save_once(hwnd, dest, started=started, min_bytes=min_bytes):
+        return True
 
-    for step_name, fn in steps:
-        if time.monotonic() >= deadline:
-            break
-        if not _dialog_still_open(hwnd):
-            hwnd = find_save_as_dialog_hwnd(log=True)
-            if not hwnd:
-                break
+    # Dialog closed without success — do NOT touch the next Save dialog.
+    if not _dialog_still_open(hwnd):
+        _log(
+            "ERROR: Save dialog closed but file was not written to the target path. "
+            "Fix folder/filename manually before the next label."
+        )
+        return False
+
+    if time.monotonic() - started < timeout_s - 5:
+        _log("Retrying same Save dialog once (folder + PO)…")
         _focus_dialog(hwnd)
-        time.sleep(0.3)
-        try:
-            attempted = fn(hwnd, dest)
-        except Exception as exc:
-            _log(f"WARN: {step_name} failed: {exc}")
-            continue
-        if not attempted:
-            _log(f"WARN: {step_name} could not fill dialog.")
-            continue
         time.sleep(0.5)
-        dismiss_overwrite_prompt()
-        if _wait_save_complete(hwnd, dest, started=started, deadline=deadline, min_bytes=min_bytes):
+        if _worldship_save_once(hwnd, dest, started=started, min_bytes=min_bytes):
             return True
-        _log(f"WARN: {step_name} — save not complete, trying next approach.")
 
     return False
 
