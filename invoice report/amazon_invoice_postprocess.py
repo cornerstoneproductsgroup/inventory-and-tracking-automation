@@ -1,6 +1,7 @@
 """
 Post-process Amazon transaction exports from the Cornerstone share: trim header junk,
-filter by run-day rules, keep Order rows only, merge duplicate PO+SKU lines (sum qty and sales),
+filter by run-day rules, keep Order rows only, forward-fill blank PO/SKU on continuation lines,
+merge duplicate PO+SKU lines (sum qty and sales),
 format columns, save, and print (landscape + gridlines).
 
 Drop a new raw .csv/.xlsx into the Amazon **Input** share folder. Formatted output is saved to
@@ -23,6 +24,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -42,8 +44,8 @@ DEFAULT_AMAZON_BASE_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\A
 DEFAULT_AMAZON_INPUT_DIR = DEFAULT_AMAZON_BASE_DIR + r"\Input"
 DEFAULT_AMAZON_OUTPUT_DIR = DEFAULT_AMAZON_BASE_DIR + r"\Output"
 
-# Raw column letters → output A..F (0-based indices into the header row).
-_RAW_COL_INDICES: tuple[int, ...] = (0, 2, 3, 4, 6, 13)  # A, C, D, E, G, N
+# Default raw column letters → output A..F (overridden per file from header names).
+_DEFAULT_RAW_COL_INDICES: tuple[int, ...] = (0, 2, 3, 4, 6, 13)  # A, C, D, E, G, N
 
 _AMAZON_TXN_RE = re.compile(
     r"^(?P<dt>[A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)"
@@ -148,6 +150,20 @@ def _pad_row(row: tuple, width: int) -> tuple:
     return tuple(row) + (None,) * (w - len(row))
 
 
+def _xlsx_cell_value(cell) -> object:
+    """Prefer stable strings for order IDs (Excel often stores them as imprecise floats)."""
+    val = cell.value
+    if val is None:
+        return None
+    if cell.data_type == "s" or isinstance(val, str):
+        return str(val).strip() if isinstance(val, str) else val
+    if isinstance(val, float):
+        if val == int(val) and abs(val) < 9_007_199_254_740_992:
+            return str(int(val))
+        return format(val, ".0f") if abs(val) >= 1e11 else val
+    return val
+
+
 def _load_rows(path: Path) -> list[tuple]:
     suf = path.suffix.lower()
     if suf == ".csv":
@@ -162,9 +178,53 @@ def _load_rows(path: Path) -> list[tuple]:
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb.active
-        return [tuple(c.value for c in row) for row in ws.iter_rows()]
+        return [tuple(_xlsx_cell_value(c) for c in row) for row in ws.iter_rows()]
     finally:
         wb.close()
+
+
+def _header_cell_matches(cell: object, *parts: str, exclude: tuple[str, ...] = ()) -> bool:
+    u = str(cell or "").strip().lower()
+    if not u:
+        return False
+    return all(p in u for p in parts) and all(e not in u for e in exclude)
+
+
+def _resolve_raw_col_indices(header: tuple) -> tuple[int, ...]:
+    """Map Amazon export columns by header text (layout varies); keep output A..F shape."""
+    width = max(29, _row_width(header))
+    h = _pad_row(header, width)
+
+    def find(*parts: str, exclude: tuple[str, ...] = ()) -> int | None:
+        for i, cell in enumerate(h):
+            if _header_cell_matches(cell, *parts, exclude=exclude):
+                return i
+        return None
+
+    date_i = find("date", "time") or find("date") or 0
+    type_i = find("type") or 2
+    po_i = (
+        find("order", "id")
+        or find("purchase", "order")
+        or find("po", "number")
+        or find("po", "#")
+        or 3
+    )
+    sku_i = find("sku") or 4
+    if sku_i == po_i:
+        alt = find("sku", exclude=("order", "purchase", "po"))
+        sku_i = alt if alt is not None else sku_i
+    qty_i = find("quantity") or find("qty") or 6
+    amt_i = (
+        find("product", "sales")
+        or find("total", "sales")
+        or find("sales", exclude=("product",))
+        or 13
+    )
+    indices = (date_i, type_i, po_i, sku_i, qty_i, amt_i)
+    if indices != _DEFAULT_RAW_COL_INDICES:
+        print(f"[amazon] Column map from headers: {indices}", flush=True)
+    return indices
 
 
 def find_header_row_index(rows: list[tuple]) -> int:
@@ -294,11 +354,16 @@ def mark_existing_input_files_processed(folder: Path | None = None) -> int:
     return marked
 
 
-def _select_columns(header: tuple, data_rows: list[tuple]) -> tuple[list[str], list[tuple]]:
+def _select_columns(
+    header: tuple,
+    data_rows: list[tuple],
+    raw_indices: tuple[int, ...] | None = None,
+) -> tuple[list[str], list[tuple]]:
+    indices = raw_indices or _DEFAULT_RAW_COL_INDICES
     width = max(29, max(_row_width(header), max((_row_width(r) for r in data_rows), default=0)))
     header = _pad_row(header, width)
     headers_out: list[str] = []
-    for idx in _RAW_COL_INDICES:
+    for idx in indices:
         if idx >= len(header):
             headers_out.append("")
         else:
@@ -309,7 +374,7 @@ def _select_columns(header: tuple, data_rows: list[tuple]) -> tuple[list[str], l
         row = _pad_row(row, width)
         if not any(v is not None and str(v).strip() for v in row):
             continue
-        picked = tuple(row[i] if i < len(row) else None for i in _RAW_COL_INDICES)
+        picked = tuple(row[i] if i < len(row) else None for i in indices)
         rows_out.append(picked)
     return headers_out, rows_out
 
@@ -344,6 +409,37 @@ def _forward_fill_transaction_dates(rows: list[tuple]) -> list[tuple]:
     return filled
 
 
+def _forward_fill_po_and_sku(rows: list[tuple]) -> list[tuple]:
+    """
+    Continuation Order lines often repeat quantity on new rows with blank PO/SKU.
+
+    Without this, merge keys differ (filled PO+SKU vs blank+blank) and identical orders
+    stay split as one row per unit.
+    """
+    filled: list[tuple] = []
+    last_po: str = ""
+    last_sku: str = ""
+    for row in rows:
+        if not row:
+            filled.append(row)
+            continue
+        mutable = list(row)
+        while len(mutable) <= _COL_SKU:
+            mutable.append(None)
+        po = _merge_key_po(mutable[_COL_PO])
+        sku = _merge_key_sku(mutable[_COL_SKU])
+        if po:
+            last_po = po
+        elif last_po:
+            mutable[_COL_PO] = last_po
+        if sku:
+            last_sku = sku
+        elif last_sku:
+            mutable[_COL_SKU] = last_sku
+        filled.append(tuple(mutable))
+    return filled
+
+
 def _filter_rows(
     headers: list[str],
     rows: list[tuple],
@@ -370,16 +466,66 @@ def _sort_rows_by_transaction_datetime(rows: list[tuple]) -> list[tuple]:
     return sorted(rows, key=sort_key)
 
 
-_COL_PO = 2  # output C
-_COL_SKU = 3  # output D
-_COL_QTY = 4  # output E
-_COL_AMT = 5  # output F
+# Output columns after _select_columns: A date, B type, C PO, D SKU, E qty, F amount.
+_COL_PO = 2
+_COL_SKU = 3
+_COL_QTY = 4
+_COL_AMT = 5
 
 
 def _cell_key(value: object) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _normalize_merge_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value == int(value) and abs(value) < 9_007_199_254_740_992:
+            return str(int(value))
+        if abs(value) >= 1e11:
+            return format(value, ".0f")
+        return str(value).strip()
+    s = unicodedata.normalize("NFKC", str(value))
+    s = s.replace("\u00a0", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _merge_key_po(value: object) -> str:
+    """
+    Canonical PO for grouping — rows can look identical but differ by dashes,
+    spaces, Excel numeric formatting, or hidden characters.
+    """
+    s = _normalize_merge_text(value).replace(",", "")
+    if not s:
+        return ""
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".", 1)[0]
+    try:
+        f = float(s)
+        if f == int(f) and abs(f) < 9_007_199_254_740_992:
+            s = str(int(f))
+    except ValueError:
+        pass
+    # Amazon order IDs: compare by digits so 114-1234567-1234567 == 11412345671234567
+    if re.fullmatch(r"[\d\s\-]+", s):
+        digits = re.sub(r"\D", "", s)
+        if len(digits) >= 8:
+            return digits
+    compact = re.sub(r"\s+", "", s).upper()
+    return compact
+
+
+def _merge_key_sku(value: object) -> str:
+    s = _normalize_merge_text(value)
+    return s.casefold() if s else ""
 
 
 def _parse_quantity(value: object) -> float:
@@ -411,24 +557,37 @@ def _quantity_output_value(total: float) -> int | float:
     return total
 
 
-def _consolidate_rows_by_po_and_sku(rows: list[tuple]) -> list[tuple]:
+def _consolidate_rows_by_po_and_sku(
+    rows: list[tuple],
+    *,
+    po_col: int = _COL_PO,
+    sku_col: int = _COL_SKU,
+    qty_col: int = _COL_QTY,
+    amt_col: int = _COL_AMT,
+) -> list[tuple]:
     """
-    Merge duplicate Order lines that share the same PO (column C) and SKU (column D).
+    Merge Order lines with the same PO + SKU (sums quantity and product sales).
 
-    New Amazon exports often emit one row per unit; this sums quantity (E) and sales (F)
-    so the printed report matches the older one-row-per-PO-per-SKU layout.
+    Uses canonical merge keys so three identical-looking unit rows always become one line.
     """
     if not rows:
         return rows
 
     groups: dict[tuple[str, str], dict] = {}
     order: list[tuple[str, str]] = []
+    max_col = max(po_col, sku_col, qty_col, amt_col)
 
-    for row in rows:
-        padded = tuple(row) + (None,) * max(0, _COL_AMT + 1 - len(row))
-        key = (_cell_key(padded[_COL_PO]), _cell_key(padded[_COL_SKU]))
-        qty = _parse_quantity(padded[_COL_QTY])
-        amt = _parse_amount_for_sum(padded[_COL_AMT])
+    for i, row in enumerate(rows):
+        padded = tuple(row) + (None,) * max(0, max_col + 1 - len(row))
+        po_key = _merge_key_po(padded[po_col])
+        sku_key = _merge_key_sku(padded[sku_col])
+        if not po_key:
+            po_key = _normalize_merge_text(padded[po_col]) or f"__row_{i}"
+        if not sku_key:
+            sku_key = _normalize_merge_text(padded[sku_col]) or f"__row_{i}"
+        key = (po_key, sku_key)
+        qty = _parse_quantity(padded[qty_col])
+        amt = _parse_amount_for_sum(padded[amt_col])
 
         if key not in groups:
             groups[key] = {"row": padded, "qty": 0.0, "amt": 0.0}
@@ -440,12 +599,36 @@ def _consolidate_rows_by_po_and_sku(rows: list[tuple]) -> list[tuple]:
     for key in order:
         g = groups[key]
         row = list(g["row"])
-        while len(row) <= _COL_AMT:
+        while len(row) <= amt_col:
             row.append(None)
-        row[_COL_QTY] = _quantity_output_value(g["qty"])
-        row[_COL_AMT] = g["amt"]
+        row[qty_col] = _quantity_output_value(g["qty"])
+        row[amt_col] = g["amt"]
         merged.append(tuple(row))
     return merged
+
+
+def _log_unmerged_po_sku_groups(
+    rows: list[tuple],
+    consolidated: list[tuple],
+    *,
+    po_col: int = _COL_PO,
+    sku_col: int = _COL_SKU,
+) -> None:
+    """Warn when the same visible PO+SKU still appears on multiple output rows."""
+    if len(consolidated) >= len(rows):
+        return
+    out_keys: dict[tuple[str, str], int] = {}
+    for row in consolidated:
+        pk = (_merge_key_po(row[po_col] if po_col < len(row) else None),
+              _merge_key_sku(row[sku_col] if sku_col < len(row) else None))
+        out_keys[pk] = out_keys.get(pk, 0) + 1
+    dup = [k for k, n in out_keys.items() if n > 1]
+    if dup:
+        print(
+            f"[amazon] WARN: {len(dup)} PO+SKU group(s) still split across multiple output rows "
+            f"after consolidate (check raw file for mismatched SKU text).",
+            flush=True,
+        )
 
 
 def _order_rows_by_calendar_date(
@@ -581,18 +764,28 @@ def process_amazon_export(
     header = rows[header_i]
     body = rows[header_i + 1 :]
 
-    headers, selected = _select_columns(header, body)
+    raw_indices = _resolve_raw_col_indices(header)
+    headers, selected = _select_columns(header, body, raw_indices)
     selected = _forward_fill_transaction_dates(selected)
+    selected = _forward_fill_po_and_sku(selected)
     print(f"[amazon] Date filter (calendar days only): {', '.join(sorted(d.isoformat() for d in keep_dates))}", flush=True)
     _log_source_date_coverage(selected, headers, keep_dates, run_day)
     filtered = _filter_rows(headers, selected, keep_dates=keep_dates)
     filtered = _sort_rows_by_transaction_datetime(filtered)
+    filtered = _forward_fill_po_and_sku(filtered)
     line_count = len(filtered)
     consolidated = _consolidate_rows_by_po_and_sku(filtered)
+    _log_unmerged_po_sku_groups(filtered, consolidated)
     if len(consolidated) < line_count:
         print(
             f"[amazon] Consolidated {line_count} Order line(s) -> {len(consolidated)} "
-            f"by matching PO (column C) and SKU (column D); summed quantity (E) and sales (F).",
+            f"by PO+SKU (columns {headers[_COL_PO]!r} + {headers[_COL_SKU]!r}); "
+            "summed quantity and sales.",
+            flush=True,
+        )
+    elif line_count > 0:
+        print(
+            f"[amazon] No rows merged ({line_count} Order line(s) — each PO+SKU was already unique).",
             flush=True,
         )
 
