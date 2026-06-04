@@ -202,8 +202,9 @@ def _enter_filename_with_retry(hwnd: int, dest: Path) -> bool:
                 return True
 
         current = _read_filename_field(hwnd)
+        have = current if current else "(empty)"
         _log(
-            f"File name check — want {want!r}, have {current!r or '(empty)'}; "
+            f"File name check — want {want!r}, have {have!r}; "
             f"retry {attempt}/{attempts}…"
         )
         time.sleep(0.5)
@@ -502,7 +503,8 @@ def _prepare_save_dialog(
     _log(f"Verify — PO {po_label!r}, SKU {sku!r}")
     _log(f"Verify — folder: {dest.parent}")
     _log(f"Verify — file:   {dest.name}")
-    _log(f"Dialog file name now: {_read_filename_field(hwnd)!r or '(empty)'}")
+    dialog_name = _read_filename_field(hwnd) or "(empty)"
+    _log(f"Dialog file name now: {dialog_name!r}")
 
     _navigate_to_folder(hwnd, dest.parent, force=force_folder)
     hwnd = find_save_as_dialog_hwnd(log=False) or hwnd
