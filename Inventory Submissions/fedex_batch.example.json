@@ -14,6 +14,7 @@
     "username_input": "#username, input#username[autocomplete='username'], input[name='username']",
     "password_input": "#password, input#password[type='password'], input[name='password']",
     "login_submit": "button:has-text('Log In'), button:has-text('LOG IN'), button:has-text('Sign in'), button.fdx-c-button:has-text('Log In')",
+    "login_next": "button:has-text('Next'), button:has-text('Continue')",
     "cookie_accept": "#onetrust-accept-btn-handler, button#onetrust-accept-btn-handler, button:has-text('Accept all cookies')",
     "upload_button": "[data-test-id=\"files-upload-btn\"]",
     "file_input": "#uploadFileInput-GENERAL, input[type='file']",

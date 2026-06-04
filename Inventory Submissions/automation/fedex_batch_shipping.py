@@ -367,12 +367,14 @@ def _recover_from_load_failure(page: Page, cfg: dict[str, Any], creds: FedexCred
         _log("Batch uploads page is ready after reload.")
         return True
 
-    if _find_login_form(page, cfg, quick=True):
-        _log("Login form after reload — signing in.")
-        _perform_fedex_login(page, cfg, creds)
+    if _find_login_form(page, cfg, quick=True) or _is_load_failure_page(page):
+        _log("Login required after reload — using FedEx secure-login page (not empty redirect).")
+        _goto_fedex_login_page(page, cfg, creds)
+        _submit_fedex_login(page, cfg, creds)
         if not _is_batch_page(page):
+            _log(f"Opening batch uploads after login: {batch_url}")
             page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
-            _fedex_short_pause(page, cfg, ms=500)
+            _fedex_short_pause(page, cfg, ms=600)
             _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
         return _is_batch_page(page)
 
@@ -553,6 +555,22 @@ def _wait_for_login_or_batch(
     return ""
 
 
+def _login_next_selectors(cfg: dict[str, Any]) -> list[str]:
+    custom = _sel(cfg, "login_next")
+    out: list[str] = []
+    if custom:
+        out.extend(s.strip() for s in custom.split(",") if s.strip())
+    out.extend(
+        [
+            "button:has-text('Next')",
+            "button:has-text('Continue')",
+            "button:has-text('CONTINUE')",
+            "button.fdx-c-button:has-text('Next')",
+        ]
+    )
+    return out
+
+
 def _login_submit_selectors(cfg: dict[str, Any]) -> list[str]:
     custom = _sel(cfg, "login_submit")
     out: list[str] = []
@@ -575,18 +593,120 @@ def _login_submit_selectors(cfg: dict[str, Any]) -> list[str]:
     return deduped
 
 
-def _fill_login_field(field: Any, value: str, *, label: str) -> None:
+def _field_input_value(field: Any) -> str:
+    try:
+        return (field.input_value() or "").strip()
+    except Exception:
+        return ""
+
+
+def _type_into_login_field(field: Any, value: str, *, label: str) -> None:
+    """Type like a user so FedEx React fields keep the value."""
+    pg = getattr(field, "page", None)
     field.wait_for(state="visible", timeout=45_000)
     field.click(timeout=10_000)
-    field.fill(value, timeout=15_000)
+    if pg is not None:
+        pg.wait_for_timeout(150)
     try:
-        got = (field.input_value() or "").strip()
-        want = value.strip()
-        if got != want:
-            _log(f"WARN: {label} mismatch after fill; retrying once.")
-            field.fill(value, timeout=15_000)
+        field.press("Control+a", timeout=3000)
+        field.press("Backspace", timeout=3000)
     except Exception:
         pass
+    try:
+        field.press_sequentially(value, delay=45, timeout=60_000)
+    except Exception:
+        field.fill(value, timeout=15_000)
+    if pg is not None:
+        pg.wait_for_timeout(250)
+
+
+def _maybe_advance_username_step(
+    page: Page, scope: Page | Frame, pw: Any, cfg: dict[str, Any]
+) -> None:
+    """FedEx secure login: username step may require Next before password appears."""
+    try:
+        if pw.is_visible():
+            return
+    except Exception:
+        pass
+    for sel in _login_next_selectors(cfg):
+        try:
+            btn = scope.locator(sel).first
+            if btn.count() == 0 or not btn.is_visible():
+                continue
+            _log(f"Clicking {sel!r} after username (password step).")
+            btn.click(timeout=10_000)
+            page.wait_for_timeout(600)
+            return
+        except Exception:
+            continue
+
+
+def _fill_fedex_login_credentials(
+    page: Page,
+    scope: Page | Frame,
+    user: Any,
+    pw: Any,
+    cfg: dict[str, Any],
+    creds: FedexCredentials,
+) -> None:
+    """
+    Username → Tab → password → Tab so values stick in FedEx's login form.
+    """
+    _log(f"Entering credentials for {creds.username!r}")
+    _type_into_login_field(user, creds.username, label="username")
+    got_user = _field_input_value(user)
+    if got_user != creds.username.strip():
+        _log(f"WARN: username field={got_user!r}; retyping.")
+        _type_into_login_field(user, creds.username, label="username")
+        got_user = _field_input_value(user)
+    _log(f"Username field: {len(got_user)} character(s).")
+
+    _maybe_advance_username_step(page, scope, pw, cfg)
+
+    try:
+        user.press("Tab", timeout=5000)
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+    try:
+        pw.wait_for(state="visible", timeout=20_000)
+    except PlaywrightTimeout:
+        _maybe_advance_username_step(page, scope, pw, cfg)
+        pw.wait_for(state="visible", timeout=20_000)
+
+    _type_into_login_field(pw, creds.password, label="password")
+    got_pw = _field_input_value(pw)
+    if len(got_pw) < 2:
+        _log("WARN: password field empty after fill; retyping.")
+        _type_into_login_field(pw, creds.password, label="password")
+        got_pw = _field_input_value(pw)
+    _log(f"Password field: {len(got_pw)} character(s).")
+    if len(got_pw) < 2:
+        raise FedexBatchError(
+            "FedEx password field stayed empty after fill. "
+            "Check FEDEX_PASSWORD in Inventory Submissions\\.env"
+        )
+
+    try:
+        pw.press("Tab", timeout=5000)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _submit_fedex_login(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> bool:
+    """Wait for login form, fill credentials, submit, wait for batch or Shipping Plus."""
+    hit = _wait_for_login_ready(page, cfg, creds, timeout_ms=90_000)
+    if hit is None:
+        return _is_batch_page(page)
+    user, pw, scope = hit
+    _fill_fedex_login_credentials(page, scope, user, pw, cfg, creds)
+    page.wait_for_timeout(350)
+    _click_login_submit(page, scope, cfg)
+    _wait_for_logged_in(page, cfg, creds)
+    return _is_batch_page(page) or "shippingplus" in page.url.lower()
 
 
 def _click_login_submit(page: Page, scope: Page | Frame, cfg: dict[str, Any]) -> None:
@@ -637,16 +757,17 @@ def _wait_for_logged_in(
 
 
 def _perform_fedex_login(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
-    hit = _wait_for_login_ready(page, cfg, creds)
-    if hit is None:
-        return
-    user, pw, scope = hit
-    _log(f"Entering credentials for {creds.username!r}")
-    _fill_login_field(user, creds.username, label="username")
-    _fill_login_field(pw, creds.password, label="password")
-    page.wait_for_timeout(250)
-    _click_login_submit(page, scope, cfg)
-    _wait_for_logged_in(page, cfg, creds)
+    if not _submit_fedex_login(page, cfg, creds):
+        raise FedexBatchError(f"FedEx login did not reach batch/Shipping Plus ({page.url}).")
+
+
+def _goto_fedex_login_page(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
+    """Open secure-login URL (more reliable than redirect stub with empty fields)."""
+    login_url = (cfg.get("fedex", {}).get("login_url") or DEFAULT_LOGIN_URL).strip()
+    _log(f"Opening FedEx login page: {login_url}")
+    page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
+    _fedex_short_pause(page, cfg, ms=900)
+    _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
 
 
 def _open_batch_after_login(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
@@ -690,24 +811,22 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -
         return
 
     if state == "login":
-        _log("Login form on current page — signing in without leaving.")
-        _perform_fedex_login(page, cfg, creds)
+        _log("Login form on batch redirect — opening secure-login page.")
+        _goto_fedex_login_page(page, cfg, creds)
+        _submit_fedex_login(page, cfg, creds)
         _open_batch_after_login(page, cfg, creds)
         return
 
-    _log(f"Opening FedEx login as {creds.username!r}: {login_url}")
-    page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
-    _fedex_short_pause(page, cfg, ms=700)
     if _retry_button_visible(page, cfg):
-        _recover_from_load_failure(page, cfg, creds)
-    _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
+        if _recover_from_load_failure(page, cfg, creds) and _is_batch_page(page):
+            return
 
-    state = _wait_for_login_or_batch(page, cfg, creds, timeout_ms=45_000)
-    if state == "batch":
-        _log("Batch uploads page ready (skipped separate login).")
+    _goto_fedex_login_page(page, cfg, creds)
+    if _is_batch_page(page):
+        _log("Batch uploads page ready.")
         return
 
-    _perform_fedex_login(page, cfg, creds)
+    _submit_fedex_login(page, cfg, creds)
     _open_batch_after_login(page, cfg, creds)
 
 
