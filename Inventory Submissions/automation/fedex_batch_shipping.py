@@ -90,6 +90,104 @@ def _click_first(page: Page, selector: str, *, timeout_ms: int = 8000) -> bool:
         return False
 
 
+def _click_any(
+    page: Page,
+    selectors: list[str],
+    *,
+    timeout_ms: int = 12_000,
+    label: str = "",
+) -> bool:
+    """Try selectors in order until one clicks."""
+    cleaned = [s.strip() for s in selectors if s and s.strip()]
+    if not cleaned:
+        return False
+    per = max(2500, timeout_ms // len(cleaned))
+    for sel in cleaned:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=per)
+            try:
+                loc.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            loc.click(timeout=per)
+            if label:
+                _log(f"Clicked {label} ({sel!r}).")
+            return True
+        except Exception as exc:
+            if label:
+                _log(f"WARN: {label} — {sel!r} failed: {exc}")
+    return False
+
+
+def _after_row_select_wait_ms(cfg: dict[str, Any]) -> int:
+    timing = cfg.get("timing") or {}
+    raw = (
+        str(timing.get("after_row_select_ms") or "")
+        or (os.environ.get("FEDEX_AFTER_ROW_SELECT_MS") or "2000")
+    ).strip()
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 2000
+
+
+def _count_checked_shipment_rows(page: Page) -> int:
+    """How many shipment rows appear selected in the table."""
+    selectors = (
+        "tbody tr.mat-mdc-row input[type='checkbox']:checked",
+        "tbody tr.mat-mdc-row mat-checkbox.mat-mdc-checkbox-checked",
+        "tbody tr.mat-mdc-row .mat-mdc-checkbox-checked",
+    )
+    for sel in selectors:
+        try:
+            n = page.locator(sel).count()
+            if n > 0:
+                return n
+        except Exception:
+            continue
+    return 0
+
+
+def _wait_for_row_selection(page: Page, *, expected: int, timeout_ms: int = 12_000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        checked = _count_checked_shipment_rows(page)
+        if checked >= expected:
+            return True
+        page.wait_for_timeout(250)
+    return _count_checked_shipment_rows(page) >= expected
+
+
+def _finalize_toolbar_selectors(cfg: dict[str, Any]) -> list[str]:
+    custom = _sel(cfg, "finalize_toolbar")
+    defaults = [
+        "button.fdx-c-button:has(span.fdx-c-button__title:text-matches('Finalize', 'i'))",
+        "button:has(span.fdx-c-button__title:text-matches('Finalize', 'i'))",
+        "button.fdx-c-button:has-text('Finalize')",
+        "button:has-text('Finalize')",
+        "span.fdx-c-button__title:text-matches('^\\s*Finalize\\s*$', 'i')",
+        "[aria-label*='Finalize' i]",
+        "text=/^\\s*Finalize\\s*$/i",
+    ]
+    if custom:
+        return [s.strip() for s in custom.split(",") if s.strip()] + defaults
+    return defaults
+
+
+def _finalize_menu_selectors(cfg: dict[str, Any]) -> list[str]:
+    custom = _sel(cfg, "finalize_print_manual")
+    defaults = [
+        ".mat-mdc-menu-item:has(span.mat-mdc-menu-item-text:text-matches('Finalize and print manually', 'i'))",
+        "span.mat-mdc-menu-item-text:text-matches('Finalize and print manually', 'i')",
+        ".mat-mdc-menu-item:has-text('Finalize and print manually')",
+        "button.mat-mdc-menu-item:has-text('Finalize and print manually')",
+    ]
+    if custom:
+        return [s.strip() for s in custom.split(",") if s.strip()] + defaults
+    return defaults
+
+
 def _fedex_peel_blocking_overlays(page: Page) -> None:
     """Best-effort: stop full-page loaders from intercepting OneTrust / login clicks."""
     try:
@@ -564,6 +662,7 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
     row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
     cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
     _clear_row_selection(page, cfg)
+    page.wait_for_timeout(500)
     selected = 0
     rows = page.locator(row_sel)
     for i in range(rows.count()):
@@ -571,39 +670,122 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
         ref = _row_reference_text(row)
         if ref not in refs:
             continue
-        cb = row.locator(cb_sel).first
         try:
-            if not cb.is_checked():
-                cb.check(force=True)
-            selected += 1
+            row.scroll_into_view_if_needed(timeout=5000)
         except Exception:
+            pass
+        page.wait_for_timeout(150)
+        clicked = False
+        for label_sel in (
+            "label.fdx-c-form-group__label[data-test-id='label']",
+            "label.fdx-c-form-group__label",
+            "mat-checkbox label",
+        ):
+            label = row.locator(label_sel).first
             try:
-                row.locator("label.fdx-c-form-group__label").first.click(force=True)
-                selected += 1
-            except Exception as exc:
-                _log(f"WARN: could not select row {ref!r}: {exc}")
+                if label.count() > 0 and label.is_visible():
+                    label.click(timeout=8000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            cb = row.locator(cb_sel).first
+            try:
+                if cb.count() > 0:
+                    if not cb.is_checked():
+                        cb.click(timeout=8000)
+                    clicked = True
+            except Exception:
+                try:
+                    cb.check(force=True, timeout=8000)
+                    clicked = True
+                except Exception as exc:
+                    _log(f"WARN: could not select row {ref!r}: {exc}")
+                    continue
+        if clicked:
+            selected += 1
+            page.wait_for_timeout(200)
+
+    if selected > 0:
+        if not _wait_for_row_selection(page, expected=selected, timeout_ms=10_000):
+            checked = _count_checked_shipment_rows(page)
+            _log(
+                f"WARN: expected {selected} selected row(s), UI shows {checked} checked — "
+                "continuing after extra wait."
+            )
+            page.wait_for_timeout(800)
+        settle_ms = _after_row_select_wait_ms(cfg)
+        _log(f"Waiting {settle_ms}ms for selection toolbar before Finalize…")
+        page.wait_for_timeout(settle_ms)
+
+    checked = _count_checked_shipment_rows(page)
+    _log(f"Row selection: {selected} matched, {checked} checkbox(es) checked.")
     return selected
 
 
 def _finalize_and_print_manual(page: Page, cfg: dict[str, Any]) -> None:
-    fin_sel = _sel(
-        cfg,
-        "finalize_toolbar",
-        "button:has-text('FINALIZE'), [aria-label*='Finalize'], text=FINALIZE",
+    """Open Finalize dropdown → Finalize and print manually → print preview tab."""
+    _log("Opening Finalize menu…")
+    opened = _click_any(
+        page,
+        _finalize_toolbar_selectors(cfg),
+        timeout_ms=20_000,
+        label="Finalize toolbar",
     )
-    menu_sel = _sel(
-        cfg,
-        "finalize_print_manual",
-        (
-            ".mat-mdc-menu-item:has-text('Finalize and print manually'), "
-            "span.mat-mdc-menu-item-text:has-text('Finalize and print manually')"
-        ),
-    )
-    if not _click_first(page, fin_sel, timeout_ms=15_000):
+    if not opened:
+        try:
+            btn = page.locator("button.fdx-c-button").filter(
+                has=page.locator(
+                    "span.fdx-c-button__title",
+                    has_text=re.compile(r"^\s*Finalize\s*$", re.I),
+                )
+            ).first
+            btn.wait_for(state="visible", timeout=8000)
+            btn.scroll_into_view_if_needed(timeout=3000)
+            btn.click(timeout=12_000)
+            _log("Clicked Finalize toolbar (filter fallback).")
+            opened = True
+        except Exception as exc:
+            _log(f"WARN: Finalize filter fallback failed: {exc}")
+
+    if not opened:
         raise FedexBatchError("Could not open FINALIZE menu.")
-    page.wait_for_timeout(600)
-    if not _click_first(page, menu_sel, timeout_ms=12_000):
+
+    page.wait_for_timeout(900)
+    try:
+        page.locator(".mat-mdc-menu-panel, .mat-menu-panel").first.wait_for(
+            state="visible",
+            timeout=6000,
+        )
+    except PlaywrightTimeout:
+        _log("WARN: Material menu panel not visible yet; trying menu item click.")
+
+    menu_clicked = False
+    try:
+        item = page.get_by_role(
+            "menuitem",
+            name=re.compile(r"Finalize and print manually", re.I),
+        ).first
+        item.wait_for(state="visible", timeout=10_000)
+        item.click(timeout=12_000)
+        _log('Clicked "Finalize and print manually" (menuitem role).')
+        menu_clicked = True
+    except Exception as exc:
+        _log(f"WARN: menuitem role click failed: {exc}")
+
+    if not menu_clicked:
+        menu_clicked = _click_any(
+            page,
+            _finalize_menu_selectors(cfg),
+            timeout_ms=15_000,
+            label="Finalize and print manually",
+        )
+
+    if not menu_clicked:
         raise FedexBatchError('Could not click "Finalize and print manually".')
+
+    page.wait_for_timeout(1200)
 
 
 def _print_preview_candidate_pages(page: Page, context: BrowserContext) -> list[Page]:

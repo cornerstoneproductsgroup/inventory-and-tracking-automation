@@ -21,8 +21,8 @@
     "shipment_table_row": "table tbody tr.mat-mdc-row, tr.mat-mdc-row",
     "row_checkbox": "input[type='checkbox']",
     "clear_selection_button": "button:has-text('CLEAR SELECTION')",
-    "finalize_toolbar": "button:has-text('FINALIZE'), text=FINALIZE",
-    "finalize_print_manual": "span.mat-mdc-menu-item-text:has-text('Finalize and print manually')",
+    "finalize_toolbar": "button.fdx-c-button:has(span.fdx-c-button__title:text-matches('Finalize', 'i'))",
+    "finalize_print_manual": "span.mat-mdc-menu-item-text:text-matches('Finalize and print manually', 'i')",
     "select_all_checkbox": "thead label.fdx-c-form-group__label[data-test-id='label'], thead label[for^='fedex-checkbox-']",
     "download_button": "button:has-text('DOWNLOAD'), a:has-text('DOWNLOAD')",
     "shipment_report_menu": "span.mat-mdc-menu-item-text:has-text('Shipment report (.xlsx file)')"
@@ -30,5 +30,8 @@
   "label_save": {
     "use_native_save_dialog": true,
     "pause_between_labels_ms": 1000
+  },
+  "timing": {
+    "after_row_select_ms": 2000
   }
 }

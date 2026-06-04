@@ -84,6 +84,7 @@ Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
 - `FEDEX_SHIPMENT_REPORT_TIMEOUT_MS` — shipment report download timeout (default 180000)
 - `ORDER_SPLITTER_V2_DIR` / `ORDER_SPLITTER_WATCHER_PY` — where to read `WAREHOUSE_VENDORS` (see above)
 - `FEDEX_WAREHOUSE_LABEL_PRINTER` — Zebra name override (falls back to `PULL_ORDERS_SOS_LABEL_PRINTER`, then auto-detect **Zebra ZP 450**)
+- `FEDEX_AFTER_ROW_SELECT_MS` — pause after row checkboxes before **Finalize** (default 2000; or `timing.after_row_select_ms` in `fedex_batch.json`)
 
 ### Warehouse-print vendors (same as Order Splitter)
 
