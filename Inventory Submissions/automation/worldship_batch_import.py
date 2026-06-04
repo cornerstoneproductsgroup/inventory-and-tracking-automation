@@ -1266,23 +1266,32 @@ def _verify_saved_label(dest: Path, order) -> None:
     _log(f"Verified on disk: {dest.name} ({size:,} bytes)")
 
 
-def _wait_until_save_dialog_gone(*, max_s: float = 20.0) -> None:
-    from automation.windows_save_as import wait_until_save_dialog_closed
+def _wait_until_save_dialog_gone(*, previous_hwnd: int = 0, max_s: float = 12.0) -> None:
+    from automation.windows_save_as import wait_for_save_dialog_handoff
 
-    if not wait_until_save_dialog_closed(timeout_s=max_s):
+    if not previous_hwnd:
+        return
+    if not wait_for_save_dialog_handoff(previous_hwnd, timeout_s=max_s, saved_dest=None):
         raise RuntimeError(
-            "Save Print Output As dialog is still open — cannot start the next label. "
-            "Close it manually or fix the previous save."
+            "The same Save Print Output As window is still open after save. "
+            "Close it manually or fix the previous label."
         )
 
 
-def _pause_between_labels() -> None:
+def _pause_between_labels(*, previous_hwnd: int, saved_dest: Path) -> None:
+    from automation.windows_save_as import wait_for_save_dialog_handoff
     from automation.worldship_label_config import label_save_gap_s
 
     gap_s = label_save_gap_s()
     _log(f"Waiting {gap_s:.0f}s for next shipment…")
     time.sleep(gap_s)
-    _wait_until_save_dialog_gone()
+    if not wait_for_save_dialog_handoff(
+        previous_hwnd, timeout_s=8.0, saved_dest=saved_dest
+    ):
+        raise RuntimeError(
+            "The same Save Print Output As window did not close after save. "
+            "If the next label dialog is already open, pull the latest script update."
+        )
 
 
 def _run_save_label_phase(plan) -> int:
@@ -1318,20 +1327,42 @@ def _run_save_label_phase(plan) -> int:
             )
             dialog_hwnd = wait_for_save_as_dialog(timeout_s=timeout_s)
         else:
-            _wait_until_save_dialog_gone(max_s=30.0)
+            from automation.windows_save_as import (
+                _dialog_still_open,
+                _find_filename_edit_hwnd,
+                _filename_matches,
+                find_save_as_dialog_hwnd,
+            )
+
             timeout_s = save_dialog_timeout_s(first=False)
-            _wait_for_processing_after_save(
-                saves_completed=saved,
-                saves_total=len(items),
-                timeout_s=timeout_s,
-            )
-            _log(
-                f"Waiting for next Save dialog — save {item.index}/{len(items)}, "
-                f"row {order.row_number}, PO {order.po!r}…"
-            )
-            dialog_hwnd = wait_for_next_save_dialog(
-                previous_hwnd=last_hwnd, timeout_s=timeout_s
-            )
+            prior_dest = items[saved - 1].dest
+            dialog_hwnd = find_save_as_dialog_hwnd(log=False)
+            next_ready = False
+            if dialog_hwnd:
+                if not _dialog_still_open(last_hwnd):
+                    next_ready = True
+                else:
+                    edit = _find_filename_edit_hwnd(dialog_hwnd)
+                    if edit and not _filename_matches(edit, prior_dest):
+                        next_ready = True
+            if next_ready and dialog_hwnd:
+                _log(
+                    f"Next Save dialog already open — save {item.index}/{len(items)}, "
+                    f"row {order.row_number}, PO {order.po!r}"
+                )
+            else:
+                _wait_for_processing_after_save(
+                    saves_completed=saved,
+                    saves_total=len(items),
+                    timeout_s=timeout_s,
+                )
+                _log(
+                    f"Waiting for next Save dialog — save {item.index}/{len(items)}, "
+                    f"row {order.row_number}, PO {order.po!r}…"
+                )
+                dialog_hwnd = wait_for_next_save_dialog(
+                    previous_hwnd=last_hwnd, timeout_s=timeout_s
+                )
 
         if not dialog_hwnd:
             raise TimeoutError(
@@ -1354,11 +1385,10 @@ def _run_save_label_phase(plan) -> int:
                 f"(row {order.row_number}) to:\n  {dest}"
             )
         _verify_saved_label(dest, order)
-        _wait_until_save_dialog_gone(max_s=30.0)
         saved += 1
         _log(f"Completed save {saved}/{len(items)}: {dest.name}")
         if item.index < len(items):
-            _pause_between_labels()
+            _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=dest)
 
     _log(f"Phase 1 complete: {saved} label(s) saved and verified.")
     return saved
@@ -1390,10 +1420,14 @@ def _run_warehouse_print_phase(plan) -> int:
                 f"(row {order.row_number})."
             )
             dismiss_save_as_dialog_esc()
-            _wait_until_save_dialog_gone()
+            from automation.windows_save_as import wait_until_save_dialog_closed
+
+            wait_until_save_dialog_closed(timeout_s=12.0)
         printed += 1
         if printed < len(orders):
-            _pause_between_labels()
+            from automation.worldship_label_config import label_save_gap_s
+
+            time.sleep(label_save_gap_s())
     _log(f"Phase 2 complete: {printed} warehouse label(s) processed.")
     return printed
 
@@ -1428,7 +1462,10 @@ def _save_shipping_labels() -> int:
         gap_s = label_save_gap_s()
         _log(f"Save phase done; waiting {gap_s:.0f}s before warehouse print phase…")
         time.sleep(gap_s)
-        _wait_until_save_dialog_gone(max_s=30.0)
+        from automation.windows_save_as import wait_until_save_dialog_closed
+
+        if not wait_until_save_dialog_closed(timeout_s=30.0):
+            _log("WARN: Save dialog still visible entering print phase — continuing.")
 
     printed = _run_warehouse_print_phase(plan)
     if printed != len(plan.print_orders):

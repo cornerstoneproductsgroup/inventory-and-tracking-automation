@@ -530,14 +530,73 @@ def _worldship_save_once(
     return False
 
 
-def wait_until_save_dialog_closed(*, timeout_s: float = 20.0) -> bool:
+def wait_for_save_dialog_handoff(
+    previous_hwnd: int,
+    *,
+    timeout_s: float = 15.0,
+    saved_dest: Path | None = None,
+) -> bool:
+    """
+    Wait until the Save dialog we just used (previous_hwnd) is done.
+
+    WorldShip often opens the *next* Save dialog within 1–2s. That is success:
+    - previous hwnd closed, or
+    - a Save dialog is visible but the filename is no longer the file we saved
+      (Windows may reuse the same hwnd for the new dialog).
+    """
+    if not previous_hwnd:
+        return True
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _dialog_still_open(previous_hwnd):
+            current = find_save_as_dialog_hwnd(log=False)
+            if current and current != previous_hwnd:
+                _log(
+                    "Previous Save dialog closed; next Save Print Output dialog "
+                    "is already open."
+                )
+            else:
+                _log("Previous Save dialog closed.")
+            return True
+
+        if saved_dest is not None:
+            edit = _find_filename_edit_hwnd(previous_hwnd)
+            if edit and not _filename_matches(edit, saved_dest):
+                _log(
+                    "Save dialog shows the next shipment (filename changed) — continuing."
+                )
+                return True
+
+        time.sleep(0.2)
+
+    if _dialog_still_open(previous_hwnd):
+        if saved_dest is not None:
+            edit = _find_filename_edit_hwnd(previous_hwnd)
+            if edit and not _filename_matches(edit, saved_dest):
+                return True
+        _log(
+            "ERROR: Same Save Print Output dialog is still open after save "
+            f"(hwnd={previous_hwnd})."
+        )
+        return False
+    return True
+
+
+def wait_until_save_dialog_closed(
+    *, timeout_s: float = 20.0, previous_hwnd: int = 0
+) -> bool:
+    """Wait for a dialog to close. Prefer wait_for_save_dialog_handoff when hwnd is known."""
+    if previous_hwnd:
+        return wait_for_save_dialog_handoff(previous_hwnd, timeout_s=timeout_s)
+
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if not find_save_as_dialog_hwnd(log=False):
             return True
         time.sleep(0.35)
     if find_save_as_dialog_hwnd(log=False):
-        _log("ERROR: Save dialog still visible (blocks next label).")
+        _log("ERROR: Save dialog still visible.")
         return False
     return True
 
@@ -552,26 +611,18 @@ def _min_label_bytes() -> int:
 
 def wait_for_next_save_dialog(*, previous_hwnd: int, timeout_s: float) -> int:
     """
-    Wait until the previous Save dialog is gone, then the next one appears.
-    Prevents reusing a stale dialog hwnd from the prior label.
-    """
-    import win32gui
+    Return hwnd for the next Save Print Output dialog.
 
-    close_limit = min(timeout_s, 30.0)
-    close_deadline = time.monotonic() + close_limit
-    while time.monotonic() < close_deadline:
-        if not previous_hwnd:
-            break
-        try:
-            if not (win32gui.IsWindow(previous_hwnd) and win32gui.IsWindowVisible(previous_hwnd)):
-                break
-        except Exception:
-            break
-        time.sleep(0.3)
-    else:
-        if _dialog_still_open(previous_hwnd):
-            _log("ERROR: previous Save dialog did not close before next label.")
-            return 0
+    Accepts the next dialog if it is already open once previous_hwnd has closed.
+    """
+    if previous_hwnd and not _dialog_still_open(previous_hwnd):
+        current = find_save_as_dialog_hwnd(log=False)
+        if current:
+            _log(f"Next Save dialog (already open): {_dialog_title(current)!r}")
+            return current
+
+    if not wait_for_save_dialog_handoff(previous_hwnd, timeout_s=min(timeout_s, 12.0)):
+        return 0
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -614,7 +665,7 @@ def fill_save_as_dialog(
         _log(f"Existing file on share (mtime {before[0]:.0f}, {before[1]:,} bytes) — will require update after Save.")
 
     if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
-        return wait_until_save_dialog_closed(timeout_s=25.0)
+        return wait_for_save_dialog_handoff(hwnd, timeout_s=12.0, saved_dest=dest)
 
     # Dialog closed without success — do NOT touch the next Save dialog.
     if not _dialog_still_open(hwnd):
@@ -629,7 +680,7 @@ def fill_save_as_dialog(
         _focus_dialog(hwnd)
         time.sleep(0.5)
         if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
-            return wait_until_save_dialog_closed(timeout_s=25.0)
+            return wait_for_save_dialog_handoff(hwnd, timeout_s=12.0, saved_dest=dest)
 
     return False
 

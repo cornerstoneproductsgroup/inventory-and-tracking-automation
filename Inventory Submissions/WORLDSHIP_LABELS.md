@@ -30,6 +30,8 @@ While WorldShip shows **Automatic Processing Progress**, the batch runs shipment
 - **Only click Save** on each Save Print Output As window (the script does this when automation runs).
 - The script never sends **Alt+S** (that shortcut is **Stop** on the progress window if focus is wrong).
 
+After each Save, WorldShip often closes that dialog and opens the **next** Save dialog within a few seconds. That is normal — the script tracks the **window handle** of the dialog it just saved and only treats the **same** window staying open as an error (not “any Save dialog visible”).
+
 If you already clicked Stop, close the import, re-run the batch, and let processing run through all save labels without stopping.
 
 ## Verification
