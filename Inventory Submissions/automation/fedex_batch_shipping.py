@@ -759,6 +759,14 @@ def _process_vendor_groups(
         refs = [o.reference for o in group]
         skus = ", ".join(o.sku for o in group)
         _log(f"Vendor group {vendor!r}: {len(group)} shipment(s) — SKU(s): {skus}")
+        if is_warehouse_print_vendor(vendor):
+            _log(
+                f"  → Zebra ({_zebra_label_printer()!r}): warehouse-print vendor — "
+                "labels will NOT be saved to the share"
+            )
+        else:
+            dest = vendor_label_pdf_path(vendor, order_date)
+            _log(f"  → Save PDF: {dest}")
 
         selected = _select_rows_for_group(page, cfg, group)
         if selected == 0:
