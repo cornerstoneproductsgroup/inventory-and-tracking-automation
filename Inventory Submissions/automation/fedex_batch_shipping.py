@@ -320,61 +320,63 @@ def _retry_button_visible(page: Page, cfg: dict[str, Any]) -> bool:
     return False
 
 
-def _maybe_click_load_retry(page: Page, cfg: dict[str, Any]) -> bool:
-    """Click FedEx 'Retry' when the page failed to load."""
+_fedex_recover_count = 0
+_fedex_last_reload_at = 0.0
+
+
+def _reset_fedex_recover_state() -> None:
+    global _fedex_recover_count, _fedex_last_reload_at
+    _fedex_recover_count = 0
+    _fedex_last_reload_at = 0.0
+
+
+def _batch_url(cfg: dict[str, Any]) -> str:
+    return (cfg.get("fedex", {}).get("batch_url") or DEFAULT_BATCH_URL).strip()
+
+
+def _recover_from_load_failure(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> bool:
+    """
+    Retry/load-failure page: do NOT click Retry — reload batch shipping URL and log in if needed.
+    """
+    global _fedex_recover_count, _fedex_last_reload_at
+
     if not _retry_button_visible(page, cfg):
         return False
 
-    try:
-        btn = page.get_by_role("button", name=re.compile(r"retry", re.I)).first
-        if btn.is_visible():
-            btn.click(timeout=8000)
-            _log("Clicked Retry (role=button).")
-            return True
-    except Exception:
-        pass
+    now = time.monotonic()
+    if now - _fedex_last_reload_at < 6.0:
+        return False
+    if _fedex_recover_count >= 3:
+        raise FedexBatchError(
+            "FedEx stayed on a Retry/load-failure page after reloading the batch "
+            "shipping URL 3 times. Check network or VPN, then run again."
+        )
 
-    for sel in _retry_selectors(cfg):
-        try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=1500)
-            loc.click(timeout=8000)
-            _log(f"Clicked Retry ({sel!r}).")
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def _relogin_after_retry(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> bool:
-    """After Retry, FedEx often shows the login form again — refill and submit."""
+    _fedex_recover_count += 1
+    _fedex_last_reload_at = now
+    batch_url = _batch_url(cfg)
+    _log(
+        "Retry/load-failure page detected — reloading batch shipping "
+        f"(not clicking Retry): {batch_url}"
+    )
+    page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
     _fedex_short_pause(page, cfg, ms=800)
-    hit = _find_login_form(page, cfg, quick=False)
-    if not hit:
-        return False
-    user, pw, scope = hit
-    _log("Login form after Retry — entering credentials again.")
-    _fill_login_field(user, creds.username, label="username")
-    _fill_login_field(pw, creds.password, label="password")
-    page.wait_for_timeout(250)
-    _click_login_submit(page, scope, cfg)
-    return True
+    _maybe_accept_fedex_cookies(page, cfg)
 
+    if _is_batch_page(page):
+        _log("Batch uploads page is ready after reload.")
+        return True
 
-def _fedex_recover_page(page: Page, cfg: dict[str, Any], creds: FedexCredentials | None) -> bool:
-    """Handle load-failure Retry + re-login when credentials are available."""
-    if not _retry_button_visible(page, cfg):
-        return False
-    if not _maybe_click_load_retry(page, cfg):
-        return False
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=45_000)
-    except PlaywrightTimeout:
-        pass
-    _fedex_short_pause(page, cfg, ms=600)
-    if creds is not None:
-        return _relogin_after_retry(page, cfg, creds)
-    return True
+    if _find_login_form(page, cfg, quick=True):
+        _log("Login form after reload — signing in.")
+        _perform_fedex_login(page, cfg, creds)
+        if not _is_batch_page(page):
+            page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
+            _fedex_short_pause(page, cfg, ms=500)
+            _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
+        return _is_batch_page(page)
+
+    return False
 
 
 def _maybe_accept_fedex_cookies(page: Page, cfg: dict[str, Any], *, peel_overlays: bool = True) -> bool:
@@ -493,8 +495,8 @@ def _wait_for_login_ready(
     stable_hits = 0
 
     while time.monotonic() < deadline:
-        if creds is not None:
-            _fedex_recover_page(page, cfg, creds)
+        if creds is not None and _retry_button_visible(page, cfg):
+            _recover_from_load_failure(page, cfg, creds)
 
         if _is_batch_page(page):
             _log("Batch uploads page is ready — login not required.")
@@ -541,8 +543,8 @@ def _wait_for_login_or_batch(
     """Return 'batch' if uploads page is ready, 'login' if login form is ready."""
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
-        if creds is not None:
-            _fedex_recover_page(page, cfg, creds)
+        if creds is not None and _retry_button_visible(page, cfg):
+            _recover_from_load_failure(page, cfg, creds)
         if _is_batch_page(page):
             return "batch"
         if _find_login_form(page, cfg, quick=True):
@@ -615,8 +617,8 @@ def _wait_for_logged_in(
 ) -> None:
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
-        if creds is not None:
-            _fedex_recover_page(page, cfg, creds)
+        if creds is not None and _retry_button_visible(page, cfg):
+            _recover_from_load_failure(page, cfg, creds)
         if _is_batch_page(page):
             _log("Session active — batch uploads page is ready.")
             return
@@ -654,7 +656,8 @@ def _open_batch_after_login(page: Page, cfg: dict[str, Any], creds: FedexCredent
     _log(f"Opening batch uploads: {batch_url}")
     page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
     _fedex_short_pause(page, cfg, ms=500)
-    _fedex_recover_page(page, cfg, creds)
+    if _retry_button_visible(page, cfg):
+        _recover_from_load_failure(page, cfg, creds)
     _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
     if not _is_batch_page(page):
         state = _wait_for_login_or_batch(page, cfg, creds, timeout_ms=45_000)
@@ -666,13 +669,15 @@ def _open_batch_after_login(page: Page, cfg: dict[str, Any], creds: FedexCredent
 
 
 def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
-    batch_url = (cfg.get("fedex", {}).get("batch_url") or DEFAULT_BATCH_URL).strip()
+    batch_url = _batch_url(cfg)
     login_url = (cfg.get("fedex", {}).get("login_url") or DEFAULT_LOGIN_URL).strip()
 
+    _reset_fedex_recover_state()
     _log(f"Opening batch page (will log in if needed): {batch_url}")
     page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
     _fedex_initial_wait(page, cfg)
-    _fedex_recover_page(page, cfg, creds)
+    if _retry_button_visible(page, cfg):
+        _recover_from_load_failure(page, cfg, creds)
     _maybe_accept_fedex_cookies(page, cfg)
 
     if _is_batch_page(page):
@@ -693,7 +698,8 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -
     _log(f"Opening FedEx login as {creds.username!r}: {login_url}")
     page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
     _fedex_short_pause(page, cfg, ms=700)
-    _fedex_recover_page(page, cfg, creds)
+    if _retry_button_visible(page, cfg):
+        _recover_from_load_failure(page, cfg, creds)
     _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
 
     state = _wait_for_login_or_batch(page, cfg, creds, timeout_ms=45_000)

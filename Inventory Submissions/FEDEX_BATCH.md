@@ -88,7 +88,7 @@ Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
 - `FEDEX_INITIAL_WAIT_MS` — one short wait after first page open (default 1200)
 - `FEDEX_AFTER_COOKIE_MS` — pause after Accept cookies (default 600)
 - `FEDEX_MICRO_PAUSE_MS` — small pauses between quick login steps (default 350)
-- `selectors.load_retry_button` — Retry on FedEx “failed to load” pages (auto re-login after click)
+- `selectors.load_retry_button` — detects FedEx “failed to load” / Retry pages (script reloads batch URL instead of clicking Retry)
 
 ### Warehouse-print vendors (same as Order Splitter)
 
