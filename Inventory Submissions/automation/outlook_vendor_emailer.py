@@ -46,6 +46,14 @@ def _as_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _normalize_recipient_field(value: Any) -> str:
+    """Accept a string or list of emails/names; return one Outlook-style field."""
+    if isinstance(value, list):
+        parts = [_as_str(x) for x in value if _as_str(x)]
+        return ", ".join(parts)
+    return _as_str(value)
+
+
 def load_vendor_email_config(config_path: Path) -> VendorEmailConfig:
     if not config_path.is_file():
         raise VendorEmailError(f"Config not found: {config_path}")
@@ -78,8 +86,8 @@ def load_vendor_email_config(config_path: Path) -> VendorEmailConfig:
         if not isinstance(item, dict):
             raise VendorEmailError(f"vendors[{i}] is not an object.")
         vendor = _as_str(item.get("vendor_folder"))
-        to = _as_str(item.get("to"))
-        cc = _as_str(item.get("cc"))
+        to = _normalize_recipient_field(item.get("to"))
+        cc = _normalize_recipient_field(item.get("cc"))
         subject = _as_str(item.get("subject"))
         body = str(item.get("body") or "")
         if not vendor:
@@ -427,29 +435,33 @@ def _apply_mail_recipients(
 
     for token in _split_recipient_field(to):
         ok, source = _add_recipient_token(mail, namespace, token, _OL_TO)
-        if ok and source == "entry":
-            _log(f"  To: added {token!r} from address book / Contacts")
+        if ok:
+            if source == "entry":
+                _log(f"  To: added {token!r} from address book / Contacts")
+            elif source == "smtp":
+                _log(f"  To: added {token!r} (email)")
             continue
-        if not ok and _gal_resolves(namespace, token):
+        if _gal_resolves(namespace, token):
             if _rebuild_named_recipient(mail, namespace, token, _OL_TO):
                 _log(f"  To: re-linked {token!r} from Contacts")
                 continue
-        if not _gal_resolves(namespace, token):
-            _log(f"  WARN: not found in address book: {token!r}")
-            unresolved.append(token)
+        _log(f"  WARN: not found in address book: {token!r}")
+        unresolved.append(token)
 
     for token in _split_recipient_field(cc):
         ok, source = _add_recipient_token(mail, namespace, token, _OL_CC)
-        if ok and source == "entry":
-            _log(f"  Cc: added {token!r} from address book / Contacts")
+        if ok:
+            if source == "entry":
+                _log(f"  Cc: added {token!r} from address book / Contacts")
+            elif source == "smtp":
+                _log(f"  Cc: added {token!r} (email)")
             continue
-        if not ok and _gal_resolves(namespace, token):
+        if _gal_resolves(namespace, token):
             if _rebuild_named_recipient(mail, namespace, token, _OL_CC):
                 _log(f"  Cc: re-linked {token!r} from Contacts")
                 continue
-        if not _gal_resolves(namespace, token):
-            _log(f"  WARN: not found in address book: {token!r}")
-            unresolved.append(token)
+        _log(f"  WARN: not found in address book: {token!r}")
+        unresolved.append(token)
 
     for _ in range(3):
         try:

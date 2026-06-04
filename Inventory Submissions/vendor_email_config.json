@@ -1,5 +1,5 @@
 {
-  "_comment": "Fill vendor_folder to match z- Daily Vendor Orders folders. Put exact Outlook group display name in \"to\". Preview: run_vendor_emails.py --preview --vendor \"MMR\". Send is blocked until groups resolve (VENDOR_EMAIL_RESOLVE_TIMEOUT_S, default 45s).",
+  "_comment": "vendor_folder must match z- Daily Vendor Orders folders. Put one or more emails (or Outlook names) in \"to\" — string or JSON array. Preview: run_vendor_emails.py --preview --vendor \"Agra Life\".",
   "daily_vendor_root": "\\\\rygarcorp.com\\shares\\Cornerstone\\Dot Com Packing Slips\\1-Orders Before Extraction\\Order Splitter Output\\z- Daily Vendor Orders",
   "skip_root_entries": [
     ".warehouse_parts",
@@ -18,56 +18,133 @@
   "vendors": [
     {
       "vendor_folder": "Agra Life",
-      "to": "Agra",
+      "to": [
+        "Acapistrand@ecoshell.com",
+        "helen@ecoshell.com",
+        "JBrown@ecoshell.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "Ez Pole",
-      "to": "Ez Pole",
+      "to": [
+        "dennis@tdfab.com",
+        "sales@ezpole.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "Handozer",
-      "to": "Handozer",
+      "to": [
+        "carmen@GEP-led.com",
+        "mike@handozer.com",
+        "sales@handozer.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "MMR",
-      "to": "MMR",
+      "to": [
+        "cmh@moldsolutionsintl.com",
+        "thudik@badaxeproducts.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "Oru Kayak",
-      "to": "Oru Kayak",
+      "to": [
+        "laura.galindo@orukayak.com",
+        "retail@orukayak.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "ORU Kayaks",
-      "to": "Oru Kayak",
+      "to": [
+        "laura.galindo@orukayak.com",
+        "retail@orukayak.com"
+      ],
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "Post Protector",
-      "to": "Post Protector",
+      "to": "post_protector@yahoo.com",
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
     },
     {
       "vendor_folder": "Snake Snare",
-      "to": "Snake Fence",
+      "to": "chris@snakesnares.com",
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Function 101",
+      "to": "mike@function101.com",
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "CapSpot",
+      "to": [
+        "chad@capspotusa.com",
+        "FCXWarehouse@fcxproduction.com",
+        "mc@fcxproduction.com",
+        "sw@fcxproduction.com"
+      ],
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Creative Composites",
+      "to": "info@creativecomposite.com",
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Post Protector - SBP99",
+      "to": "post_protector@yahoo.com",
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "TorkStrap",
+      "to": "sales@torkstrap.com",
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "UPROOT",
+      "to": [
+        "dan@uprootclean.com",
+        "rizza@uprootclean.com"
+      ],
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Zaca",
+      "to": "zaca@zaca-inc.com",
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
