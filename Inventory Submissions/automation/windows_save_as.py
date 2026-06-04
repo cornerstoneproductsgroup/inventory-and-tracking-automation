@@ -250,26 +250,51 @@ def _filename_matches(edit_hwnd: int, dest: Path) -> bool:
     current = _read_edit_text(edit_hwnd).strip().lower()
     if not current:
         return False
-    want = dest.name.strip().lower()
-    stem = dest.stem.strip().lower()
-    return want in current or current == stem or current.endswith(f"{stem}.pdf")
+    want_stem = dest.stem.strip().lower()
+    want_name = dest.name.strip().lower()
+    return (
+        current == want_name
+        or current == want_stem
+        or want_stem in current
+        or current.startswith(want_stem)
+    )
 
 
 def _click_save_button(hwnd: int) -> bool:
     import win32con
     import win32gui
 
+    _focus_dialog(hwnd)
+    time.sleep(0.15)
     btn = _find_save_button_hwnd(hwnd)
     if btn:
         try:
-            win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+            win32gui.SendMessage(btn, win32con.BM_CLICK, 0, 0)
         except Exception:
-            pass
-        _log("Clicked Save.")
-        return True
-    _send_alt_key("s")
-    _log("Sent Alt+S for Save.")
+            try:
+                win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+            except Exception:
+                pass
+    else:
+        _send_alt_key("s")
+    time.sleep(0.2)
+    _send_vk(win32con.VK_RETURN)
+    _log("Clicked Save (button + Enter).")
     return True
+
+
+def dismiss_save_as_dialog_esc() -> None:
+    """Close a stray Save dialog without saving (warehouse-print rows)."""
+    import win32con
+
+    hwnd = find_save_as_dialog_hwnd(log=False)
+    if not hwnd:
+        return
+    _focus_dialog(hwnd)
+    time.sleep(0.15)
+    _send_vk(win32con.VK_ESCAPE)
+    time.sleep(0.4)
+    _log("Dismissed Save dialog (Escape).")
 
 
 def _navigate_to_folder(hwnd: int, folder: Path) -> None:
@@ -307,7 +332,7 @@ def _clear_filename_field(hwnd: int) -> None:
 
 
 def _set_filename_only(hwnd: int, dest: Path) -> bool:
-    """File name = PO.pdf only (folder must already be set)."""
+    """File name = full PURCHASE_ORDER.pdf (folder must already be set)."""
     _clear_filename_field(hwnd)
     edit = _find_filename_edit_hwnd(hwnd)
     _set_clipboard(dest.name)
@@ -389,19 +414,30 @@ def _wait_for_save_result(
 
 def _worldship_save_once(hwnd: int, dest: Path, *, started: float, min_bytes: int) -> bool:
     """
-    One label, one dialog: navigate folder → clear → PO filename → Save.
-    Never paste a full UNC into File name (that leaks into the next dialog).
+    One label, one dialog: navigate folder → clear → full PURCHASE_ORDER filename → Save.
     """
     _navigate_to_folder(hwnd, dest.parent)
+    hwnd = find_save_as_dialog_hwnd(log=False) or hwnd
     if not _set_filename_only(hwnd, dest):
         return False
-    time.sleep(0.25)
+    time.sleep(0.35)
     _click_save_button(hwnd)
-    time.sleep(0.5)
+    time.sleep(0.6)
     dismiss_overwrite_prompt()
-    return _wait_for_save_result(
-        hwnd, dest, started=started, timeout_s=25.0, min_bytes=min_bytes
-    )
+    if _wait_for_save_result(
+        hwnd, dest, started=started, timeout_s=28.0, min_bytes=min_bytes
+    ):
+        return True
+    # Dialog still open — one more Save attempt with fresh focus.
+    if _dialog_still_open(hwnd) and _set_filename_only(hwnd, dest):
+        _log("Retrying Save click on same dialog…")
+        _click_save_button(hwnd)
+        time.sleep(0.6)
+        dismiss_overwrite_prompt()
+        return _wait_for_save_result(
+            hwnd, dest, started=started, timeout_s=20.0, min_bytes=min_bytes
+        )
+    return False
 
 
 def fill_save_as_dialog(

@@ -122,6 +122,15 @@ def label_save_gap_s() -> float:
         return 4.0
 
 
+def warehouse_print_wait_s() -> float:
+    """How long to wait for a Save dialog on warehouse-print rows (usually none)."""
+    raw = (os.environ.get("WORLDSHIP_PRINT_WAIT_S") or "15").strip()
+    try:
+        return max(3.0, float(raw))
+    except ValueError:
+        return 15.0
+
+
 def retailer_merchant_to_key(merchant: str) -> str:
     m = (merchant or "").strip().lower()
     if not m:

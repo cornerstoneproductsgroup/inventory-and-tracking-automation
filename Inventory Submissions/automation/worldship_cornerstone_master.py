@@ -100,12 +100,16 @@ def _cell_str(value) -> str:
     return str(value).strip()
 
 
-def _normalize_po(raw: str) -> str:
-    """WorldShip PURCHASE_ORDER may include product text, e.g. '44987387 Coarse 10'."""
+def _purchase_order_for_label(raw: str) -> str:
+    """
+    Full PURCHASE_ORDER cell for the saved PDF name (e.g. '48690515 Coarse 10').
+    Invalid Windows filename characters are replaced with underscores.
+    """
     text = _cell_str(raw)
     if not text:
         return ""
-    return text.split()[0]
+    text = re.sub(r'[<>:"/\\|?*]', "_", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _norm_header(name: str) -> str:
@@ -206,7 +210,7 @@ def _append_order_row(
     sku = _cell_str(row[sku_i] if len(row) > sku_i else "")
     if not sku:
         return "skip"
-    po = _normalize_po(row[po_i] if len(row) > po_i else "")
+    po = _purchase_order_for_label(row[po_i] if len(row) > po_i else "")
     retailer_raw = _cell_str(row[retailer_i] if len(row) > retailer_i else "")
     if not po:
         raise ValueError(f"Row {row_idx}: PO is empty (SKU={sku!r}).")
