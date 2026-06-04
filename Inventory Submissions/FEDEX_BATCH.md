@@ -58,6 +58,25 @@ If the **newest** CSV in the folder is **not** today's date:
 
 5. First full run uses a visible browser (`headless: false` in config) so login can save **`fedex_storage_state.json`** for later runs.
 
+### Recommended when auto-login fails
+
+FedEx often clears or ignores scripted username/password (empty fields, Retry page). Use **manual login once**, then reuse the saved session:
+
+```powershell
+cd "Inventory Submissions"
+python run_fedex_batch.py --manual-login
+```
+
+Sign in in the Chromium window (including MFA). When the batch **Upload** page is visible, press **Enter** in the console. The run continues (upload, labels, tracking export) and refreshes **`fedex_storage_state.json`**.
+
+Daily runs (session still valid):
+
+```powershell
+python run_fedex_batch.py --skip-auto-login
+```
+
+Or set in `.env`: `FEDEX_SKIP_AUTO_LOGIN=1` (never auto-fills password; prompts only if session expired).
+
 6. On first visit, FedEx may show a OneTrust **Accept all cookies** banner. The automation clicks it when present (`#onetrust-accept-btn-handler`). Override with `selectors.cookie_accept` in `fedex_batch.json` if your banner differs.
 
 7. Login uses [FedEx secure login](https://www.fedex.com/secure-login/en-us/) (not the marketing home page). If login fields flash and disappear, set `fedex.login_url` to that URL in `fedex_batch.json`.
@@ -69,6 +88,8 @@ cd "Inventory Submissions"
 python run_fedex_batch.py --plan-only
 python run_fedex_batch.py
 python run_fedex_batch.py --skip-upload
+python run_fedex_batch.py --manual-login
+python run_fedex_batch.py --skip-auto-login
 ```
 
 Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.

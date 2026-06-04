@@ -65,6 +65,16 @@ def main() -> int:
         action="store_true",
         help="Verify FEDEX_USERNAME and FEDEX_PASSWORD in .env (no browser).",
     )
+    parser.add_argument(
+        "--manual-login",
+        action="store_true",
+        help="You sign in in the browser; script continues when batch page is ready (saves session).",
+    )
+    parser.add_argument(
+        "--skip-auto-login",
+        action="store_true",
+        help="Use fedex_storage_state.json only; prompt for manual login if session expired.",
+    )
     args = parser.parse_args()
 
     os.chdir(_HERE)
@@ -115,6 +125,8 @@ def main() -> int:
             plan_only=bool(args.plan_only or args.dry_run),
             skip_upload=args.skip_upload,
             dry_run=args.dry_run,
+            manual_login=args.manual_login,
+            skip_auto_login=args.skip_auto_login,
         )
     except LowesCsvSkip as skip:
         print(f"[fedex] Skipping: newest file {skip.top_filename!r} is not today's Lowe's Output.")

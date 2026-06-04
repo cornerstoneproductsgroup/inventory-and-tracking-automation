@@ -770,6 +770,54 @@ def _goto_fedex_login_page(page: Page, cfg: dict[str, Any], creds: FedexCredenti
     _maybe_accept_fedex_cookies(page, cfg, peel_overlays=False)
 
 
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _pause_for_manual_login(page: Page, cfg: dict[str, Any]) -> None:
+    """Let the user sign in in the visible browser; continue when batch uploads is ready."""
+    batch_url = _batch_url(cfg)
+    if not _is_batch_page(page):
+        _log(f"Manual login: opening batch page: {batch_url}")
+        page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
+        _fedex_initial_wait(page, cfg)
+        _maybe_accept_fedex_cookies(page, cfg)
+
+    if _is_batch_page(page):
+        _log("Batch uploads page already open (manual login not required).")
+        return
+
+    print(
+        "\n=== FedEx manual login ===\n"
+        "1. In the Chromium window, sign in to FedEx (MFA / email code if prompted).\n"
+        "2. Stay on or open the batch uploads page (Upload button visible).\n"
+        "3. Return here and press Enter to continue automation.\n"
+        "   Type q and Enter to cancel.\n",
+        flush=True,
+    )
+    deadline = time.monotonic() + 600.0
+    while time.monotonic() < deadline:
+        if _is_batch_page(page):
+            _log("Batch uploads page detected after manual login.")
+            return
+        try:
+            line = input("Press Enter when the batch page is ready (q to quit): ")
+        except EOFError as exc:
+            raise FedexBatchError(
+                "Manual login needs an interactive console (run from Run FedEx Batch.bat, not a detached job)."
+            ) from exc
+        if line.strip().lower() == "q":
+            raise FedexBatchError("Manual login cancelled.")
+        if _is_batch_page(page):
+            _log("Batch uploads page ready.")
+            return
+        print("Batch page not detected yet — finish login in the browser, then press Enter again.", flush=True)
+
+    raise FedexBatchError(
+        "Manual login timed out after 10 minutes. Confirm you can open FedEx Shipping Plus batch import in a normal browser."
+    )
+
+
 def _open_batch_after_login(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
     batch_url = (cfg.get("fedex", {}).get("batch_url") or DEFAULT_BATCH_URL).strip()
     if _is_batch_page(page):
@@ -789,7 +837,19 @@ def _open_batch_after_login(page: Page, cfg: dict[str, Any], creds: FedexCredent
             )
 
 
-def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -> None:
+def _login_if_needed(
+    page: Page,
+    cfg: dict[str, Any],
+    creds: FedexCredentials,
+    *,
+    manual_login: bool = False,
+    skip_auto_login: bool = False,
+) -> None:
+    if manual_login:
+        _reset_fedex_recover_state()
+        _pause_for_manual_login(page, cfg)
+        return
+
     batch_url = _batch_url(cfg)
     login_url = (cfg.get("fedex", {}).get("login_url") or DEFAULT_LOGIN_URL).strip()
 
@@ -803,6 +863,14 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: FedexCredentials) -
 
     if _is_batch_page(page):
         _log("Already on batch uploads page (session active).")
+        return
+
+    if skip_auto_login:
+        _log(
+            "FEDEX_SKIP_AUTO_LOGIN: saved session did not reach batch page — "
+            "complete login in the browser."
+        )
+        _pause_for_manual_login(page, cfg)
         return
 
     state = _wait_for_login_or_batch(page, cfg, creds, timeout_ms=60_000)
@@ -1468,6 +1536,8 @@ def run_fedex_batch(
     plan_only: bool = False,
     skip_upload: bool = False,
     dry_run: bool = False,
+    manual_login: bool = False,
+    skip_auto_login: bool = False,
 ) -> int:
     cfg = _load_config(config_path)
     d = order_date or date.today()
@@ -1511,8 +1581,18 @@ def run_fedex_batch(
             f"{order_splitter_watcher_path()}"
         )
 
+    manual_login = manual_login or _env_truthy("FEDEX_MANUAL_LOGIN")
+    skip_auto_login = skip_auto_login or _env_truthy("FEDEX_SKIP_AUTO_LOGIN")
+    if manual_login:
+        _log("Login mode: manual (browser sign-in, no auto-fill).")
+    elif skip_auto_login:
+        _log("Login mode: saved session only; manual prompt if session expired.")
+
     browser_cfg = cfg.get("browser", {})
     headless = bool(browser_cfg.get("headless", False))
+    if manual_login and headless:
+        _log("WARN: manual login requires a visible browser; forcing headless=false.")
+        headless = False
     slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
     default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
 
@@ -1526,7 +1606,13 @@ def run_fedex_batch(
         page = context.new_page()
         page.set_default_timeout(default_timeout)
         try:
-            _login_if_needed(page, cfg, creds)
+            _login_if_needed(
+                page,
+                cfg,
+                creds,
+                manual_login=manual_login,
+                skip_auto_login=skip_auto_login,
+            )
 
             if not skip_upload:
                 _upload_lowes_csv(page, cfg, upload_csv)
