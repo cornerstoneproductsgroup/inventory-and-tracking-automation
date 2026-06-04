@@ -19,7 +19,7 @@ Example (6 shipments):
 
 ## Phases
 
-1. **Phase 1** — Every SAVE row: wait for a **new** Save dialog → set vendor folder → full `PURCHASE_ORDER` filename → Save → verify file on disk and dialog closed. Stops on first failure (no silent skip).
+1. **Phase 1** — Every SAVE row: wait for a **new** Save dialog → enter **PO filename** → set **vendor folder** → **re-enter PO** (folder nav clears it) → Save → verify on disk. One automatic retry if Save does not complete.
 2. **Phase 2** — Warehouse-print rows: wait for print; dismiss any unexpected Save dialog.
 
 ## Automatic Processing Progress — do not click Stop
