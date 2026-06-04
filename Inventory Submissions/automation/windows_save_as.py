@@ -331,41 +331,84 @@ def _clear_filename_field(hwnd: int) -> None:
     time.sleep(0.15)
 
 
-def _set_filename_only(hwnd: int, dest: Path) -> bool:
+def _set_filename_only(hwnd: int, dest: Path, *, attempts: int = 4) -> bool:
     """File name = full PURCHASE_ORDER.pdf (folder must already be set)."""
-    _clear_filename_field(hwnd)
+    want = dest.name
+    for attempt in range(1, attempts + 1):
+        _clear_filename_field(hwnd)
+        edit = _find_filename_edit_hwnd(hwnd)
+        if edit:
+            _set_edit_text(edit, want)
+            time.sleep(0.2)
+        _set_clipboard(want)
+        _focus_dialog(hwnd)
+        _send_alt_key("n")
+        time.sleep(0.35)
+        _send_ctrl_a()
+        _send_ctrl_v()
+        time.sleep(0.4)
+        edit = _find_filename_edit_hwnd(hwnd) or edit
+        if edit:
+            if not _filename_matches(edit, dest):
+                _set_edit_text(edit, want)
+                time.sleep(0.2)
+            current = _read_edit_text(edit)
+            _log(f"File name field (try {attempt}/{attempts}): {current!r}")
+            if _filename_matches(edit, dest):
+                return True
+        if attempt < attempts:
+            _log(f"Filename not set yet; retrying ({attempt}/{attempts})…")
+            time.sleep(0.35)
+    _log(f"ERROR: could not set filename to {want!r}.")
+    return False
+
+
+def _assert_ready_to_save(hwnd: int, dest: Path) -> bool:
     edit = _find_filename_edit_hwnd(hwnd)
-    _set_clipboard(dest.name)
-    _send_alt_key("n")
-    time.sleep(0.3)
-    _send_ctrl_a()
-    _send_ctrl_v()
-    time.sleep(0.35)
-
-    if edit:
-        if not _filename_matches(edit, dest):
-            _set_edit_text(edit, dest.name)
-            time.sleep(0.15)
-        current = _read_edit_text(edit)
-        _log(f"File name field: {current!r}")
-        if not _filename_matches(edit, dest):
-            _log(f"ERROR: expected filename {dest.name!r}.")
-            return False
-        return True
-
-    _log("WARN: cannot read filename field; continuing after keyboard paste.")
+    if not edit or not _filename_matches(edit, dest):
+        current = _read_edit_text(edit) if edit else ""
+        _log(f"ERROR: refusing Save — filename field is {current!r}, want {dest.name!r}.")
+        return False
     return True
 
 
-def _dest_file_ready(dest: Path, *, started: float, min_bytes: int) -> bool:
+def _file_stat_snapshot(dest: Path) -> tuple[float, int] | None:
+    if not dest.is_file():
+        return None
+    try:
+        st = dest.stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+
+
+def _dest_file_saved(
+    dest: Path,
+    *,
+    min_bytes: int,
+    save_clicked_at: float,
+    before: tuple[float, int] | None,
+) -> bool:
+    """
+    True only when dest was written or updated by this Save click.
+
+    Uses wall-clock mtimes (never time.monotonic() — that caused false positives
+    when an older PDF with the same name already existed on the share).
+    """
     if not dest.is_file():
         return False
     try:
-        size = dest.stat().st_size
-        mtime = dest.stat().st_mtime
+        st = dest.stat()
     except OSError:
         return False
-    return size >= min_bytes and mtime >= started - 8
+    if st.st_size < min_bytes:
+        return False
+    if st.st_mtime < save_clicked_at - 2.0:
+        return False
+    if before is None:
+        return True
+    prev_mtime, prev_size = before
+    return st.st_mtime > prev_mtime + 0.05 or st.st_size != prev_size
 
 
 def dismiss_overwrite_prompt(*, timeout_s: float = 4.0) -> None:
@@ -385,82 +428,185 @@ def _wait_for_save_result(
     hwnd: int,
     dest: Path,
     *,
-    started: float,
+    save_clicked_at: float,
+    before: tuple[float, int] | None,
     timeout_s: float,
     min_bytes: int,
 ) -> bool:
-    """Dialog must close AND the PDF must exist at the exact target path."""
+    """Dialog must close AND the PDF must be newly written at the exact target path."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _dest_file_ready(dest, started=started, min_bytes=min_bytes):
+        dialog_open = _dialog_still_open(hwnd)
+        file_ok = _dest_file_saved(
+            dest,
+            min_bytes=min_bytes,
+            save_clicked_at=save_clicked_at,
+            before=before,
+        )
+        if file_ok and not dialog_open:
             _log(f"Confirmed on disk: {dest} ({dest.stat().st_size:,} bytes)")
             return True
-        if not _dialog_still_open(hwnd):
-            for _ in range(50):
-                if _dest_file_ready(dest, started=started, min_bytes=min_bytes):
+        if not dialog_open:
+            for _ in range(60):
+                if _dest_file_saved(
+                    dest,
+                    min_bytes=min_bytes,
+                    save_clicked_at=save_clicked_at,
+                    before=before,
+                ):
                     _log(f"Confirmed on disk: {dest} ({dest.stat().st_size:,} bytes)")
                     return True
                 time.sleep(0.25)
             _log(
-                "Dialog closed but the PDF is not at the target path "
-                "(wrong folder or save was cancelled)."
+                "Dialog closed but the PDF was not updated at the target path "
+                "(filename not saved or wrong folder)."
             )
             return False
         time.sleep(0.3)
     if _dialog_still_open(hwnd):
         _log("ERROR: Save dialog still open after Save click.")
+    elif _dest_file_saved(
+        dest, min_bytes=min_bytes, save_clicked_at=save_clicked_at, before=before
+    ):
+        _log("ERROR: PDF updated but Save dialog is still open (will block next label).")
     return False
 
 
-def _worldship_save_once(hwnd: int, dest: Path, *, started: float, min_bytes: int) -> bool:
+def _worldship_save_once(
+    hwnd: int,
+    dest: Path,
+    *,
+    before: tuple[float, int] | None,
+    min_bytes: int,
+) -> bool:
     """
     One label, one dialog: navigate folder → clear → full PURCHASE_ORDER filename → Save.
     """
     _navigate_to_folder(hwnd, dest.parent)
     hwnd = find_save_as_dialog_hwnd(log=False) or hwnd
+    _focus_dialog(hwnd)
+    time.sleep(0.4)
     if not _set_filename_only(hwnd, dest):
         return False
-    time.sleep(0.35)
+    if not _assert_ready_to_save(hwnd, dest):
+        return False
+    time.sleep(0.25)
+    save_clicked_at = time.time()
     _click_save_button(hwnd)
     time.sleep(0.6)
     dismiss_overwrite_prompt()
     if _wait_for_save_result(
-        hwnd, dest, started=started, timeout_s=28.0, min_bytes=min_bytes
+        hwnd,
+        dest,
+        save_clicked_at=save_clicked_at,
+        before=before,
+        timeout_s=28.0,
+        min_bytes=min_bytes,
     ):
         return True
     # Dialog still open — one more Save attempt with fresh focus.
     if _dialog_still_open(hwnd) and _set_filename_only(hwnd, dest):
         _log("Retrying Save click on same dialog…")
+        save_clicked_at = time.time()
         _click_save_button(hwnd)
         time.sleep(0.6)
         dismiss_overwrite_prompt()
         return _wait_for_save_result(
-            hwnd, dest, started=started, timeout_s=20.0, min_bytes=min_bytes
+            hwnd,
+            dest,
+            save_clicked_at=save_clicked_at,
+            before=before,
+            timeout_s=20.0,
+            min_bytes=min_bytes,
         )
     return False
+
+
+def wait_until_save_dialog_closed(*, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not find_save_as_dialog_hwnd(log=False):
+            return True
+        time.sleep(0.35)
+    if find_save_as_dialog_hwnd(log=False):
+        _log("ERROR: Save dialog still visible (blocks next label).")
+        return False
+    return True
+
+
+def _min_label_bytes() -> int:
+    raw = (os.environ.get("WORLDSHIP_MIN_LABEL_BYTES") or "800").strip()
+    try:
+        return max(100, int(raw))
+    except ValueError:
+        return 800
+
+
+def wait_for_next_save_dialog(*, previous_hwnd: int, timeout_s: float) -> int:
+    """
+    Wait until the previous Save dialog is gone, then the next one appears.
+    Prevents reusing a stale dialog hwnd from the prior label.
+    """
+    import win32gui
+
+    close_limit = min(timeout_s, 30.0)
+    close_deadline = time.monotonic() + close_limit
+    while time.monotonic() < close_deadline:
+        if not previous_hwnd:
+            break
+        try:
+            if not (win32gui.IsWindow(previous_hwnd) and win32gui.IsWindowVisible(previous_hwnd)):
+                break
+        except Exception:
+            break
+        time.sleep(0.3)
+    else:
+        if _dialog_still_open(previous_hwnd):
+            _log("ERROR: previous Save dialog did not close before next label.")
+            return 0
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = _enum_save_dialog_hwnds()
+        if not found:
+            time.sleep(0.35)
+            continue
+        hwnd = found[0][1]
+        if previous_hwnd and hwnd == previous_hwnd and _dialog_still_open(previous_hwnd):
+            time.sleep(0.35)
+            continue
+        _log(f"Next Save dialog: {_dialog_title(hwnd)!r}")
+        return hwnd
+    return 0
 
 
 def fill_save_as_dialog(
     dest: Path,
     *,
     timeout_s: float = 45.0,
-    min_bytes: int = 100,
+    min_bytes: int | None = None,
+    dialog_hwnd: int | None = None,
 ) -> bool:
     """Save Print Output As: vendor folder + PO.pdf, verify exact path on disk."""
     dest = dest.resolve()
     dest.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    before = _file_stat_snapshot(dest)
+    if min_bytes is None:
+        min_bytes = _min_label_bytes()
 
-    hwnd = find_save_as_dialog_hwnd(log=True)
+    hwnd = dialog_hwnd or find_save_as_dialog_hwnd(log=dialog_hwnd is None)
     if not hwnd:
         _log("ERROR: Save As dialog not found.")
         return False
 
     _log(f"Target folder: {dest.parent}")
     _log(f"Target file:   {dest.name}")
+    if before:
+        _log(f"Existing file on share (mtime {before[0]:.0f}, {before[1]:,} bytes) — will require update after Save.")
 
-    if _worldship_save_once(hwnd, dest, started=started, min_bytes=min_bytes):
-        return True
+    if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
+        return wait_until_save_dialog_closed(timeout_s=25.0)
 
     # Dialog closed without success — do NOT touch the next Save dialog.
     if not _dialog_still_open(hwnd):
@@ -474,8 +620,8 @@ def fill_save_as_dialog(
         _log("Retrying same Save dialog once (folder + PO)…")
         _focus_dialog(hwnd)
         time.sleep(0.5)
-        if _worldship_save_once(hwnd, dest, started=started, min_bytes=min_bytes):
-            return True
+        if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
+            return wait_until_save_dialog_closed(timeout_s=25.0)
 
     return False
 

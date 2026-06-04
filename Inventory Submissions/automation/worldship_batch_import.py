@@ -1127,48 +1127,47 @@ def _build_label_destination(order, vendor_maps: "VendorMapRegistry") -> Path:
     return dest_dir / filename
 
 
-def _log_label_plan(orders, vendor_maps) -> tuple[int, int]:
-    from automation.warehouse_print_vendors import (
-        is_warehouse_print_vendor,
-        load_warehouse_print_vendors,
-    )
-    from automation.worldship_vendor_map import VendorMapRegistry
+def _verify_saved_label(dest: Path, order) -> None:
+    """Hard stop if the wrong file was written — prevents cascading mis-saves."""
+    from automation.worldship_cornerstone_master import CornerstoneOrderRow
+    from automation.worldship_label_config import label_extension
 
-    if not isinstance(vendor_maps, VendorMapRegistry):
-        raise TypeError("vendor_maps must be VendorMapRegistry")
-    load_warehouse_print_vendors(reload=True)
-    save_n = 0
-    print_n = 0
-    _log(f"Label plan for {len(orders)} CornerstoneMaster row(s):")
-    for order in orders:
-        vendor = vendor_maps.lookup(order.sku, order.retailer_key)
-        if is_warehouse_print_vendor(vendor):
-            print_n += 1
-            _log(
-                f"  row {order.row_number}: PRINT on warehouse — {vendor!r} "
-                f"(SKU {order.sku!r}, PO {order.po!r})"
-            )
-        else:
-            save_n += 1
-            try:
-                dest = _build_label_destination(order, vendor_maps)
-                _log(
-                    f"  row {order.row_number}: SAVE — {vendor!r} → {dest.parent.name}\\{dest.name}"
-                )
-            except FileNotFoundError as exc:
-                _log(f"  row {order.row_number}: SAVE — {vendor!r} (folder missing: {exc})")
-    _log(f"  → {save_n} to save to share, {print_n} warehouse print (no save).")
-    return save_n, print_n
+    if not isinstance(order, CornerstoneOrderRow):
+        raise TypeError("order must be CornerstoneOrderRow")
+    if not dest.is_file():
+        raise RuntimeError(f"Label file missing after save: {dest}")
+    ext = label_extension()
+    expected_name = f"{order.po}{ext}" if ext else order.po
+    if dest.name != expected_name:
+        raise RuntimeError(
+            f"Saved file name mismatch for row {order.row_number}: "
+            f"expected {expected_name!r}, found {dest.name!r} at\n  {dest}"
+        )
+    try:
+        size = dest.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read saved label: {dest}") from exc
+    min_bytes = 800
+    raw = (os.environ.get("WORLDSHIP_MIN_LABEL_BYTES") or "800").strip()
+    try:
+        min_bytes = max(100, int(raw))
+    except ValueError:
+        pass
+    if size < min_bytes:
+        raise RuntimeError(
+            f"Saved label too small ({size} bytes) for row {order.row_number}, PO {order.po!r}: {dest}"
+        )
+    _log(f"Verified on disk: {dest.name} ({size:,} bytes)")
 
 
-def _wait_until_save_dialog_gone(*, max_s: float = 12.0) -> None:
-    from automation.windows_save_as import find_save_as_dialog_hwnd
+def _wait_until_save_dialog_gone(*, max_s: float = 20.0) -> None:
+    from automation.windows_save_as import wait_until_save_dialog_closed
 
-    deadline = time.monotonic() + max_s
-    while time.monotonic() < deadline:
-        if not find_save_as_dialog_hwnd(log=False):
-            return
-        time.sleep(0.35)
+    if not wait_until_save_dialog_closed(timeout_s=max_s):
+        raise RuntimeError(
+            "Save Print Output As dialog is still open — cannot start the next label. "
+            "Close it manually or fix the previous save."
+        )
 
 
 def _pause_between_labels() -> None:
@@ -1180,88 +1179,151 @@ def _pause_between_labels() -> None:
     _wait_until_save_dialog_gone()
 
 
-def _save_shipping_labels() -> int:
+def _run_save_label_phase(plan) -> int:
+    """Phase 1: consecutive Save dialogs — one per save_items entry, strict verify."""
     from automation.windows_save_as import (
-        dismiss_save_as_dialog_esc,
         fill_save_as_dialog,
+        wait_for_next_save_dialog,
         wait_for_save_as_dialog,
     )
-    from automation.warehouse_print_vendors import is_warehouse_print_vendor
-    from automation.worldship_cornerstone_master import load_cornerstone_orders
-    from automation.worldship_label_config import save_dialog_timeout_s, warehouse_print_wait_s
-    from automation.worldship_vendor_map import VendorMapRegistry
+    from automation.worldship_label_config import save_dialog_timeout_s
 
-    _log("Loading CornerstoneMaster for label routing…")
-    orders = load_cornerstone_orders()
-    vendor_maps = VendorMapRegistry()
-    save_expected, print_expected = _log_label_plan(orders, vendor_maps)
+    items = plan.save_items
+    if not items:
+        return 0
 
+    _log(f"=== Phase 1/2: SAVE {len(items)} label(s) to share ===")
+    last_hwnd = 0
     saved = 0
-    printed = 0
-    awaiting_first_save_dialog = True
 
-    for order in orders:
-        vendor = vendor_maps.lookup(order.sku, order.retailer_key)
-
-        if is_warehouse_print_vendor(vendor):
+    for item in items:
+        order = item.order
+        dest = item.dest
+        if item.index == 1:
+            timeout_s = save_dialog_timeout_s(first=True)
             _log(
-                f"Row {order.row_number}: warehouse PRINT — vendor {vendor!r}, "
-                f"SKU {order.sku!r}, PO {order.po!r}"
+                f"Waiting for first Save dialog — save {item.index}/{len(items)}, "
+                f"row {order.row_number}, PO {order.po!r}…"
             )
-            wait_s = warehouse_print_wait_s()
-            if wait_for_save_as_dialog(timeout_s=wait_s):
-                _log(
-                    "WARN: Save dialog appeared for a warehouse-print row — "
-                    "closing it (label should have printed)."
-                )
-                dismiss_save_as_dialog_esc()
-                _wait_until_save_dialog_gone()
-            printed += 1
-            _log(f"Printed {printed}/{print_expected} warehouse label(s).")
-            _pause_between_labels()
-            continue
+            dialog_hwnd = wait_for_save_as_dialog(timeout_s=timeout_s)
+        else:
+            _wait_until_save_dialog_gone(max_s=30.0)
+            timeout_s = save_dialog_timeout_s(first=False)
+            _log(
+                f"Waiting for next Save dialog — save {item.index}/{len(items)}, "
+                f"row {order.row_number}, PO {order.po!r}…"
+            )
+            dialog_hwnd = wait_for_next_save_dialog(
+                previous_hwnd=last_hwnd, timeout_s=timeout_s
+            )
 
-        timeout_s = save_dialog_timeout_s(first=awaiting_first_save_dialog)
-        awaiting_first_save_dialog = False
-        _log(
-            f"Waiting for Save dialog — row {order.row_number}, "
-            f"PO {order.po!r} ({saved + 1}/{save_expected} saves)…"
-        )
-        if not wait_for_save_as_dialog(timeout_s=timeout_s):
+        if not dialog_hwnd:
             raise TimeoutError(
-                f"Timed out waiting for Save dialog for row {order.row_number} "
-                f"(PO {order.po!r})."
+                f"Timed out waiting for Save dialog {item.index}/{len(items)} "
+                f"(row {order.row_number}, PO {order.po!r}). "
+                "Stop WorldShip, fix the previous label, and re-run."
             )
+        last_hwnd = dialog_hwnd
 
-        dest = _build_label_destination(order, vendor_maps)
         _log(
-            f"Saving row {order.row_number}: PO {order.po!r}, SKU {order.sku!r}, "
-            f"retailer {order.retailer_raw!r}"
+            f"--- Save {item.index}/{len(items)}: row {order.row_number}, "
+            f"PO {order.po!r}, SKU {order.sku!r}, retailer {order.retailer_raw!r} ---"
         )
         _log(f"  → folder: {dest.parent}")
         _log(f"  → file:   {dest.name}")
-        if not fill_save_as_dialog(dest, timeout_s=75.0):
+
+        if not fill_save_as_dialog(dest, timeout_s=90.0, dialog_hwnd=dialog_hwnd):
             raise RuntimeError(
-                f"Failed to save label for PO {order.po!r} (SKU {order.sku!r}) to:\n  {dest}"
+                f"Failed to save label {item.index}/{len(items)} for PO {order.po!r} "
+                f"(row {order.row_number}) to:\n  {dest}"
             )
-        if not dest.is_file():
-            raise RuntimeError(f"Label file missing after save: {dest}")
+        _verify_saved_label(dest, order)
+        _wait_until_save_dialog_gone(max_s=30.0)
         saved += 1
-        _log(f"Saved {saved}/{save_expected}: {dest.name}")
-        _pause_between_labels()
+        _log(f"Completed save {saved}/{len(items)}: {dest.name}")
+        if item.index < len(items):
+            _pause_between_labels()
+
+    _log(f"Phase 1 complete: {saved} label(s) saved and verified.")
+    return saved
+
+
+def _run_warehouse_print_phase(plan) -> int:
+    """Phase 2: warehouse-print rows only (no Save dialog expected)."""
+    from automation.windows_save_as import (
+        dismiss_save_as_dialog_esc,
+        wait_for_save_as_dialog,
+    )
+    from automation.worldship_label_config import warehouse_print_wait_s
+
+    orders = plan.print_orders
+    if not orders:
+        return 0
+
+    _log(f"=== Phase 2/2: WAREHOUSE PRINT {len(orders)} label(s) (no save) ===")
+    printed = 0
+    for order in orders:
+        _log(
+            f"Warehouse print {printed + 1}/{len(orders)}: row {order.row_number}, "
+            f"PO {order.po!r}, SKU {order.sku!r}"
+        )
+        wait_s = warehouse_print_wait_s()
+        if wait_for_save_as_dialog(timeout_s=wait_s):
+            _log(
+                "WARN: Save dialog during warehouse print — closing without saving "
+                f"(row {order.row_number})."
+            )
+            dismiss_save_as_dialog_esc()
+            _wait_until_save_dialog_gone()
+        printed += 1
+        if printed < len(orders):
+            _pause_between_labels()
+    _log(f"Phase 2 complete: {printed} warehouse label(s) processed.")
+    return printed
+
+
+def _save_shipping_labels() -> int:
+    from automation.warehouse_print_vendors import load_warehouse_print_vendors
+    from automation.worldship_cornerstone_master import load_cornerstone_orders
+    from automation.worldship_label_work_plan import (
+        log_worldship_label_work_plan,
+        partition_worldship_label_rows,
+    )
+    from automation.worldship_vendor_map import VendorMapRegistry
+
+    _log("Loading CornerstoneMaster for label routing…")
+    load_warehouse_print_vendors(reload=True)
+    orders = load_cornerstone_orders()
+    vendor_maps = VendorMapRegistry()
+    plan = partition_worldship_label_rows(
+        orders, vendor_maps, build_destination=_build_label_destination
+    )
+    log_worldship_label_work_plan(plan, vendor_maps)
+
+    saved = _run_save_label_phase(plan)
+    if saved != len(plan.save_items):
+        raise RuntimeError(
+            f"Expected {len(plan.save_items)} saved label(s), completed {saved}."
+        )
+
+    if plan.save_items and plan.print_orders:
+        from automation.worldship_label_config import label_save_gap_s
+
+        gap_s = label_save_gap_s()
+        _log(f"Save phase done; waiting {gap_s:.0f}s before warehouse print phase…")
+        time.sleep(gap_s)
+        _wait_until_save_dialog_gone(max_s=30.0)
+
+    printed = _run_warehouse_print_phase(plan)
+    if printed != len(plan.print_orders):
+        raise RuntimeError(
+            f"Expected {len(plan.print_orders)} warehouse print(s), counted {printed}."
+        )
 
     _log(
         f"Label processing complete: {saved} saved to share, "
-        f"{printed} sent to warehouse print, {len(orders)} total row(s)."
+        f"{printed} warehouse print, {saved + printed} total."
     )
-    if saved != save_expected:
-        raise RuntimeError(
-            f"Expected {save_expected} saved label(s), completed {saved}."
-        )
-    if printed != print_expected:
-        raise RuntimeError(
-            f"Expected {print_expected} warehouse print(s), counted {printed}."
-        )
     return saved
 
 
