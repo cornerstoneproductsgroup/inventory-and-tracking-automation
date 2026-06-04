@@ -115,11 +115,11 @@ def save_dialog_timeout_s(*, first: bool) -> float:
 
 def label_save_gap_s() -> float:
     """Pause after each label save before waiting for the next Save dialog."""
-    raw = (os.environ.get("WORLDSHIP_SAVE_BETWEEN_LABELS_S") or "4").strip()
+    raw = (os.environ.get("WORLDSHIP_SAVE_BETWEEN_LABELS_S") or "2").strip()
     try:
-        return max(1.0, float(raw))
+        return max(0.5, float(raw))
     except ValueError:
-        return 4.0
+        return 2.0
 
 
 def warehouse_print_wait_s() -> float:

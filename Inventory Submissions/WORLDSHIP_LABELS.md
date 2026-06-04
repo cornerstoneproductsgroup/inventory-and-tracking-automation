@@ -43,6 +43,7 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 
 ## Env tuning
 
-- `WORLDSHIP_SAVE_BETWEEN_LABELS_S` — pause between save dialogs (default 4)
-- `WORLDSHIP_SAVE_FOLDER_NAV_S` — wait after folder path Enter (default 1.4)
+- `WORLDSHIP_SAVE_BETWEEN_LABELS_S` — pause between save dialogs (default 2)
+- `WORLDSHIP_SAVE_FOLDER_NAV_S` — max wait after folder path Enter (default 1.0; skipped when vendor folder unchanged)
+- `WORLDSHIP_SAVE_FILENAME_SETTLE_S` — brief pause after setting filename (default 0.25)
 - `WORLDSHIP_FIRST_SAVE_TIMEOUT_S` / `WORLDSHIP_SAVE_TIMEOUT_S` — wait for dialog

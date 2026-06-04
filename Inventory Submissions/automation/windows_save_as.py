@@ -63,12 +63,115 @@ def _send_ctrl_a() -> None:
     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
-def _folder_nav_pause_s() -> float:
-    raw = (os.environ.get("WORLDSHIP_SAVE_FOLDER_NAV_S") or "1.4").strip()
+_last_nav_folder: Path | None = None
+
+
+def _pause_s(env_key: str, default: float) -> float:
+    raw = (os.environ.get(env_key) or str(default)).strip()
     try:
-        return max(0.8, float(raw))
+        return max(0.05, float(raw))
     except ValueError:
-        return 1.4
+        return default
+
+
+def _folder_nav_pause_s() -> float:
+    return _pause_s("WORLDSHIP_SAVE_FOLDER_NAV_S", 1.0)
+
+
+def _filename_settle_s() -> float:
+    return _pause_s("WORLDSHIP_SAVE_FILENAME_SETTLE_S", 0.25)
+
+
+def _reset_last_save_folder() -> None:
+    global _last_nav_folder
+    _last_nav_folder = None
+
+
+def reset_last_save_folder() -> None:
+    """Clear cached folder at start of a new label batch."""
+    _reset_last_save_folder()
+
+
+def _focus_filename_edit(hwnd: int) -> int:
+    import win32gui
+
+    edit = _find_filename_edit_hwnd(hwnd)
+    if not edit:
+        return 0
+    try:
+        win32gui.SetFocus(edit)
+    except Exception:
+        pass
+    return edit
+
+
+def _wait_for_filename_edit(hwnd: int, *, timeout_s: float = 2.5) -> int:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        edit = _find_filename_edit_hwnd(hwnd)
+        if edit:
+            return edit
+        time.sleep(0.08)
+    return 0
+
+
+def _set_filename_direct(edit_hwnd: int, dest: Path) -> bool:
+    """Set filename via WM_SETTEXT — fastest and most reliable when edit has focus."""
+    want = dest.name
+    _set_edit_text(edit_hwnd, want)
+    time.sleep(_filename_settle_s())
+    if _filename_matches(edit_hwnd, dest):
+        return True
+    _set_edit_text(edit_hwnd, want)
+    time.sleep(_filename_settle_s())
+    return _filename_matches(edit_hwnd, dest)
+
+
+def _set_filename_keyboard(hwnd: int, dest: Path) -> bool:
+    """Fallback when WM_SETTEXT alone did not stick."""
+    want = dest.name
+    _focus_dialog(hwnd)
+    edit = _focus_filename_edit(hwnd) or _find_filename_edit_hwnd(hwnd)
+    _set_clipboard(want)
+    _send_alt_key("n")
+    time.sleep(0.2)
+    _send_ctrl_a()
+    _send_ctrl_v()
+    time.sleep(_filename_settle_s())
+    if edit and _filename_matches(edit, dest):
+        return True
+    edit = _find_filename_edit_hwnd(hwnd)
+    return bool(edit and _filename_matches(edit, dest))
+
+
+def _set_filename_only(hwnd: int, dest: Path) -> bool:
+    """File name = full PURCHASE_ORDER.pdf (folder must already be set)."""
+    want = dest.name
+    _focus_dialog(hwnd)
+    edit = _wait_for_filename_edit(hwnd, timeout_s=2.0)
+    if not edit:
+        _log("WARN: filename field not ready; trying keyboard fallback.")
+        return _set_filename_keyboard(hwnd, dest)
+
+    current = _read_edit_text(edit)
+    if current and ("\\" in current or "/" in current):
+        _set_edit_text(edit, "")
+        time.sleep(0.08)
+
+    _focus_filename_edit(hwnd)
+    if _set_filename_direct(edit, dest):
+        _log(f"File name field: {_read_edit_text(edit)!r}")
+        return True
+
+    _log("WM_SETTEXT did not stick; trying keyboard once…")
+    if _set_filename_keyboard(hwnd, dest):
+        edit = _find_filename_edit_hwnd(hwnd)
+        current = _read_edit_text(edit) if edit else ""
+        _log(f"File name field (keyboard): {current!r}")
+        return True
+
+    _log(f"ERROR: could not set filename to {want!r}.")
+    return False
 
 
 def _dialog_title(hwnd: int) -> str:
@@ -304,69 +407,45 @@ def dismiss_save_as_dialog_esc() -> None:
 
 
 def _navigate_to_folder(hwnd: int, folder: Path) -> None:
-    """Always set folder via address bar (Alt+D) — do not assume WorldShip opened the right place."""
+    """Set folder via address bar (Alt+D). Skip when same folder as previous label."""
     import win32con
+
+    global _last_nav_folder
+    folder = folder.resolve()
+    if _last_nav_folder == folder:
+        _log(f"Folder unchanged — skipping address bar ({folder.name})")
+        _focus_dialog(hwnd)
+        _wait_for_filename_edit(hwnd, timeout_s=0.5)
+        return
 
     folder_str = str(folder)
     _log(f"Setting folder: {folder_str}")
     _focus_dialog(hwnd)
-    time.sleep(0.45)
+    time.sleep(0.25)
     _set_clipboard(folder_str)
     _send_alt_key("d")
-    time.sleep(0.45)
+    time.sleep(0.3)
     _send_ctrl_a()
     _send_ctrl_v()
-    time.sleep(0.25)
+    time.sleep(0.15)
     _send_vk(win32con.VK_RETURN)
-    time.sleep(_folder_nav_pause_s())
+
+    deadline = time.monotonic() + _folder_nav_pause_s()
+    while time.monotonic() < deadline:
+        if _wait_for_filename_edit(hwnd, timeout_s=0.15):
+            time.sleep(_filename_settle_s())
+            _last_nav_folder = folder
+            return
+        time.sleep(0.1)
+    _last_nav_folder = folder
 
 
 def _clear_filename_field(hwnd: int) -> None:
-    """Clear stale path/PO text before entering the current label."""
-    import win32con
-
-    _focus_dialog(hwnd)
-    time.sleep(0.2)
-    edit = _find_filename_edit_hwnd(hwnd)
+    """Clear stale filename before entering the current label."""
+    edit = _focus_filename_edit(hwnd) or _find_filename_edit_hwnd(hwnd)
     if edit:
         _set_edit_text(edit, "")
-    _send_alt_key("n")
-    time.sleep(0.3)
-    _send_ctrl_a()
-    _send_vk(win32con.VK_DELETE)
-    time.sleep(0.15)
-
-
-def _set_filename_only(hwnd: int, dest: Path, *, attempts: int = 4) -> bool:
-    """File name = full PURCHASE_ORDER.pdf (folder must already be set)."""
-    want = dest.name
-    for attempt in range(1, attempts + 1):
-        _clear_filename_field(hwnd)
-        edit = _find_filename_edit_hwnd(hwnd)
-        if edit:
-            _set_edit_text(edit, want)
-            time.sleep(0.2)
-        _set_clipboard(want)
-        _focus_dialog(hwnd)
-        _send_alt_key("n")
-        time.sleep(0.35)
-        _send_ctrl_a()
-        _send_ctrl_v()
-        time.sleep(0.4)
-        edit = _find_filename_edit_hwnd(hwnd) or edit
-        if edit:
-            if not _filename_matches(edit, dest):
-                _set_edit_text(edit, want)
-                time.sleep(0.2)
-            current = _read_edit_text(edit)
-            _log(f"File name field (try {attempt}/{attempts}): {current!r}")
-            if _filename_matches(edit, dest):
-                return True
-        if attempt < attempts:
-            _log(f"Filename not set yet; retrying ({attempt}/{attempts})…")
-            time.sleep(0.35)
-    _log(f"ERROR: could not set filename to {want!r}.")
-    return False
+        time.sleep(0.08)
 
 
 def _assert_ready_to_save(hwnd: int, dest: Path) -> bool:
@@ -484,50 +563,34 @@ def _worldship_save_once(
     *,
     before: tuple[float, int] | None,
     min_bytes: int,
+    skip_folder_nav: bool = False,
 ) -> bool:
     """
-    One label, one dialog: navigate folder → clear → full PURCHASE_ORDER filename → Save.
+    One label, one dialog: navigate folder → set PURCHASE_ORDER filename → Save.
     """
-    _navigate_to_folder(hwnd, dest.parent)
+    if not skip_folder_nav:
+        _navigate_to_folder(hwnd, dest.parent)
     hwnd = find_save_as_dialog_hwnd(log=False) or hwnd
     _focus_dialog(hwnd)
-    time.sleep(0.4)
+
     if not _set_filename_only(hwnd, dest):
         return False
     if not _assert_ready_to_save(hwnd, dest):
         return False
-    time.sleep(0.25)
+
     save_clicked_at = time.time()
     if not _click_save_button(hwnd):
         return False
-    time.sleep(0.6)
+    time.sleep(0.35)
     dismiss_overwrite_prompt()
-    if _wait_for_save_result(
+    return _wait_for_save_result(
         hwnd,
         dest,
         save_clicked_at=save_clicked_at,
         before=before,
-        timeout_s=28.0,
+        timeout_s=22.0,
         min_bytes=min_bytes,
-    ):
-        return True
-    # Dialog still open — one more Save attempt with fresh focus.
-    if _dialog_still_open(hwnd) and _set_filename_only(hwnd, dest):
-        _log("Retrying Save click on same dialog…")
-        save_clicked_at = time.time()
-        if not _click_save_button(hwnd):
-            return False
-        time.sleep(0.6)
-        dismiss_overwrite_prompt()
-        return _wait_for_save_result(
-            hwnd,
-            dest,
-            save_clicked_at=save_clicked_at,
-            before=before,
-            timeout_s=20.0,
-            min_bytes=min_bytes,
-        )
-    return False
+    )
 
 
 def wait_for_save_dialog_handoff(
@@ -665,7 +728,7 @@ def fill_save_as_dialog(
         _log(f"Existing file on share (mtime {before[0]:.0f}, {before[1]:,} bytes) — will require update after Save.")
 
     if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
-        return wait_for_save_dialog_handoff(hwnd, timeout_s=12.0, saved_dest=dest)
+        return wait_for_save_dialog_handoff(hwnd, timeout_s=8.0, saved_dest=dest)
 
     # Dialog closed without success — do NOT touch the next Save dialog.
     if not _dialog_still_open(hwnd):
@@ -676,11 +739,12 @@ def fill_save_as_dialog(
         return False
 
     if time.monotonic() - started < timeout_s - 5:
-        _log("Retrying same Save dialog once (folder + PO)…")
+        _log("Retry: filename + Save only (folder already set)…")
         _focus_dialog(hwnd)
-        time.sleep(0.5)
-        if _worldship_save_once(hwnd, dest, before=before, min_bytes=min_bytes):
-            return wait_for_save_dialog_handoff(hwnd, timeout_s=12.0, saved_dest=dest)
+        if _worldship_save_once(
+            hwnd, dest, before=before, min_bytes=min_bytes, skip_folder_nav=True
+        ):
+            return wait_for_save_dialog_handoff(hwnd, timeout_s=8.0, saved_dest=dest)
 
     return False
 

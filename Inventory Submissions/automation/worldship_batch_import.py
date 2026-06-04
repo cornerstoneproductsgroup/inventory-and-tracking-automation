@@ -1308,6 +1308,9 @@ def _run_save_label_phase(plan) -> int:
         return 0
 
     _log(f"=== Phase 1/2: SAVE {len(items)} label(s) to share ===")
+    from automation.windows_save_as import reset_last_save_folder
+
+    reset_last_save_folder()
     _log(
         "IMPORTANT: While Automatic Processing Progress is open, do NOT click Stop. "
         "WorldShip will pause the batch and later Save dialogs will not appear. "
