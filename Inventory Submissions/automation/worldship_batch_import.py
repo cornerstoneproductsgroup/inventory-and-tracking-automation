@@ -1404,44 +1404,24 @@ def _run_save_label_phase(plan) -> int:
 
 
 def _run_warehouse_print_phase(plan) -> int:
-    """Phase 2: warehouse-print rows only (no Save dialog expected)."""
-    from automation.windows_save_as import (
-        dismiss_save_as_dialog_esc,
-        wait_for_save_as_dialog,
-    )
-    from automation.worldship_label_config import warehouse_print_wait_s
-
+    """Phase 2: warehouse-print rows — WorldShip prints; automation waits for Close."""
     orders = plan.print_orders
     if not orders:
         return 0
 
-    _log(f"=== Phase 2/2: WAREHOUSE PRINT {len(orders)} label(s) (no save) ===")
-    printed = 0
+    _log(f"=== Phase 2/2: WAREHOUSE PRINT {len(orders)} label(s) ===")
     for order in orders:
         _log(
-            f"Warehouse print {printed + 1}/{len(orders)}: row {order.row_number}, "
-            f"PO {order.po!r}, SKU {order.sku!r}"
+            f"  print row {order.row_number}: PO {order.po!r}, SKU {order.sku!r}"
         )
-        wait_s = warehouse_print_wait_s()
-        if wait_for_save_as_dialog(timeout_s=wait_s):
-            _log(
-                "WARN: Save dialog during warehouse print — closing without saving "
-                f"(row {order.row_number})."
-            )
-            dismiss_save_as_dialog_esc()
-            from automation.windows_save_as import wait_until_save_dialog_closed
-
-            wait_until_save_dialog_closed(timeout_s=12.0)
-        printed += 1
-        if printed < len(orders):
-            from automation.worldship_label_config import label_save_gap_s
-
-            time.sleep(label_save_gap_s())
-    _log(f"Phase 2 complete: {printed} warehouse label(s) processed.")
-    return printed
+    _log(
+        "WorldShip is printing warehouse labels — automation will wait for "
+        "100% and click Close when ready (do not click Stop)."
+    )
+    return len(orders)
 
 
-def _save_shipping_labels() -> int:
+def _save_shipping_labels(app, main) -> int:
     from automation.warehouse_print_vendors import load_warehouse_print_vendors
     from automation.worldship_cornerstone_master import load_cornerstone_orders
     from automation.worldship_label_work_plan import (
@@ -1482,9 +1462,13 @@ def _save_shipping_labels() -> int:
             f"Expected {len(plan.print_orders)} warehouse print(s), counted {printed}."
         )
 
+    from automation.worldship_after_print import run_after_print_workflow
+
+    run_after_print_workflow(app, main, print_label_count=printed)
+
     _log(
         f"Label processing complete: {saved} saved to share, "
-        f"{printed} warehouse print, {saved + printed} total."
+        f"{printed} warehouse print, End of Day + Batch Export done."
     )
     return saved
 
@@ -1554,7 +1538,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     proc_timeout = processing_timeout_s(order_count=_proc_count or 4)
     _advance_after_preview_next(processing_timeout_s=proc_timeout)
 
-    labels_saved = _save_shipping_labels()
+    labels_saved = _save_shipping_labels(app, main)
     record_count = labels_saved
     import_source = None
     _log(f"Completed {labels_saved} label save(s).")

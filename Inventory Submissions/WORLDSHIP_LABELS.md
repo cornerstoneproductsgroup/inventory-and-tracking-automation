@@ -31,7 +31,10 @@ Example (6 shipments):
 6. Read back field — if empty/wrong, try again (up to 3 times)  
 7. Click **Save** only when filename is committed  
 8. One retry of the full sequence if the dialog stays open
-2. **Phase 2** — Warehouse-print rows: wait for print; dismiss any unexpected Save dialog.
+2. **Phase 2** — Warehouse-print rows: WorldShip prints (may take many minutes); wait for **100%** and **Close**.
+3. **Phase 3** — Click **Close** on Automatic Processing Progress when enabled.
+4. **Phase 4** — **End of Day** → **Yes** → wait for processing.
+5. **Phase 5** — **Import-Export** → **Batch Export** → today’s date → **Next** → preview **Next** → **Save** on summary.
 
 ## Automatic Processing Progress — do not click Stop
 
