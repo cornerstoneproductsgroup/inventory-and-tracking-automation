@@ -2,7 +2,10 @@
   "browser": {
     "headless": false,
     "slow_mo_ms": 80,
-    "default_timeout_ms": 120000
+    "default_timeout_ms": 120000,
+    "channel": "msedge",
+    "use_persistent_profile": true,
+    "user_data_dir": "fedex_browser_profile"
   },
   "fedex": {
     "login_url": "https://www.fedex.com/secure-login/en-us/",

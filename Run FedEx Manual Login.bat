@@ -8,7 +8,8 @@ if exist "%INV_PY%" set "RUNNER=%INV_PY%"
 
 echo.
 echo FedEx Manual Login Test
-echo - Opens FedEx SIGN-IN page in Chromium (not the batch page / Retry screen)
+echo - Opens FedEx SIGN-IN in Microsoft Edge (not Playwright Chromium)
+echo - Uses fedex_browser_profile so cookies work like your normal browser
 echo - YOU type username and password (script does not auto-fill)
 echo - Verifies batch Upload page loads, then saves fedex_storage_state.json
 echo - No CSV upload or label processing

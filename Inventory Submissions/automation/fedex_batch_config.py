@@ -54,9 +54,13 @@ DEFAULT_BATCH_URL = (
     os.environ.get("FEDEX_BATCH_URL") or "https://www.fedex.com/shippingplus/en-us/shipments-import"
 ).strip()
 
-STORAGE_STATE = Path(
+_INVENTORY_ROOT = Path(__file__).resolve().parent.parent
+
+STORAGE_STATE = _INVENTORY_ROOT / (
     (os.environ.get("FEDEX_STORAGE_STATE") or "fedex_storage_state.json").strip()
 )
+
+DEFAULT_BROWSER_PROFILE_DIR = _INVENTORY_ROOT / "fedex_browser_profile"
 
 
 def lowes_output_basename(order_date: date | None = None) -> str:

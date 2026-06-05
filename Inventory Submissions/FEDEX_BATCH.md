@@ -58,6 +58,18 @@ If the **newest** CSV in the folder is **not** today's date:
 
 5. First full run uses a visible browser (`headless: false` in config) so login can save **`fedex_storage_state.json`** for later runs.
 
+### Retry page in Playwright but normal browser works
+
+FedEx often **blocks Playwright’s bundled Chromium** (automation fingerprint) and shows Retry / failed-to-load even when you type credentials yourself. Your normal Edge/Chrome works because it is not flagged as automation.
+
+The script now defaults to:
+
+- **Installed Microsoft Edge** on Windows (`browser.channel`: `msedge`)
+- **Persistent profile** (`Inventory Submissions\fedex_browser_profile`) — cookies behave like your regular browser
+- Anti-automation launch flags (`AutomationControlled`, no `--enable-automation`)
+
+Override in `.env` if needed: `FEDEX_BROWSER_CHANNEL=chrome` or `FEDEX_BROWSER_CHANNEL=chromium` (old behavior).
+
 ### Recommended when auto-login fails
 
 FedEx often clears or ignores scripted username/password (empty fields, Retry page). Use **manual login** so you type credentials yourself — rules out bad auto-fill.
@@ -123,6 +135,9 @@ Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
 - `FEDEX_INITIAL_WAIT_MS` — one short wait after first page open (default 1200)
 - `FEDEX_AFTER_COOKIE_MS` — pause after Accept cookies (default 600)
 - `FEDEX_MICRO_PAUSE_MS` — small pauses between quick login steps (default 350)
+- `FEDEX_BROWSER_CHANNEL` — `msedge` (default on Windows), `chrome`, or `chromium` for bundled Playwright browser
+- `FEDEX_USE_PERSISTENT_PROFILE` — `1` (default) keeps cookies in `fedex_browser_profile`; set `0` to use `fedex_storage_state.json` only
+- `FEDEX_USER_DATA_DIR` — profile folder override
 - `selectors.load_retry_button` — detects FedEx “failed to load” / Retry pages (script reloads batch URL instead of clicking Retry)
 
 ### Warehouse-print vendors (same as Order Splitter)

@@ -14,15 +14,18 @@ from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import (
+    Browser,
     BrowserContext,
     Frame,
     Page,
+    Playwright,
     TimeoutError as PlaywrightTimeout,
     sync_playwright,
 )
 
 from automation.fedex_batch_config import (
     DEFAULT_BATCH_URL,
+    DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_LOGIN_URL,
     STORAGE_STATE,
     label_save_timeout_s,
@@ -72,6 +75,173 @@ class ShipmentRowState:
 def _load_config(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+_FEDEX_STEALTH_INIT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+"""
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "off", "disable", "disabled"):
+        return False
+    return raw in ("1", "true", "yes", "on")
+
+
+def _resolve_fedex_channel(browser_cfg: dict[str, Any]) -> str | None:
+    """Prefer installed Edge/Chrome over Playwright Chromium (FedEx blocks automation)."""
+    explicit = (
+        (os.environ.get("FEDEX_BROWSER_CHANNEL") or "").strip()
+        or str(browser_cfg.get("channel") or "").strip()
+    )
+    lowered = explicit.lower()
+    if lowered in ("chromium", "bundled", "playwright"):
+        return None
+    if lowered == "auto" or not explicit:
+        return "msedge" if os.name == "nt" else "chrome"
+    return explicit
+
+
+def _resolve_fedex_user_data_dir(browser_cfg: dict[str, Any]) -> Path | None:
+    """Persistent profile dir — behaves like a normal browser (cookies survive)."""
+    disable = (
+        (os.environ.get("FEDEX_USE_PERSISTENT_PROFILE") or "").strip().lower()
+        in ("0", "false", "no", "off", "disable", "disabled")
+        or browser_cfg.get("use_persistent_profile") is False
+    )
+    if disable:
+        return None
+
+    raw = (
+        (os.environ.get("FEDEX_USER_DATA_DIR") or "").strip()
+        or str(browser_cfg.get("user_data_dir") or "").strip()
+    )
+    if raw.lower() in ("0", "false", "no", "off", "disable", "disabled"):
+        return None
+    path = Path(raw) if raw else DEFAULT_BROWSER_PROFILE_DIR
+    if not path.is_absolute():
+        path = DEFAULT_BROWSER_PROFILE_DIR.parent / path
+    return path
+
+
+def _fedex_launch_args(browser_cfg: dict[str, Any]) -> list[str]:
+    extra = browser_cfg.get("args") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    base = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=BlockThirdPartyCookies,TrackingProtection3pcd",
+    ]
+    out: list[str] = []
+    for arg in [*base, *extra]:
+        text = str(arg).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _apply_fedex_stealth(context: BrowserContext) -> None:
+    try:
+        context.add_init_script(_FEDEX_STEALTH_INIT)
+    except Exception:
+        pass
+
+
+def _open_fedex_browser(
+    p: Playwright,
+    cfg: dict[str, Any],
+    *,
+    headless: bool,
+    slow_mo: int,
+) -> tuple[Browser | None, BrowserContext, Page, bool]:
+    """
+    Launch FedEx automation browser.
+
+    Uses installed Edge/Chrome + persistent profile by default because FedEx
+    often serves Retry/failed-to-load to Playwright's bundled Chromium.
+    """
+    browser_cfg = cfg.get("browser", {})
+    user_data_dir = _resolve_fedex_user_data_dir(browser_cfg)
+    args = _fedex_launch_args(browser_cfg)
+    ignore_automation = browser_cfg.get("ignore_automation_args", True)
+    ignore_default_args = ["--enable-automation"] if ignore_automation else None
+    channels: list[str | None] = []
+    primary = _resolve_fedex_channel(browser_cfg)
+    if primary:
+        channels.append(primary)
+    for alt in ("msedge", "chrome"):
+        if alt not in channels:
+            channels.append(alt)
+    channels.append(None)
+
+    seen: set[str | None] = set()
+    last_err: Exception | None = None
+
+    for channel in channels:
+        if channel in seen:
+            continue
+        seen.add(channel)
+        label = channel or "playwright chromium"
+        try:
+            common: dict[str, Any] = {
+                "headless": headless,
+                "slow_mo": slow_mo,
+                "args": args,
+                "accept_downloads": True,
+            }
+            if ignore_default_args:
+                common["ignore_default_args"] = ignore_default_args
+            if channel:
+                common["channel"] = channel
+
+            if user_data_dir is not None:
+                user_data_dir.mkdir(parents=True, exist_ok=True)
+                context = p.chromium.launch_persistent_context(
+                    str(user_data_dir),
+                    **common,
+                )
+                _apply_fedex_stealth(context)
+                page = context.pages[0] if context.pages else context.new_page()
+                _log(
+                    f"FedEx browser: {label} with persistent profile "
+                    f"({user_data_dir})"
+                )
+                return None, context, page, True
+
+            browser = p.chromium.launch(**common)
+            storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
+            context = browser.new_context(
+                accept_downloads=True,
+                storage_state=str(storage) if storage else None,
+                locale="en-US",
+                viewport={"width": 1440, "height": 900},
+            )
+            _apply_fedex_stealth(context)
+            page = context.new_page()
+            _log(f"FedEx browser: {label} (ephemeral context)")
+            return browser, context, page, False
+        except Exception as exc:
+            last_err = exc
+            _log(f"WARN: could not launch FedEx browser ({label}): {exc}")
+
+    raise FedexBatchError(
+        "Could not launch a FedEx browser. Install Microsoft Edge or Google Chrome, "
+        "or set FEDEX_BROWSER_CHANNEL=msedge (or chrome) in .env. "
+        f"Last error: {last_err}"
+    )
+
+
+def _save_fedex_session(context: BrowserContext, *, uses_persistent_profile: bool) -> None:
+    if uses_persistent_profile:
+        _log(
+            f"Session cookies kept in browser profile ({DEFAULT_BROWSER_PROFILE_DIR})."
+        )
+        return
+    context.storage_state(path=str(STORAGE_STATE))
+    _log(f"Session saved to {STORAGE_STATE}")
 
 
 def _sel(cfg: dict[str, Any], key: str, default: str = "") -> str:
@@ -1606,13 +1776,9 @@ def run_fedex_login_test(*, config_path: Path) -> int:
     default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=slow_mo)
-        storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
-        context = browser.new_context(
-            accept_downloads=True,
-            storage_state=str(storage) if storage else None,
+        browser, context, page, persistent = _open_fedex_browser(
+            p, cfg, headless=False, slow_mo=slow_mo
         )
-        page = context.new_page()
         page.set_default_timeout(default_timeout)
         try:
             _login_if_needed(page, cfg, creds=None, manual_login=True)
@@ -1627,8 +1793,8 @@ def run_fedex_login_test(*, config_path: Path) -> int:
             if _retry_button_visible(page, cfg):
                 raise FedexBatchError(
                     "Still on FedEx Retry / failed-to-load after manual login. "
-                    "That usually means network/VPN/account — not scripted auto-fill. "
-                    "Try the same sign-in in a normal Chrome window."
+                    "FedEx may be blocking this browser profile — try signing in once in "
+                    "your normal Edge/Chrome, or set FEDEX_BROWSER_CHANNEL=chrome in .env."
                 )
             if not _is_batch_page(page):
                 raise FedexBatchError(
@@ -1637,11 +1803,11 @@ def run_fedex_login_test(*, config_path: Path) -> int:
                 )
 
             _log("SUCCESS: Batch uploads page is ready after manual login.")
-            context.storage_state(path=str(STORAGE_STATE))
-            _log(f"Session saved to {STORAGE_STATE}")
+            _save_fedex_session(context, uses_persistent_profile=persistent)
         finally:
             context.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
 
     return 0
 
@@ -1717,13 +1883,9 @@ def run_fedex_batch(
     default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, slow_mo=slow_mo)
-        storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
-        context = browser.new_context(
-            accept_downloads=True,
-            storage_state=str(storage) if storage else None,
+        browser, context, page, persistent = _open_fedex_browser(
+            p, cfg, headless=headless, slow_mo=slow_mo
         )
-        page = context.new_page()
         page.set_default_timeout(default_timeout)
         try:
             _login_if_needed(
@@ -1749,11 +1911,10 @@ def run_fedex_batch(
 
             _export_shipment_report_for_tracking(page, cfg)
 
-            if storage or not STORAGE_STATE.parent.exists():
-                context.storage_state(path=str(STORAGE_STATE))
-                _log(f"Session saved to {STORAGE_STATE}")
+            _save_fedex_session(context, uses_persistent_profile=persistent)
         finally:
             context.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
 
     return 0
