@@ -152,12 +152,12 @@ def _ok_dialog_timeout_s() -> float:
 def _ready_timeout_s(*, cold_start: bool) -> float:
     """Max wait for Import-Export tab to become clickable."""
     key = "WORLDSHIP_READY_TIMEOUT_S" if cold_start else "WORLDSHIP_WARM_READY_TIMEOUT_S"
-    default = "300" if cold_start else "5"
+    default = "300" if cold_start else "12"
     raw = (os.environ.get(key) or default).strip()
     try:
-        return max(3.0 if cold_start else 1.0, float(raw))
+        return max(3.0 if cold_start else 2.0, float(raw))
     except ValueError:
-        return 300.0 if cold_start else 5.0
+        return 300.0 if cold_start else 12.0
 
 
 def _step_wait_s(env_key: str, default: float) -> float:
@@ -348,15 +348,42 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
 
 
 def _focus_main_window(win) -> None:
+    import win32con
+    import win32gui
+
+    hwnd: int | None = None
+    try:
+        hwnd = int(win.handle)
+    except Exception:
+        pass
     try:
         if win.is_minimized():
             win.restore()
     except Exception:
         pass
+    if hwnd:
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
     try:
         win.set_focus()
     except Exception:
         pass
+
+
+def _bring_worldship_to_front(app) -> bool:
+    """Restore and foreground WorldShip as soon as we attach (warm start)."""
+    try:
+        win = app.window(title_re=WORLDSHIP_TITLE_RE)
+        if not win.exists(timeout=0.5):
+            return False
+        _focus_main_window(win)
+        _log("Brought WorldShip to the foreground.")
+        return True
+    except Exception:
+        return False
 
 
 def _wait_until_import_export_ready(app, *, timeout_s: float, poll_interval_s: float = 2.0):
@@ -380,6 +407,7 @@ def _wait_until_import_export_ready(app, *, timeout_s: float, poll_interval_s: f
 def _resolve_main_window(app, *, cold_start: bool):
     """Return the main WorldShip window; skip long waits when already loaded."""
     _dismiss_blocking_dialogs_once()
+    _bring_worldship_to_front(app)
     if _import_export_tab_ready(app, fast=True):
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         _focus_main_window(win)
@@ -393,7 +421,7 @@ def _resolve_main_window(app, *, cold_start: bool):
     return _wait_until_import_export_ready(
         app,
         timeout_s=_ready_timeout_s(cold_start=cold_start),
-        poll_interval_s=2.0 if cold_start else 0.5,
+        poll_interval_s=2.0 if cold_start else 0.15,
     )
 
 
@@ -467,11 +495,12 @@ def _connect_or_start(app_factory, *, startup_timeout_s: float) -> tuple[object,
     try:
         _log("Connecting to running WorldShip window…")
         app = _connect()
+        _bring_worldship_to_front(app)
         if _import_export_tab_ready(app, fast=True):
             _log("Connected — WorldShip is already loaded.")
             return app, False
-        _log("WorldShip is open but still loading (Import-Export not ready yet).")
-        cold = True
+        _log("Connected — WorldShip is open (brief wait for Import-Export ribbon)…")
+        return app, False
     except Exception:
         app = None
         cold = True
@@ -783,7 +812,7 @@ def _click_preview_next(preview: ModalDialog) -> None:
     import win32gui
 
     hwnd = preview.hwnd
-    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 1.0)
+    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 0.25)
     if settle_s > 0:
         _log(f"Waiting {settle_s:.1f}s for preview dialog to finish loading…")
         time.sleep(settle_s)
@@ -1485,8 +1514,11 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     main = _resolve_main_window(app, cold_start=cold_start)
 
     _log("Clicking Import-Export tab…")
-    tab_clicked_at = time.monotonic()
     _ensure_import_export_tab(main)
+
+    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
+    if after_tab_s > 0:
+        time.sleep(after_tab_s)
 
     _log("Clicking Batch Import…")
     _click_when_ready(
@@ -1499,17 +1531,10 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _log("Waiting for Batch Import wizard…")
     wizard = _wait_for_batch_import_wizard(app, main, timeout_s=8)
 
-    before_checkbox_s = _step_wait_s("WORLDSHIP_BEFORE_CHECKBOX_WAIT_S", 2.0)
-    elapsed_since_tab = time.monotonic() - tab_clicked_at
-    remaining = before_checkbox_s - elapsed_since_tab
-    if remaining > 0:
-        _log(f"Waiting {remaining:.1f}s before auto-process checkbox…")
-        time.sleep(remaining)
-
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
     _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=5)
 
-    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 0.3)
+    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 1.5)
     if before_next_s > 0:
         _log(f"Waiting {before_next_s:.1f}s before Next…")
         time.sleep(before_next_s)
