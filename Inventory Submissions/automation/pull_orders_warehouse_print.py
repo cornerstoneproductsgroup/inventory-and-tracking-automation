@@ -98,13 +98,29 @@ def wait_for_warehouse_pdfs(
     )
 
 
-def _resolve_printer(env_key: str, fallback_env: str, default_substring: str) -> str:
-    direct = (os.environ.get(env_key) or "").strip()
-    if direct:
-        return direct
-    fallback = (os.environ.get(fallback_env) or "").strip()
-    if fallback:
-        return fallback
+_VIRTUAL_PRINTER_HINTS = (
+    "onenote",
+    "microsoft print to pdf",
+    "print to pdf",
+    "microsoft xps",
+    "xps document writer",
+    "fax",
+    "send to",
+    "redirected",
+    "adobe pdf",
+    "foxit",
+    "cutepdf",
+    "bullzip",
+    "pdfcreator",
+)
+
+
+def _is_virtual_printer(name: str) -> bool:
+    low = (name or "").strip().lower()
+    return any(hint in low for hint in _VIRTUAL_PRINTER_HINTS)
+
+
+def list_installed_printers(*, include_virtual: bool = True) -> list[str]:
     try:
         import win32print
 
@@ -122,15 +138,70 @@ def _resolve_printer(env_key: str, fallback_env: str, default_substring: str) ->
                 continue
             if name:
                 names.append(name)
-        needle = default_substring.lower()
-        for name in names:
+        if include_virtual:
+            return names
+        return [name for name in names if not _is_virtual_printer(name)]
+    except Exception:
+        return []
+
+
+def _printer_exists(printer_name: str) -> bool:
+    try:
+        import win32print
+
+        handle = win32print.OpenPrinter(printer_name)
+        win32print.ClosePrinter(handle)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_printer(env_key: str, fallback_env: str, default_substring: str) -> str:
+    direct = (os.environ.get(env_key) or "").strip()
+    if direct:
+        if _is_virtual_printer(direct):
+            raise RuntimeError(
+                f"{env_key}={direct!r} is a virtual printer. "
+                f"Set {env_key} to your physical Zebra name in .env."
+            )
+        if not _printer_exists(direct):
+            raise RuntimeError(
+                f"{env_key}={direct!r} is not installed on this PC. "
+                f"Check Windows Printers or fix .env."
+            )
+        return direct
+
+    fallback = (os.environ.get(fallback_env) or "").strip()
+    if fallback:
+        if _is_virtual_printer(fallback):
+            raise RuntimeError(
+                f"{fallback_env}={fallback!r} is a virtual printer. "
+                f"Set {env_key} to your physical Zebra name in .env."
+            )
+        if not _printer_exists(fallback):
+            raise RuntimeError(
+                f"{fallback_env}={fallback!r} is not installed on this PC."
+            )
+        return fallback
+
+    physical = list_installed_printers(include_virtual=False)
+    needles = [default_substring.lower()]
+    if "zebra" not in needles[0]:
+        needles.append("zebra")
+    for needle in needles:
+        for name in physical:
             if needle in name.lower():
                 return name
-        if names:
-            return names[0]
-    except Exception:
-        pass
-    return default_substring
+
+    installed = list_installed_printers(include_virtual=True)
+    physical_hint = ", ".join(physical[:10]) or "(no physical printers found)"
+    installed_hint = ", ".join(installed[:12]) or "(none)"
+    raise RuntimeError(
+        f"No physical printer matching {default_substring!r} found. "
+        f"Set {env_key} in Inventory Submissions\\.env to the exact Windows printer name "
+        f"(e.g. Zebra ZP 450). Physical printers: {physical_hint}. "
+        f"All printers: {installed_hint}"
+    )
 
 
 def print_pdf_windows(pdf_path: Path, printer_name: str) -> None:
@@ -140,10 +211,19 @@ def print_pdf_windows(pdf_path: Path, printer_name: str) -> None:
 
     if not pdf_path.is_file():
         raise FileNotFoundError(pdf_path)
+    if _is_virtual_printer(printer_name):
+        raise RuntimeError(f"Refusing to print to virtual printer {printer_name!r}")
+    if not _printer_exists(printer_name):
+        raise RuntimeError(f"Printer not found: {printer_name!r}")
     old = win32print.GetDefaultPrinter()
     try:
         win32print.SetDefaultPrinter(printer_name)
-        win32api.ShellExecute(0, "print", str(pdf_path), None, ".", 0)
+        result = win32api.ShellExecute(0, "print", str(pdf_path), None, ".", 0)
+        if int(result) <= 32:
+            raise RuntimeError(
+                f"Windows could not queue print job for {pdf_path.name} "
+                f"on {printer_name!r} (ShellExecute={result})"
+            )
     finally:
         try:
             win32print.SetDefaultPrinter(old)

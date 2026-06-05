@@ -130,7 +130,7 @@ Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
 - `FEDEX_LOWES_TRACKING_DIR` — folder for `Lowe's Fedex Master.xlsx` (tracking input)
 - `FEDEX_SHIPMENT_REPORT_TIMEOUT_MS` — shipment report download timeout (default 180000)
 - `ORDER_SPLITTER_V2_DIR` / `ORDER_SPLITTER_WATCHER_PY` — where to read `WAREHOUSE_VENDORS` (see above)
-- `FEDEX_WAREHOUSE_LABEL_PRINTER` — Zebra name override (falls back to `PULL_ORDERS_SOS_LABEL_PRINTER`, then auto-detect **Zebra ZP 450**)
+- `FEDEX_WAREHOUSE_LABEL_PRINTER` — **exact** Windows printer name for warehouse labels (e.g. `Zebra ZP 450`). Auto-detect skips virtual printers (OneNote, Print to PDF). Set this in `.env` on the FedEx PC if labels say “Printed” but nothing comes out.
 - `FEDEX_AFTER_ROW_SELECT_MS` — pause after row checkboxes before **Finalize** (default 2000; or `timing.after_row_select_ms` in `fedex_batch.json`)
 - `FEDEX_INITIAL_WAIT_MS` — one short wait after first page open (default 1200)
 - `FEDEX_AFTER_COOKIE_MS` — pause after Accept cookies (default 600)

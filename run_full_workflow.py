@@ -3,14 +3,16 @@ Orchestrates the full daily workflow.
 
 Two independent lanes run in parallel (default); neither waits on the other:
 
-  **CommerceHub (Rithum)** — one browser for the whole lane: optional Depot/Lowe's invoice reports,
-  inventory, Depot tracking/invoicing, Lowe's workflows, Depot Special Orders (ack + track + invoice).
+  **Phase 0** — CommerceHub invoice reports (Depot, Lowe's, Tractor) run as a separate subprocess
+  (``commercehub_invoice_export.py``), same as menu **R**. This is more reliable than attaching
+  to the chain browser via CDP.
 
-  **SPS Commerce** — one browser for the whole lane: optional Tractor invoice report, Tractor
-  inventory, Tractor + Grainger tracking/invoicing.
+  **CommerceHub (Rithum)** — one browser: inventory, Depot tracking/invoicing, Lowe's workflows,
+  Depot Special Orders (ack + track + invoice).
 
-Use ``--sequential-lanes`` to run CommerceHub fully, then SPS. Invoice-only runs still use
-``--invoice-report-only`` (legacy separate export subprocesses).
+  **SPS Commerce** — one browser: Tractor inventory, Tractor + Grainger tracking/invoicing.
+
+Use ``--sequential-lanes`` to run CommerceHub fully, then SPS.
 
 Optional skips: --skip-commercehub, --skip-sps-inventory, --skip-sps-tracking,
 --skip-depot, --skip-lowes, --skip-invoice-report.
@@ -317,14 +319,6 @@ def _build_chain_cmd(
     return cmd
 
 
-def _lane_wants_ch_invoice(modes: list[str]) -> bool:
-    return any(m in modes for m in ("all", "retail", "depot", "lowes"))
-
-
-def _lane_wants_sps_invoice(modes: list[str]) -> bool:
-    return any(m in modes for m in ("all", "tractor"))
-
-
 def _build_sps_lane_cmd(
     python_exe: str,
     *,
@@ -415,6 +409,73 @@ def _run_step_sequence(step_list: list[tuple[str, list[str], Path]]) -> list[str
     for title, cmd, cwd in step_list:
         out.extend(_run_single(title, cmd, cwd))
     return out
+
+
+_INVOICE_MODE_LABELS = {
+    "all": "All (parallel: CH Depot+Lowe's + SPS Tractor)",
+    "retail": "Depot + Lowe's (CommerceHub, one browser)",
+    "depot": "Depot",
+    "lowes": "Lowe's",
+    "tractor": "Tractor Supply",
+}
+
+
+def _run_invoice_report_phase(
+    invoice_modes: list[str],
+    invoice_report_dir: Path,
+    invoice_search_tried: list[Path],
+    invoice_report_date: date | None,
+) -> list[str]:
+    """Run commercehub_invoice_export.py subprocess(es) — same path as menu R."""
+    errors: list[str] = []
+    export_script = invoice_report_dir / _INVOICE_EXPORT_SCRIPT
+    if not export_script.is_file():
+        checked = (
+            "\n".join(f"  - {p}" for p in invoice_search_tried) if invoice_search_tried else "  (none)"
+        )
+        msg = (
+            f"Invoice report script not found:\n  {export_script}\n"
+            f"Checked locations:\n{checked}\n"
+            'Fix: copy the invoice report project into this repo as "invoice report", or use the full folder name:\n'
+            f"  {ROOT / _INVOICE_REPORT_FOLDER_IN_REPO}  (recommended)\n"
+            f"  {ROOT / _INVOICE_REPORT_FOLDER}\n"
+            f"  or next to the repo: {ROOT.parent / _INVOICE_REPORT_FOLDER}\n"
+            "  or set environment variable COMMERCEHUB_INVOICE_REPORT_DIR to that folder, "
+            "or pass --invoice-report-dir on the command line."
+        )
+        print(f"\nWARN: {msg}")
+        return [msg]
+
+    print(
+        "\n"
+        + "=" * 60
+        + "\nPhase 0 — Invoice reports (Depot, Lowe's, Tractor)\n"
+        + "=" * 60
+        + f"\n  Modes: {', '.join(invoice_modes)}\n"
+        + (
+            f"  Report date: {invoice_report_date.isoformat()} (custom)\n"
+            if invoice_report_date is not None
+            else "  Report date: previous business day (default)\n"
+        )
+        + "  (Separate browser session — same as menu R.)\n"
+    )
+    inv_py_parts, invoice_py_err = resolve_invoice_report_python(invoice_report_dir)
+    if invoice_py_err:
+        print(f"\n{invoice_py_err}")
+        return [invoice_py_err]
+    if not inv_py_parts:
+        msg = "ERROR: Could not resolve an interpreter for invoice reports."
+        print(f"\n{msg}")
+        return [msg]
+
+    for mode in invoice_modes:
+        label = _INVOICE_MODE_LABELS.get(mode, mode)
+        cmd = inv_py_parts + [str(export_script), mode]
+        if invoice_report_date is not None:
+            cmd.extend(["--date", invoice_report_date.isoformat()])
+        title = f"Invoice report — {label}"
+        errors.extend(_run_single(title, cmd, invoice_report_dir))
+    return errors
 
 
 def _run_parallel_pair(
@@ -903,9 +964,6 @@ def main() -> int:
     )
     wants_sps_work = not skip_sps_inventory or run_sps_tracking or run_grainger_all
 
-    ch_with_invoice = bool(invoice_modes and _lane_wants_ch_invoice(invoice_modes))
-    sps_with_invoice = bool(invoice_modes and _lane_wants_sps_invoice(invoice_modes))
-
     if wants_ch_work:
         ch_cmd = _build_chain_cmd(
             python_exe,
@@ -913,7 +971,7 @@ def main() -> int:
             skip_depot=skip_depot,
             skip_lowes=skip_lowes,
             lowes_submit=lowes_submit,
-            with_invoice_reports=ch_with_invoice,
+            with_invoice_reports=False,
             invoice_report_date=invoice_report_date,
             skip_special_orders=skip_special_orders,
         )
@@ -951,7 +1009,7 @@ def main() -> int:
                 skip_tracking=not run_sps_tracking,
                 skip_grainger=not run_grainger_all,
                 skip_tractor=grainger_only,
-                with_invoice_reports=sps_with_invoice,
+                with_invoice_reports=False,
                 invoice_report_date=invoice_report_date,
                 submit=True,
                 interactive_login=sps_interactive,
@@ -996,73 +1054,24 @@ def main() -> int:
 
     errors: list[str] = []
 
-    if invoice_modes and invoice_report_only:
-        export_script = invoice_report_dir / "commercehub_invoice_export.py"
-        if not export_script.is_file():
-            checked = "\n".join(f"  - {p}" for p in invoice_search_tried) if invoice_search_tried else "  (none)"
-            msg = (
-                f"Invoice report script not found:\n  {export_script}\n"
-                f"Checked locations:\n{checked}\n"
-                "Fix: copy the invoice report project into this repo as \"invoice report\", or use the full folder name:\n"
-                f"  {ROOT / _INVOICE_REPORT_FOLDER_IN_REPO}  (recommended)\n"
-                f"  {ROOT / _INVOICE_REPORT_FOLDER}\n"
-                f"  or next to the repo: {ROOT.parent / _INVOICE_REPORT_FOLDER}\n"
-                "  or set environment variable COMMERCEHUB_INVOICE_REPORT_DIR to that folder, "
-                "or pass --invoice-report-dir on the command line."
+    if invoice_modes:
+        errors.extend(
+            _run_invoice_report_phase(
+                invoice_modes,
+                invoice_report_dir,
+                invoice_search_tried,
+                invoice_report_date,
             )
-            print(f"\nWARN: {msg}")
-            errors.append(msg)
-        else:
-            mode_labels = {
-                "all": "All (parallel: CH Depot+Lowe's + SPS Tractor)",
-                "retail": "Depot + Lowe's (CommerceHub, one browser)",
-                "depot": "Depot",
-                "lowes": "Lowe's",
-                "tractor": "Tractor Supply",
-            }
+        )
+        if errors and invoice_report_only:
             print(
                 "\n"
                 + "=" * 60
-                + "\nPhase 0 — CommerceHub invoice reports\n"
+                + "\nWARN: Invoice report step(s) had issues.\n"
                 + "=" * 60
-                + f"\n  Modes: {', '.join(invoice_modes)}\n"
-                + (
-                    f"  Report date: {invoice_report_date.isoformat()} (custom)\n"
-                    if invoice_report_date is not None
-                    else "  Report date: previous business day (default)\n"
-                )
             )
-            inv_py_parts, invoice_py_err = resolve_invoice_report_python(invoice_report_dir)
-            if invoice_py_err:
-                print(f"\n{invoice_py_err}")
-                errors.append(invoice_py_err)
-            elif not inv_py_parts:
-                msg = "ERROR: Could not resolve an interpreter for invoice reports."
-                print(f"\n{msg}")
-                errors.append(msg)
-            else:
-                for mode in invoice_modes:
-                    label = mode_labels.get(mode, mode)
-                    cmd = inv_py_parts + [str(export_script), mode]
-                    if invoice_report_date is not None:
-                        cmd.extend(["--date", invoice_report_date.isoformat()])
-                    title = f"CommerceHub invoice report — {label}"
-                    errors.extend(_run_single(title, cmd, invoice_report_dir))
-
-    if invoice_modes and errors and invoice_report_only:
-        print(
-            "\n"
-            + "=" * 60
-            + "\nWARN: Invoice report step(s) had issues.\n"
-            + "=" * 60
-        )
 
     if not invoice_report_only and (ch_lane_steps or sps_lane_steps):
-        if ch_with_invoice or sps_with_invoice:
-            print(
-                "\nNOTE: Invoice reports run inside each lane's browser session "
-                "(no separate Phase 0 subprocess).\n"
-            )
         errors.extend(
             _run_parallel_lane_sequences(
                 ch_lane_steps,

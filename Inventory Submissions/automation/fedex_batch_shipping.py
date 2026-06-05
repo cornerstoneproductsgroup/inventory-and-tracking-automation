@@ -1529,8 +1529,11 @@ def _print_label_pdf(page: Page, context: BrowserContext, cfg: dict[str, Any], *
             return False
         print_pdf_windows(dest, printer)
         time.sleep(2.0)
-        _log(f"Submitted Zebra print job for {vendor!r}")
+        _log(f"Submitted Zebra print job for {vendor!r} on {printer!r}")
         return True
+    except Exception as exc:
+        _log(f"ERROR: Zebra print failed for {vendor!r}: {exc}")
+        return False
     finally:
         _close_print_preview_pages(page, context)
         try:
@@ -1868,6 +1871,15 @@ def run_fedex_batch(
             f"Check {bundled_warehouse_vendors_path()} or Order Splitter at "
             f"{order_splitter_watcher_path()}"
         )
+
+    if warehouse_vendors:
+        try:
+            zebra = _zebra_label_printer()
+            _log(f"Warehouse Zebra printer resolved: {zebra!r}")
+        except Exception as exc:
+            raise FedexBatchError(
+                f"Cannot resolve Zebra printer for warehouse labels: {exc}"
+            ) from exc
 
     if manual_login:
         _log("Login mode: manual (browser sign-in, no auto-fill).")
