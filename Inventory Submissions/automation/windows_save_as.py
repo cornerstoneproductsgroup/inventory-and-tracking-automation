@@ -128,31 +128,66 @@ def _wait_for_filename_edit(hwnd: int, *, timeout_s: float = 2.5) -> int:
     return 0
 
 
-def _set_filename_direct(edit_hwnd: int, dest: Path) -> bool:
-    """Set filename via WM_SETTEXT — fastest and most reliable when edit has focus."""
-    want = dest.name
-    _set_edit_text(edit_hwnd, want)
-    time.sleep(_filename_settle_s())
-    if _filename_matches(edit_hwnd, dest):
-        return True
-    _set_edit_text(edit_hwnd, want)
-    time.sleep(_filename_settle_s())
-    return _filename_matches(edit_hwnd, dest)
+def _notify_filename_edit_changed(edit_hwnd: int) -> None:
+    """WM_SETTEXT alone does not commit in the common Save dialog — notify parent."""
+    import win32con
+    import win32gui
+
+    try:
+        parent = win32gui.GetParent(edit_hwnd)
+        ctrl_id = win32gui.GetDlgCtrlID(edit_hwnd)
+        if parent and ctrl_id:
+            win32gui.SendMessage(
+                parent,
+                win32con.WM_COMMAND,
+                (win32con.EN_CHANGE << 16) | (ctrl_id & 0xFFFF),
+                edit_hwnd,
+            )
+    except Exception:
+        pass
 
 
-def _set_filename_keyboard(hwnd: int, dest: Path) -> bool:
-    """Fallback when WM_SETTEXT alone did not stick."""
-    want = dest.name
+def _commit_filename_field(hwnd: int, dest: Path) -> bool:
+    """
+    Commit the file name so Save uses it.
+
+    WM_GETTEXT can show the PO while the dialog still treats the name as empty
+    until focus leaves the field (Tab) or the user types via keyboard.
+    """
+    import win32con
+
     _focus_dialog(hwnd)
     edit = _focus_filename_edit(hwnd) or _find_filename_edit_hwnd(hwnd)
+    if not edit:
+        return False
+
+    want = dest.name
     _set_clipboard(want)
     _send_alt_key("n")
-    time.sleep(0.2)
+    time.sleep(0.3)
     _send_ctrl_a()
     _send_ctrl_v()
-    time.sleep(_filename_settle_s())
+    time.sleep(0.2)
+    _notify_filename_edit_changed(edit)
+    # Tab out — Save dialog commits filename on focus loss.
+    _send_vk(win32con.VK_TAB)
+    time.sleep(0.3)
+    _send_alt_key("n")
+    time.sleep(0.15)
+
+    edit = _find_filename_edit_hwnd(hwnd)
     if edit and _filename_matches(edit, dest):
         return True
+
+    # Fallback: WM_SETTEXT + notify + Tab
+    _focus_filename_edit(hwnd)
+    _set_edit_text(edit, want)
+    _notify_filename_edit_changed(edit)
+    time.sleep(0.15)
+    _send_vk(win32con.VK_TAB)
+    time.sleep(0.25)
+    _send_alt_key("n")
+    time.sleep(0.15)
     edit = _find_filename_edit_hwnd(hwnd)
     return bool(edit and _filename_matches(edit, dest))
 
@@ -175,38 +210,28 @@ def _clear_filename_if_path(hwnd: int) -> None:
 
 
 def _enter_filename_with_retry(hwnd: int, dest: Path) -> bool:
-    """Enter PO filename after folder is set; re-try until field is non-empty and correct."""
+    """Enter PO filename after folder is set; commit with Tab so Save sees it."""
     want = dest.name
     attempts = _filename_entry_attempts()
 
     for attempt in range(1, attempts + 1):
         _focus_dialog(hwnd)
-        edit = _wait_for_filename_edit(hwnd, timeout_s=2.5)
-        if not edit:
+        if not _wait_for_filename_edit(hwnd, timeout_s=2.5):
             _log(f"Filename field not ready (attempt {attempt}/{attempts})…")
             time.sleep(0.4)
             continue
 
         _clear_filename_if_path(hwnd)
-        _focus_filename_edit(hwnd)
-        time.sleep(0.15)
+        _log(f"Entering file name (attempt {attempt}/{attempts})…")
 
-        if _set_filename_direct(edit, dest) and _filename_matches(edit, dest):
-            _log(f"File name entered: {_read_edit_text(edit)!r}")
+        if _commit_filename_field(hwnd, dest):
+            current = _read_filename_field(hwnd)
+            _log(f"File name committed: {current!r}")
             return True
-
-        if _set_filename_keyboard(hwnd, dest):
-            edit = _find_filename_edit_hwnd(hwnd)
-            if edit and _filename_matches(edit, dest):
-                _log(f"File name entered (keyboard): {_read_edit_text(edit)!r}")
-                return True
 
         current = _read_filename_field(hwnd)
         have = current if current else "(empty)"
-        _log(
-            f"File name check — want {want!r}, have {have!r}; "
-            f"retry {attempt}/{attempts}…"
-        )
+        _log(f"File name not committed — want {want!r}, have {have!r}")
         time.sleep(0.5)
 
     _log(f"ERROR: could not enter file name {want!r}.")
@@ -639,17 +664,19 @@ def _click_save_and_confirm(
     before: tuple[float, int] | None,
     min_bytes: int,
 ) -> bool:
-    current = _read_filename_field(hwnd)
-    if not current:
-        _log("ERROR: refusing Save — file name is empty.")
+    if not _commit_filename_field(hwnd, dest):
+        _log("ERROR: refusing Save — file name could not be committed.")
         return False
     if not _assert_ready_to_save(hwnd, dest):
         return False
 
+    pause = _pause_s("WORLDSHIP_SAVE_BEFORE_CLICK_S", 0.35)
+    time.sleep(pause)
+
     save_clicked_at = time.time()
     if not _click_save_button(hwnd):
         return False
-    time.sleep(0.4)
+    time.sleep(0.45)
     dismiss_overwrite_prompt()
     return _wait_for_save_result(
         hwnd,

@@ -27,9 +27,10 @@ Example (6 shipments):
 2. Change folder (Alt+D to vendor path)  
 3. Pause ~1 second (`WORLDSHIP_SAVE_AFTER_FOLDER_S`)  
 4. Enter PO in **File name**  
-5. Read back field — if empty/wrong, try again (up to 3 times)  
-6. Click **Save** only when filename is confirmed non-empty  
-7. One retry of the full sequence if the dialog stays open
+5. Paste PO, **Tab out** to commit (WM_SETTEXT alone is not enough for this dialog)  
+6. Read back field — if empty/wrong, try again (up to 3 times)  
+7. Click **Save** only when filename is committed  
+8. One retry of the full sequence if the dialog stays open
 2. **Phase 2** — Warehouse-print rows: wait for print; dismiss any unexpected Save dialog.
 
 ## Automatic Processing Progress — do not click Stop
