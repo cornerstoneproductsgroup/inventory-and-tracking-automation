@@ -60,10 +60,22 @@ If the **newest** CSV in the folder is **not** today's date:
 
 ### Recommended when auto-login fails
 
-FedEx often clears or ignores scripted username/password (empty fields, Retry page). Use **manual login once**, then reuse the saved session:
+FedEx often clears or ignores scripted username/password (empty fields, Retry page). Use **manual login** so you type credentials yourself — rules out bad auto-fill.
+
+**Login test only** (no upload; best first step):
 
 ```powershell
 cd "Inventory Submissions"
+python run_fedex_batch.py --login-test
+```
+
+Or double-click **`Run FedEx Manual Login.bat`** at the repo root.
+
+The script opens [FedEx secure login](https://www.fedex.com/secure-login/en-us/) (not the batch URL that often shows Retry). Type username/password and MFA in Chromium. Press **Enter** in the console when the batch **Upload** page is visible. On success it saves **`fedex_storage_state.json`**.
+
+**Full batch run with manual sign-in:**
+
+```powershell
 python run_fedex_batch.py --manual-login
 ```
 
@@ -88,11 +100,13 @@ cd "Inventory Submissions"
 python run_fedex_batch.py --plan-only
 python run_fedex_batch.py
 python run_fedex_batch.py --skip-upload
+python run_fedex_batch.py --login-test
 python run_fedex_batch.py --manual-login
 python run_fedex_batch.py --skip-auto-login
 ```
 
-Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.
+Menu **F** in `Run Full Workflow.bat` or `Run FedEx Batch.bat`.  
+**Manual login test:** `Run FedEx Manual Login.bat`.
 
 ## Env overrides
 

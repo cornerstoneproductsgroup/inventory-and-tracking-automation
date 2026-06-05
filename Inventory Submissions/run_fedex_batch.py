@@ -68,7 +68,12 @@ def main() -> int:
     parser.add_argument(
         "--manual-login",
         action="store_true",
-        help="You sign in in the browser; script continues when batch page is ready (saves session).",
+        help="Open FedEx sign-in; you type credentials; full batch run when Upload page is ready.",
+    )
+    parser.add_argument(
+        "--login-test",
+        action="store_true",
+        help="Manual sign-in only — verify batch page loads, save session, no CSV upload.",
     )
     parser.add_argument(
         "--skip-auto-login",
@@ -100,9 +105,16 @@ def main() -> int:
             print(f"ERROR: {exc}")
             return 1
 
-    from automation.fedex_batch_shipping import run_fedex_batch
+    from automation.fedex_batch_shipping import run_fedex_batch, run_fedex_login_test
     from automation.fedex_credentials import env_file_path, load_fedex_credentials
     from automation.fedex_lowes_csv import LowesCsvSkip
+
+    if args.login_test:
+        try:
+            return run_fedex_login_test(config_path=args.config.resolve())
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+            return 1
 
     if args.check_credentials:
         try:
