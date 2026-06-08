@@ -35,6 +35,8 @@ from automation.fedex_batch_config import (
     upload_poll_interval_s,
     upload_poll_timeout_s,
     vendor_label_pdf_path,
+    warehouse_after_print_ms,
+    warehouse_print_pause_ms,
 )
 from automation.fedex_credentials import FedexCredentials, env_file_path, load_fedex_credentials
 from automation.fedex_lowes_csv import LowesCsvSkip, resolve_upload_csv
@@ -45,7 +47,11 @@ from automation.fedex_reference import (
     reference_to_order,
 )
 from automation.fedex_upload_state import mark_file_used
-from automation.pull_orders_warehouse_print import _resolve_printer, print_pdf_windows
+from automation.pull_orders_warehouse_print import (
+    _printer_name_matches,
+    _resolve_printer,
+    print_pdf_windows,
+)
 from automation.warehouse_print_vendors import (
     bundled_warehouse_vendors_path,
     is_warehouse_print_vendor,
@@ -2190,6 +2196,325 @@ def _save_pdf_from_label_tab(
     return True
 
 
+def _restore_windows_default_printer(old_name: str | None) -> None:
+    if not old_name:
+        return
+    try:
+        import win32print
+
+        win32print.SetDefaultPrinter(old_name)
+    except Exception:
+        pass
+
+
+def _set_windows_default_printer(printer: str) -> str | None:
+    try:
+        import win32print
+
+        old = win32print.GetDefaultPrinter()
+        win32print.SetDefaultPrinter(printer)
+        return old
+    except Exception as exc:
+        _log(f"WARN: could not set Windows default printer to {printer!r}: {exc}")
+        return None
+
+
+def _wait_edge_print_preview(page: Page, *, timeout_ms: int) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            if page.locator("print-preview-app").count() > 0:
+                return True
+            if page.get_by_text("Printer", exact=True).count() > 0:
+                return True
+            if page.get_by_text(re.compile(r"Total\s+\d+\s+sheet", re.I)).count() > 0:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+    return False
+
+
+def _edge_click_pdf_toolbar_print(page: Page) -> bool:
+    for sel in (
+        "#print",
+        "cr-icon-button#print",
+        "button#print",
+        "[aria-label='Print']",
+        "[title='Print']",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=8000)
+                return True
+        except Exception:
+            continue
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const tryRoot = (root) => {
+                        if (!root) return false;
+                        for (const el of root.querySelectorAll(
+                            '#print, cr-icon-button#print, [aria-label="Print"], [title="Print"]'
+                        )) {
+                            el.click();
+                            return true;
+                        }
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot && tryRoot(el.shadowRoot)) return true;
+                        }
+                        return false;
+                    };
+                    return tryRoot(document);
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _edge_printer_already_selected(page: Page, printer: str) -> bool:
+    try:
+        body = page.locator("body").inner_text(timeout=3000) or ""
+    except Exception:
+        return False
+    for line in body.splitlines():
+        if _printer_name_matches(line.strip(), printer):
+            return True
+    return False
+
+
+def _edge_select_printer(page: Page, printer: str) -> bool:
+    if _edge_printer_already_selected(page, printer):
+        _log(f"Printer already set to {printer!r} in Edge print preview.")
+        return True
+
+    for root_sel in ("print-preview-app >> select", "select"):
+        try:
+            loc = page.locator(root_sel).first
+            if loc.count() == 0:
+                continue
+            for i in range(loc.locator("option").count()):
+                text = (loc.locator("option").nth(i).inner_text() or "").strip()
+                if _printer_name_matches(text, printer):
+                    loc.select_option(label=text)
+                    page.wait_for_timeout(500)
+                    return True
+        except Exception:
+            continue
+
+    for sel in (
+        "print-preview-app >> select",
+        "print-preview-app >> cr-select",
+        "print-preview-app >> [role='combobox']",
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=3000)
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            continue
+    else:
+        try:
+            page.get_by_text("Printer", exact=True).first.click(timeout=3000)
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    try:
+        zebra = page.get_by_text(re.compile(r"Zebra\s+ZP\s+450", re.I))
+        if zebra.count() > 0:
+            zebra.first.click(timeout=8000)
+            page.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
+
+    try:
+        return bool(
+            page.evaluate(
+                """(printer) => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const match = (text) => {
+                        const n = norm(text);
+                        return n.includes('zebra') && (n.includes('450') || n.includes('zp'));
+                    };
+                    const walk = (root) => {
+                        if (!root) return false;
+                        const sel = root.querySelector('select');
+                        if (sel) {
+                            for (const opt of sel.options) {
+                                if (match(opt.text)) {
+                                    sel.value = opt.value;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    return true;
+                                }
+                            }
+                        }
+                        for (const el of root.querySelectorAll('div, span')) {
+                            if (match(el.textContent || '')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                        }
+                        return false;
+                    };
+                    const app = document.querySelector('print-preview-app');
+                    if (app && app.shadowRoot && walk(app.shadowRoot)) return true;
+                    return walk(document);
+                }""",
+                printer,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _edge_click_print_submit(page: Page) -> bool:
+    for sel in (
+        "print-preview-app >> #action-button",
+        "print-preview-app >> cr-button#action-button",
+        "print-preview-app >> button:has-text('Print')",
+        "button:has-text('Print')",
+        "[role='button']:has-text('Print')",
+    ):
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=10_000)
+                return True
+        except Exception:
+            continue
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const clickPrint = (root) => {
+                        if (!root) return false;
+                        for (const el of root.querySelectorAll(
+                            '#action-button, button, cr-button, [role="button"]'
+                        )) {
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            if (t === 'print') {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot && clickPrint(el.shadowRoot)) return true;
+                        }
+                        return false;
+                    };
+                    const app = document.querySelector('print-preview-app');
+                    if (app && app.shadowRoot && clickPrint(app.shadowRoot)) return true;
+                    return clickPrint(document);
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _print_warehouse_label_from_tab(
+    label_tab: Page,
+    printer: str,
+    cfg: dict[str, Any],
+) -> bool:
+    """Warehouse vendors: Edge label tab → Print → Zebra → submit (not saved to share)."""
+    pause_ms = warehouse_print_pause_ms()
+    after_ms = warehouse_after_print_ms()
+    preview_timeout_ms = max(20_000, pause_ms * 3)
+
+    try:
+        label_tab.bring_to_front()
+    except Exception:
+        pass
+
+    if not _wait_for_label_pdf_ready(label_tab, timeout_ms=max(pdf_page_wait_ms(), 12_000)):
+        _log("WARN: label PDF may not be fully loaded before warehouse print.")
+
+    _log(f"Warehouse print: waiting {pause_ms}ms on label tab, then opening Edge print UI…")
+    label_tab.wait_for_timeout(pause_ms)
+
+    old_default = _set_windows_default_printer(printer)
+
+    opened = False
+    if _edge_click_pdf_toolbar_print(label_tab):
+        _log("Clicked PDF viewer Print button.")
+        opened = True
+    if not opened:
+        label_tab.keyboard.press("Control+p")
+        _log("Opened print preview via Ctrl+P.")
+        opened = True
+
+    label_tab.wait_for_timeout(1200)
+    if not _wait_edge_print_preview(label_tab, timeout_ms=preview_timeout_ms):
+        _log("ERROR: Edge print preview did not appear for warehouse label.")
+        _restore_windows_default_printer(old_default)
+        return False
+
+    if not _edge_select_printer(label_tab, printer):
+        _log(f"WARN: could not select {printer!r}; continuing with current printer.")
+    else:
+        _log(f"Printer set to {printer!r} in Edge print preview.")
+
+    label_tab.wait_for_timeout(800)
+    if not _edge_click_print_submit(label_tab):
+        _log("WARN: Print button not found; sending Enter to submit.")
+        label_tab.keyboard.press("Enter")
+
+    _log(f"Waiting {after_ms}ms for Zebra to receive label…")
+    label_tab.wait_for_timeout(after_ms)
+    try:
+        label_tab.keyboard.press("Escape")
+        label_tab.wait_for_timeout(400)
+    except Exception:
+        pass
+
+    _restore_windows_default_printer(old_default)
+    _log(f"Warehouse label sent to {printer!r} via Edge print UI.")
+    return True
+
+
+def _print_warehouse_label_with_fallback(
+    label_tab: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    *,
+    printer: str,
+    order_ref: str,
+) -> bool:
+    if _print_warehouse_label_from_tab(label_tab, printer, cfg):
+        return True
+
+    _log(f"Edge print UI failed for {order_ref!r}; trying saved-PDF fallback…")
+    fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="fedex_warehouse_label_")
+    os.close(fd)
+    dest = Path(tmp_name)
+    try:
+        if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
+            return False
+        print_pdf_windows(dest, printer)
+        label_tab.wait_for_timeout(warehouse_after_print_ms())
+        _log(f"Submitted Zebra print via Windows fallback for {order_ref!r}.")
+        return True
+    except Exception as exc:
+        _log(f"ERROR: warehouse print fallback failed for {order_ref!r}: {exc}")
+        return False
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _count_pdf_pages(path: Path) -> int:
     try:
         if not path.is_file() or path.stat().st_size < 200:
@@ -2276,36 +2601,49 @@ def _process_vendor_group_labels(
                 page, context, cfg, orders=[order]
             )
             try:
-                fd, tmp_name = tempfile.mkstemp(
-                    suffix=".pdf",
-                    prefix=f"fedex_label_{idx}_",
-                )
-                os.close(fd)
-                part = Path(tmp_name)
-                try:
-                    if not _save_pdf_from_label_tab(label_tab, context, part, cfg):
-                        _log(
-                            f"WARN: could not capture label PDF for {order.reference!r}"
-                        )
-                        continue
-                    pages = _count_pdf_pages(part)
-                    _log(f"  Captured label PDF ({pages} page(s)) for {order.reference!r}")
-                    if warehouse:
-                        print_pdf_windows(part, _zebra_label_printer())
-                        time.sleep(2.0)
+                if warehouse:
+                    printer = _zebra_label_printer()
+                    if _print_warehouse_label_with_fallback(
+                        label_tab,
+                        context,
+                        cfg,
+                        printer=printer,
+                        order_ref=order.reference,
+                    ):
                         printed_jobs += 1
                     else:
+                        _log(
+                            f"WARN: could not print warehouse label for {order.reference!r}"
+                        )
+                else:
+                    fd, tmp_name = tempfile.mkstemp(
+                        suffix=".pdf",
+                        prefix=f"fedex_label_{idx}_",
+                    )
+                    os.close(fd)
+                    part = Path(tmp_name)
+                    try:
+                        if not _save_pdf_from_label_tab(label_tab, context, part, cfg):
+                            _log(
+                                f"WARN: could not capture label PDF for {order.reference!r}"
+                            )
+                            continue
+                        pages = _count_pdf_pages(part)
+                        _log(
+                            f"  Captured label PDF ({pages} page(s)) for {order.reference!r}"
+                        )
                         label_parts.append(part)
                         part = None
-                finally:
-                    if part is not None:
-                        try:
-                            part.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    finally:
+                        if part is not None:
+                            try:
+                                part.unlink(missing_ok=True)
+                            except OSError:
+                                pass
             finally:
                 _close_label_tabs(page, context, pages_before)
-                page.wait_for_timeout(1200)
+                settle_ms = warehouse_after_print_ms() if warehouse else 1200
+                page.wait_for_timeout(settle_ms)
                 try:
                     page.wait_for_load_state("domcontentloaded")
                 except PlaywrightTimeout:

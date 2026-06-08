@@ -128,3 +128,21 @@ def pdf_page_wait_ms() -> int:
         return max(2000, int(raw))
     except ValueError:
         return 8000
+
+
+def warehouse_print_pause_ms() -> int:
+    """Pause on the label tab before opening Edge print (warehouse Zebra labels)."""
+    raw = (os.environ.get("FEDEX_WAREHOUSE_PRINT_PAUSE_MS") or "4000").strip()
+    try:
+        return max(1500, int(raw))
+    except ValueError:
+        return 4000
+
+
+def warehouse_after_print_ms() -> int:
+    """Pause after each warehouse label print before closing the tab."""
+    raw = (os.environ.get("FEDEX_WAREHOUSE_AFTER_PRINT_MS") or "6000").strip()
+    try:
+        return max(2000, int(raw))
+    except ValueError:
+        return 6000
