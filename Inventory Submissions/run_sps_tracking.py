@@ -14,9 +14,12 @@ from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError, syn
 from automation.config import load_sps_settings
 
 
-CSV_PATH = Path(
-    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\zzz - Worldship Shipment Files\Export Info\UPS_CSV_EXPORT.csv"
+UPS_TRACKING_CSV_DEFAULT = Path(
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction"
+    r"\Order Splitter Output\z - UPS Tracking\UPS_CSV_EXPORT.csv"
 )
+_env_ups_csv = (os.environ.get("UPS_TRACKING_CSV_PATH") or "").strip()
+CSV_PATH = Path(_env_ups_csv) if _env_ups_csv else UPS_TRACKING_CSV_DEFAULT
 DASHBOARD_URL = "https://commerce.spscommerce.com/fulfillment/dashboard/"
 TRANSACTIONS_LIST_URL = "https://commerce.spscommerce.com/fulfillment/transactions/list/"
 _HERE = Path(__file__).resolve().parent

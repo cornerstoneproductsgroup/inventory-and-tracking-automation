@@ -40,7 +40,8 @@ from automation.fedex_credentials import FedexCredentials, env_file_path, load_f
 from automation.fedex_lowes_csv import LowesCsvSkip, resolve_upload_csv
 from automation.fedex_reference import (
     ReferenceOrder,
-    group_consecutive_by_vendor,
+    group_by_vendor,
+    parse_reference,
     reference_to_order,
 )
 from automation.fedex_upload_state import mark_file_used
@@ -1537,71 +1538,167 @@ def _clear_row_selection(page: Page, cfg: dict[str, Any]) -> None:
         page.wait_for_timeout(400)
 
 
-def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[ReferenceOrder]) -> int:
-    refs = {_normalize_reference(g.reference) for g in group}
-    row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
+def _reference_matches_row(expected_ref: str, row_ref: str) -> bool:
+    expected = _normalize_reference(expected_ref)
+    actual = _normalize_reference(row_ref)
+    if not expected or not actual:
+        return False
+    if expected == actual:
+        return True
+    expected_po, _ = parse_reference(expected)
+    actual_po, _ = parse_reference(actual)
+    if expected_po and expected_po == actual_po:
+        return expected in actual or actual in expected
+    return False
+
+
+def _row_checkbox_locator(row, cfg: dict[str, Any]):
     cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
-    _clear_row_selection(page, cfg)
-    page.wait_for_timeout(500)
-    selected = 0
+    return row.locator(cb_sel).first
+
+
+def _is_row_checked(row, cfg: dict[str, Any]) -> bool:
+    cb = _row_checkbox_locator(row, cfg)
+    try:
+        if cb.count() > 0:
+            return cb.is_checked()
+    except Exception:
+        pass
+    try:
+        return row.locator("mat-checkbox.mat-mdc-checkbox-checked").count() > 0
+    except Exception:
+        return False
+
+
+def _click_row_checkbox(row, cfg: dict[str, Any], ref: str) -> bool:
+    try:
+        row.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    if _is_row_checked(row, cfg):
+        return True
+
+    cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
+    for label_sel in (
+        "label.fdx-c-form-group__label[data-test-id='label']",
+        "label.fdx-c-form-group__label",
+        "mat-checkbox label",
+    ):
+        label = row.locator(label_sel).first
+        try:
+            if label.count() > 0 and label.is_visible():
+                label.click(timeout=8000)
+                row.page.wait_for_timeout(250)
+                if _is_row_checked(row, cfg):
+                    return True
+        except Exception:
+            continue
+
+    cb = row.locator(cb_sel).first
+    try:
+        if cb.count() > 0:
+            if not cb.is_checked():
+                cb.click(timeout=8000)
+            row.page.wait_for_timeout(250)
+            if _is_row_checked(row, cfg):
+                return True
+    except Exception:
+        pass
+    try:
+        cb.check(force=True, timeout=8000)
+        row.page.wait_for_timeout(250)
+        return _is_row_checked(row, cfg)
+    except Exception as exc:
+        _log(f"WARN: could not check row {ref!r}: {exc}")
+        return False
+
+
+def _find_shipment_row_for_reference(page: Page, cfg: dict[str, Any], ref: str):
+    row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
     rows = page.locator(row_sel)
     for i in range(rows.count()):
         row = rows.nth(i)
-        ref = _normalize_reference(_row_reference_text(row))
-        if ref not in refs:
-            continue
-        try:
-            row.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
-            pass
-        page.wait_for_timeout(150)
-        clicked = False
-        for label_sel in (
-            "label.fdx-c-form-group__label[data-test-id='label']",
-            "label.fdx-c-form-group__label",
-            "mat-checkbox label",
-        ):
-            label = row.locator(label_sel).first
+        row_ref = _row_reference_text(row)
+        if _reference_matches_row(ref, row_ref):
+            return row
+    return None
+
+
+def _read_shipments_selected_count(page: Page) -> int | None:
+    try:
+        body = page.locator("body").inner_text(timeout=4000) or ""
+    except Exception:
+        return None
+    patterns = (
+        re.compile(r"(\d+)\s+shipments?\s+selected", re.I),
+        re.compile(r"shipment\s+selected[:\s]+(\d+)", re.I),
+        re.compile(r"(\d+)\s+selected\s+shipments?", re.I),
+    )
+    for pat in patterns:
+        m = pat.search(body)
+        if m:
             try:
-                if label.count() > 0 and label.is_visible():
-                    label.click(timeout=8000)
-                    clicked = True
-                    break
-            except Exception:
+                return int(m.group(1))
+            except ValueError:
                 continue
-        if not clicked:
-            cb = row.locator(cb_sel).first
-            try:
-                if cb.count() > 0:
-                    if not cb.is_checked():
-                        cb.click(timeout=8000)
-                    clicked = True
-            except Exception:
-                try:
-                    cb.check(force=True, timeout=8000)
-                    clicked = True
-                except Exception as exc:
-                    _log(f"WARN: could not select row {ref!r}: {exc}")
-                    continue
-        if clicked:
-            selected += 1
-            page.wait_for_timeout(200)
+    return None
 
-    if selected > 0:
-        if not _wait_for_row_selection(page, expected=selected, timeout_ms=10_000):
-            checked = _count_checked_shipment_rows(page)
-            _log(
-                f"WARN: expected {selected} selected row(s), UI shows {checked} checked — "
-                "continuing after extra wait."
-            )
-            page.wait_for_timeout(800)
-        settle_ms = _after_row_select_wait_ms(cfg)
-        _log(f"Waiting {settle_ms}ms for selection toolbar before Finalize…")
-        page.wait_for_timeout(settle_ms)
 
-    checked = _count_checked_shipment_rows(page)
-    _log(f"Row selection: {selected} matched, {checked} checkbox(es) checked.")
-    return selected
+def _count_checked_refs(page: Page, cfg: dict[str, Any], group: list[ReferenceOrder]) -> list[str]:
+    checked_refs: list[str] = []
+    for order in group:
+        row = _find_shipment_row_for_reference(page, cfg, order.reference)
+        if row is not None and _is_row_checked(row, cfg):
+            checked_refs.append(order.reference)
+    return checked_refs
+
+
+def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[ReferenceOrder]) -> int:
+    _clear_row_selection(page, cfg)
+    page.wait_for_timeout(500)
+
+    expected = len(group)
+    for attempt in range(1, 4):
+        missing = []
+        for order in group:
+            ref = order.reference
+            row = _find_shipment_row_for_reference(page, cfg, ref)
+            if row is None:
+                missing.append(ref)
+                continue
+            if not _click_row_checkbox(row, cfg, ref):
+                missing.append(ref)
+
+        checked_refs = _count_checked_refs(page, cfg, group)
+        ui_selected = _read_shipments_selected_count(page)
+        checked_count = len(checked_refs)
+        _log(
+            f"Row selection attempt {attempt}: {checked_count}/{expected} checked "
+            f"(UI selected={ui_selected if ui_selected is not None else '?'})"
+        )
+        if checked_count == expected and (ui_selected is None or ui_selected >= expected):
+            settle_ms = _after_row_select_wait_ms(cfg)
+            _log(f"Waiting {settle_ms}ms for selection toolbar before Finalize…")
+            page.wait_for_timeout(settle_ms)
+            return expected
+
+        if missing:
+            _log(f"WARN: could not find/check row(s): {', '.join(missing)}")
+        if attempt < 3:
+            page.wait_for_timeout(600)
+            for order in group:
+                row = _find_shipment_row_for_reference(page, cfg, order.reference)
+                if row is not None and not _is_row_checked(row, cfg):
+                    _click_row_checkbox(row, cfg, order.reference)
+
+    checked_refs = _count_checked_refs(page, cfg, group)
+    checked_count = len(checked_refs)
+    ui_selected = _read_shipments_selected_count(page)
+    _log(
+        f"Row selection final: {checked_count}/{expected} checked "
+        f"(UI selected={ui_selected if ui_selected is not None else '?'})"
+    )
+    return checked_count
 
 
 def _label_tab_timeout_ms(cfg: dict[str, Any]) -> int:
@@ -2093,12 +2190,169 @@ def _save_pdf_from_label_tab(
     return True
 
 
+def _count_pdf_pages(path: Path) -> int:
+    try:
+        if not path.is_file() or path.stat().st_size < 200:
+            return 0
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(path)).pages)
+    except Exception:
+        try:
+            data = path.read_bytes()[:500_000]
+        except OSError:
+            return 0
+        if not data.startswith(b"%PDF"):
+            return 0
+        count = len(re.findall(rb"/Type\s*/Page\b", data))
+        return max(1, count) if count else 0
+
+
+def _merge_pdf_files(sources: list[Path], dest: Path) -> None:
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for src in sources:
+        reader = PdfReader(str(src))
+        for page in reader.pages:
+            writer.add_page(page)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as f:
+        writer.write(f)
+
+
 def _zebra_label_printer() -> str:
     return _resolve_printer(
         "FEDEX_WAREHOUSE_LABEL_PRINTER",
         "PULL_ORDERS_SOS_LABEL_PRINTER",
         "Zebra ZP 450-200 dpi",
     )
+
+
+def _capture_label_from_finalize(
+    list_page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    *,
+    orders: list[ReferenceOrder],
+) -> Page:
+    selected = _select_rows_for_group(list_page, cfg, orders)
+    if selected != len(orders):
+        refs = [o.reference for o in orders]
+        raise FedexBatchError(
+            f"Could not check all {len(orders)} row(s) before Finalize "
+            f"({selected} checked). References: {', '.join(refs)}"
+        )
+    return _finalize_and_open_label_tab(list_page, context, cfg)
+
+
+def _process_vendor_group_labels(
+    page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    group: list[ReferenceOrder],
+    *,
+    order_date: date | None,
+) -> tuple[bool, int]:
+    """
+    Finalize and capture labels for one vendor group.
+    Multiple orders are finalized one at a time so every label is saved, then merged.
+    """
+    vendor = group[0].vendor_folder
+    warehouse = is_warehouse_print_vendor(vendor)
+    label_parts: list[Path] = []
+    printed_jobs = 0
+
+    try:
+        for idx, order in enumerate(group, start=1):
+            if len(group) > 1:
+                _log(
+                    f"  Order {idx}/{len(group)} for {vendor!r}: "
+                    f"{order.reference!r} ({order.sku})"
+                )
+
+            pages_before = set(context.pages)
+            label_tab = _capture_label_from_finalize(
+                page, context, cfg, orders=[order]
+            )
+            try:
+                fd, tmp_name = tempfile.mkstemp(
+                    suffix=".pdf",
+                    prefix=f"fedex_label_{idx}_",
+                )
+                os.close(fd)
+                part = Path(tmp_name)
+                try:
+                    if not _save_pdf_from_label_tab(label_tab, context, part, cfg):
+                        _log(
+                            f"WARN: could not capture label PDF for {order.reference!r}"
+                        )
+                        continue
+                    pages = _count_pdf_pages(part)
+                    _log(f"  Captured label PDF ({pages} page(s)) for {order.reference!r}")
+                    if warehouse:
+                        print_pdf_windows(part, _zebra_label_printer())
+                        time.sleep(2.0)
+                        printed_jobs += 1
+                    else:
+                        label_parts.append(part)
+                        part = None
+                finally:
+                    if part is not None:
+                        try:
+                            part.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            finally:
+                _close_label_tabs(page, context, pages_before)
+                page.wait_for_timeout(1200)
+                try:
+                    page.wait_for_load_state("domcontentloaded")
+                except PlaywrightTimeout:
+                    pass
+
+        if warehouse:
+            if printed_jobs == len(group):
+                _log(f"Printed {printed_jobs} Zebra label job(s) for {vendor!r}")
+                return True, printed_jobs
+            _log(
+                f"WARN: printed {printed_jobs}/{len(group)} Zebra label job(s) for {vendor!r}"
+            )
+            return printed_jobs > 0, printed_jobs
+
+        if not label_parts:
+            return False, 0
+        if len(label_parts) != len(group):
+            _log(
+                f"WARN: captured {len(label_parts)}/{len(group)} label PDF(s) for {vendor!r}"
+            )
+
+        dest = vendor_label_pdf_path(vendor, order_date)
+        if len(label_parts) == 1:
+            label_parts[0].replace(dest)
+        else:
+            _merge_pdf_files(label_parts, dest)
+            total_pages = _count_pdf_pages(dest)
+            _log(
+                f"Merged {len(label_parts)} label PDF(s) → {dest.name} "
+                f"({total_pages} page(s))"
+            )
+        for part in label_parts:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return True, len(label_parts)
+    except FedexBatchError:
+        raise
+    except Exception as exc:
+        _log(f"ERROR: vendor label processing failed for {vendor!r}: {exc}")
+        for part in label_parts:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False, 0
 
 
 def _print_label_pdf(
@@ -2187,13 +2441,12 @@ def _process_vendor_groups(
         _log(f"Pass {pass_num}: {len(pending)} shipment(s) pending finalize/print.")
 
         orders = [s.order for s in pending]
-        groups = group_consecutive_by_vendor(orders)
+        groups = group_by_vendor(orders)
         if not groups:
             break
 
         group = groups[0]
         vendor = group[0].vendor_folder
-        refs = [o.reference for o in group]
         skus = ", ".join(o.sku for o in group)
         _log(f"Vendor group {vendor!r}: {len(group)} shipment(s) — SKU(s): {skus}")
         if is_warehouse_print_vendor(vendor):
@@ -2204,34 +2457,30 @@ def _process_vendor_groups(
         else:
             dest = vendor_label_pdf_path(vendor, order_date)
             _log(f"  → Save PDF: {dest}")
+            if len(group) > 1:
+                _log(
+                    f"  → {len(group)} orders: finalize each shipment separately, "
+                    f"then merge into one PDF"
+                )
 
-        selected = _select_rows_for_group(page, cfg, group)
-        if selected == 0:
-            raise FedexBatchError(
-                f"Could not check any row checkboxes for vendor {vendor!r} "
-                f"({len(group)} shipment(s): {', '.join(refs)}). "
-                "FedEx may have changed the shipment table UI."
-            )
-
-        list_page = page
-        pages_before = set(context.pages)
-        label_tab = _finalize_and_open_label_tab(list_page, context, cfg)
-        try:
-            if is_warehouse_print_vendor(vendor):
-                if _print_label_pdf(label_tab, context, cfg, vendor=vendor):
-                    printed_groups += 1
-                else:
-                    _log(f"WARN: could not print labels on Zebra for {vendor!r}")
+        ok, label_count = _process_vendor_group_labels(
+            page, context, cfg, group, order_date=order_date
+        )
+        if is_warehouse_print_vendor(vendor):
+            if ok:
+                printed_groups += 1
             else:
+                _log(f"WARN: could not print all labels on Zebra for {vendor!r}")
+        elif ok:
+            saved_pdfs += 1
+            if len(group) > 1:
                 dest = vendor_label_pdf_path(vendor, order_date)
-                if _save_pdf_from_label_tab(label_tab, context, dest, cfg):
-                    saved_pdfs += 1
-                else:
-                    _log(f"WARN: could not save label PDF for {vendor!r}")
-        finally:
-            _close_label_tabs(list_page, context, pages_before)
-            page.wait_for_timeout(1200)
-            page.wait_for_load_state("domcontentloaded")
+                _log(
+                    f"Saved {label_count} label(s) for {vendor!r} "
+                    f"({_count_pdf_pages(dest)} page(s) in {dest.name})"
+                )
+        else:
+            _log(f"WARN: could not save label PDF for {vendor!r}")
 
     return saved_pdfs, printed_groups
 

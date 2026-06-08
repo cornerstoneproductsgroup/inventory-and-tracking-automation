@@ -76,3 +76,16 @@ def group_consecutive_by_vendor(orders: list[ReferenceOrder]) -> list[list[Refer
     if bucket:
         groups.append(bucket)
     return groups
+
+
+def group_by_vendor(orders: list[ReferenceOrder]) -> list[list[ReferenceOrder]]:
+    """Group all pending orders by vendor (order of first appearance in the list)."""
+    buckets: dict[str, list[ReferenceOrder]] = {}
+    order: list[str] = []
+    for item in orders:
+        vendor = item.vendor_folder
+        if vendor not in buckets:
+            buckets[vendor] = []
+            order.append(vendor)
+        buckets[vendor].append(item)
+    return [buckets[v] for v in order]

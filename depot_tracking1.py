@@ -12,9 +12,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-TRACKING_CSV = (
-    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\zzz - Worldship Shipment Files\Export Info\UPS_CSV_EXPORT.csv"
+UPS_TRACKING_CSV_DEFAULT = (
+    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction"
+    r"\Order Splitter Output\z - UPS Tracking\UPS_CSV_EXPORT.csv"
 )
+TRACKING_CSV = (os.environ.get("UPS_TRACKING_CSV_PATH") or "").strip() or UPS_TRACKING_CSV_DEFAULT
 ORDER_URL = "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship&tabContext=web_quickship&status=open&substatus=no-activity&merchant=thehomedepot"
 EMAIL = "rfetzer@cornerstoneproductsgroup.com"
 PASSWORD = "Lowesdepotdepotso1106!"
