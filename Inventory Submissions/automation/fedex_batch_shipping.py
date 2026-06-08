@@ -618,6 +618,52 @@ def _is_batch_page(page: Page) -> bool:
     return page.locator('[data-test-id="files-upload-btn"]').count() > 0
 
 
+def _is_batch_uploads_list(page: Page) -> bool:
+    """True on the batch uploads table (not an empty in-progress shipment detail page)."""
+    if not _is_batch_page(page):
+        return False
+    try:
+        body = (page.locator("body").inner_text(timeout=3000) or "").upper()
+    except Exception:
+        return False
+    if "VIEWING 0/" in body or "VIEWING 0 " in body:
+        return False
+    return any(
+        marker in body
+        for marker in (
+            "READY TO FINALIZE",
+            "READY TO FINALIZE OR SHARE",
+            "CREATION DATE",
+            "BATCH UPLOADS",
+        )
+    )
+
+
+def _ensure_batch_uploads_list(page: Page, cfg: dict[str, Any]) -> None:
+    """Stay on or return to the batch uploads table after upload/navigation."""
+    if _is_batch_uploads_list(page):
+        return
+    batch_url = _batch_url(cfg)
+    _log(
+        "Returning to batch uploads table "
+        f"(current URL: {page.url})."
+    )
+    page.goto(batch_url, wait_until="domcontentloaded", timeout=120_000)
+    _fedex_short_pause(page, cfg, ms=1200)
+
+
+def _find_batch_upload_row(page: Page, csv_basename: str):
+    return page.locator("tr").filter(has_text=csv_basename).first
+
+
+def _upload_poll_per_shipment_s() -> float:
+    raw = (os.environ.get("FEDEX_UPLOAD_POLL_PER_SHIPMENT_S") or "6").strip()
+    try:
+        return max(2.0, float(raw))
+    except ValueError:
+        return 6.0
+
+
 def _login_scopes(page: Page) -> list[Page | Frame]:
     scopes: list[Page | Frame] = [page]
     for frame in page.frames:
@@ -1166,12 +1212,22 @@ def _upload_lowes_csv(page: Page, cfg: dict[str, Any], csv_path: Path) -> None:
     page.wait_for_timeout(800)
     if not _click_first(page, start_upload, timeout_ms=20_000):
         raise FedexBatchError('Could not click "Start upload" on batch options dialog.')
-    _log("Start upload clicked; waiting for batch to process…")
+    _log("Start upload clicked; waiting for upload to finish on batch uploads table…")
+    page.wait_for_timeout(2000)
+    _ensure_batch_uploads_list(page, cfg)
 
 
 def _parse_ready_count(row) -> int:
     try:
         link = row.locator("a[href*='ready-to-finalize']").first
+        if link.count() == 0:
+            for sel in (
+                "a[href*='ready-to-finalize']",
+                "a[href*='readyToFinalize']",
+            ):
+                link = row.locator(sel).first
+                if link.count() > 0:
+                    break
         if link.count() == 0:
             return 0
         text = (link.inner_text() or "").strip()
@@ -1182,40 +1238,163 @@ def _parse_ready_count(row) -> int:
     return 0
 
 
-def _wait_for_batch_ready(page: Page, csv_basename: str) -> int:
-    deadline = time.monotonic() + upload_poll_timeout_s()
+def _parse_batch_row_progress(row) -> tuple[int, int | None, int | None]:
+    """Return (ready_to_finalize, finalized_so_far, total_in_batch)."""
+    ready = _parse_ready_count(row)
+    try:
+        text = row.inner_text() or ""
+    except Exception:
+        text = ""
+    fin_m = re.search(r"(\d+)\s*/\s*(\d+)", text)
+    finalized = int(fin_m.group(1)) if fin_m else None
+    total = int(fin_m.group(2)) if fin_m else None
+    return ready, finalized, total
+
+
+def _wait_for_batch_ready(page: Page, cfg: dict[str, Any], csv_basename: str) -> int:
+    """
+    Poll the batch uploads table until the file row shows a ready-to-finalize count > 0.
+    Large batches need longer — timeout extends when total shipment count is known.
+    """
+    _ensure_batch_uploads_list(page, cfg)
     interval = upload_poll_interval_s()
+    per_shipment_s = _upload_poll_per_shipment_s()
+    started_at = time.monotonic()
+    deadline = started_at + upload_poll_timeout_s()
+    last_status = ""
+    extended_for_total = False
+
     while time.monotonic() < deadline:
-        row = page.locator("tr").filter(has_text=csv_basename).first
-        if row.count() > 0:
-            ready = _parse_ready_count(row)
-            if ready > 0:
-                _log(f"Batch {csv_basename!r} ready to finalize: {ready} shipment(s).")
-                return ready
-            body = (row.inner_text() or "").lower()
-            if "in queue" in body:
-                _log("Batch still in queue for upload…")
-            elif re.search(r"\d+/\d+", body):
-                _log(f"Batch processing… ({body[:80]})")
+        _ensure_batch_uploads_list(page, cfg)
+        row = _find_batch_upload_row(page, csv_basename)
+        if row.count() == 0:
+            if last_status != "missing":
+                _log(f"Waiting for batch row {csv_basename!r} on uploads table…")
+                last_status = "missing"
         else:
-            _log(f"Waiting for batch row {csv_basename!r} to appear…")
+            ready, finalized, total = _parse_batch_row_progress(row)
+            if total and total > 0 and not extended_for_total:
+                needed_s = max(upload_poll_timeout_s(), 120.0 + total * per_shipment_s)
+                deadline = started_at + needed_s
+                extended_for_total = True
+                _log(
+                    f"Batch has {total} shipment(s) — allowing up to {needed_s:.0f}s "
+                    "for FedEx to finish processing."
+                )
+            if ready > 0:
+                _log(
+                    f"Batch {csv_basename!r} ready to finalize: {ready} shipment(s) "
+                    f"(finalized {finalized or 0}/{total or '?'})"
+                )
+                return ready
+            try:
+                body = (row.inner_text() or "").lower()
+            except Exception:
+                body = ""
+            if "in queue" in body:
+                status = "in queue"
+            elif finalized is not None and total:
+                status = f"processing {finalized}/{total}"
+            else:
+                status = "waiting for ready link"
+            if status != last_status:
+                _log(f"Batch {csv_basename!r}: {status}…")
+                last_status = status
         page.wait_for_timeout(int(interval * 1000))
-    raise FedexBatchError(f"Timed out waiting for batch {csv_basename!r} to be ready to finalize.")
+
+    raise FedexBatchError(
+        f"Timed out waiting for batch {csv_basename!r} to show ready-to-finalize on the "
+        "uploads table. Open FedEx batch uploads manually and confirm the blue ready count "
+        "appears in the row."
+    )
 
 
-def _open_batch_shipments(page: Page, cfg: dict[str, Any], csv_basename: str) -> None:
-    row = page.locator("tr").filter(has_text=csv_basename).first
+def _shipment_detail_viewing_count(page: Page) -> int | None:
+    try:
+        body = page.locator("body").inner_text(timeout=3000) or ""
+    except Exception:
+        return None
+    m = re.search(r"viewing\s+(\d+)\s*/\s*(\d+)", body, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _open_batch_shipments(
+    page: Page,
+    cfg: dict[str, Any],
+    csv_basename: str,
+    *,
+    expected_ready: int = 0,
+) -> None:
+    """From batch uploads table, click the blue ready-to-finalize link (not the whole row)."""
+    _ensure_batch_uploads_list(page, cfg)
+    row = _find_batch_upload_row(page, csv_basename)
     if row.count() == 0:
-        raise FedexBatchError(f"Batch row not found for {csv_basename!r}")
+        raise FedexBatchError(
+            f"Batch row not found for {csv_basename!r} on uploads table."
+        )
+
+    ready, finalized, total = _parse_batch_row_progress(row)
+    if expected_ready > 0 and ready != expected_ready:
+        _log(
+            f"WARN: ready count is {ready} (expected {expected_ready}); "
+            "waiting briefly for FedEx to update the batch row…"
+        )
+        page.wait_for_timeout(3000)
+        _ensure_batch_uploads_list(page, cfg)
+        row = _find_batch_upload_row(page, csv_basename)
+        ready, finalized, total = _parse_batch_row_progress(row)
+
+    if ready <= 0:
+        raise FedexBatchError(
+            f"Batch {csv_basename!r} shows 0 ready to finalize "
+            f"(finalized {finalized or 0}/{total or '?'}). "
+            "Wait until the blue ready count appears before opening shipments."
+        )
 
     ready_link = row.locator("a[href*='ready-to-finalize']").first
-    if ready_link.count() > 0:
-        ready_link.click(timeout=30_000)
-    else:
-        row.click(timeout=15_000)
+    if ready_link.count() == 0:
+        ready_link = row.get_by_role("link", name=str(ready)).first
+    if ready_link.count() == 0:
+        raise FedexBatchError(
+            f"Could not find ready-to-finalize link for {csv_basename!r} "
+            f"({ready} shipment(s))."
+        )
+
+    _log(f"Clicking ready-to-finalize link ({ready} shipment(s)) for {csv_basename!r}…")
+    ready_link.click(timeout=30_000)
     page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2000)
-    _log(f"Opened shipment list for {csv_basename!r}")
+    page.wait_for_timeout(1500)
+
+    viewing = _shipment_detail_viewing_count(page)
+    if viewing == 0:
+        _log(
+            "WARN: shipment detail shows VIEWING 0 — batch may still be processing; "
+            "returning to uploads table and retrying once…"
+        )
+        _ensure_batch_uploads_list(page, cfg)
+        row = _find_batch_upload_row(page, csv_basename)
+        ready, _, _ = _parse_batch_row_progress(row)
+        if ready <= 0:
+            raise FedexBatchError(
+                f"Opened {csv_basename!r} but shipment list was empty (0 orders). "
+                "FedEx may still be processing the upload — try again in a few minutes."
+            )
+        ready_link = row.locator("a[href*='ready-to-finalize']").first
+        ready_link.click(timeout=30_000)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2000)
+        viewing = _shipment_detail_viewing_count(page)
+        if viewing == 0:
+            raise FedexBatchError(
+                f"Shipment list for {csv_basename!r} still shows 0 orders after retry."
+            )
+
+    if viewing is not None:
+        _log(f"Opened shipment list: viewing {viewing} shipment(s).")
+    else:
+        _log(f"Opened shipment list for {csv_basename!r}")
 
 
 def _wait_for_shipment_list_loaded(
@@ -2000,12 +2179,16 @@ def run_fedex_batch(
             ready_count = 0
             if not skip_upload:
                 _upload_lowes_csv(page, cfg, upload_csv)
-                ready_count = _wait_for_batch_ready(page, csv_basename)
+                ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
                 mark_file_used(csv_basename, note="uploaded to FedEx batch")
             else:
-                _log("skip_upload: opening existing batch from table…")
+                _log("skip_upload: opening existing batch from uploads table…")
+                _ensure_batch_uploads_list(page, cfg)
+                ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
 
-            _open_batch_shipments(page, cfg, csv_basename)
+            _open_batch_shipments(
+                page, cfg, csv_basename, expected_ready=ready_count
+            )
             saved, printed = _process_vendor_groups(
                 page,
                 context,
