@@ -1511,7 +1511,7 @@ def _zebra_label_printer() -> str:
     return _resolve_printer(
         "FEDEX_WAREHOUSE_LABEL_PRINTER",
         "PULL_ORDERS_SOS_LABEL_PRINTER",
-        "Zebra ZP 450",
+        "Zebra ZP 450-200 dpi",
     )
 
 

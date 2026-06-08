@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -112,7 +113,56 @@ _VIRTUAL_PRINTER_HINTS = (
     "cutepdf",
     "bullzip",
     "pdfcreator",
+    "pdfsam",
+    "abs pdf",
+    "pdf driver",
+    "pdf printer",
 )
+
+
+def _normalize_printer_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_zebra_label_printer(name: str) -> bool:
+    norm = _normalize_printer_text(name)
+    if "zebra" not in norm:
+        return False
+    return any(token in norm for token in ("zp 450", "zp450", "zp-450", "zdesigner"))
+
+
+def _printer_name_matches(name: str, needle: str) -> bool:
+    """Match printer names ignoring extra spaces (Windows often uses double spaces)."""
+    norm_name = _normalize_printer_text(name)
+    norm_needle = _normalize_printer_text(needle)
+    if not norm_needle:
+        return False
+    if norm_needle in norm_name:
+        return True
+    if _is_zebra_label_printer(norm_needle) and _is_zebra_label_printer(norm_name):
+        return True
+    return False
+
+
+def _find_installed_printer(
+    target: str,
+    *,
+    physical: list[str] | None = None,
+) -> str | None:
+    """Resolve *target* to an installed printer name (exact, then normalized/fuzzy)."""
+    needle = (target or "").strip()
+    if not needle:
+        return None
+    names = physical if physical is not None else list_installed_printers(include_virtual=False)
+    if _printer_exists(needle):
+        return needle
+    for name in names:
+        if _normalize_printer_text(name) == _normalize_printer_text(needle):
+            return name
+    for name in names:
+        if _printer_name_matches(name, needle):
+            return name
+    return None
 
 
 def _is_virtual_printer(name: str) -> bool:
@@ -157,40 +207,42 @@ def _printer_exists(printer_name: str) -> bool:
 
 
 def _resolve_printer(env_key: str, fallback_env: str, default_substring: str) -> str:
-    direct = (os.environ.get(env_key) or "").strip()
-    if direct:
-        if _is_virtual_printer(direct):
+    physical = list_installed_printers(include_virtual=False)
+
+    def _resolve_configured(value: str, *, label: str) -> str | None:
+        if not value:
+            return None
+        if _is_virtual_printer(value):
             raise RuntimeError(
-                f"{env_key}={direct!r} is a virtual printer. "
+                f"{label}={value!r} is a virtual printer. "
                 f"Set {env_key} to your physical Zebra name in .env."
             )
-        if not _printer_exists(direct):
-            raise RuntimeError(
-                f"{env_key}={direct!r} is not installed on this PC. "
-                f"Check Windows Printers or fix .env."
-            )
-        return direct
+        resolved = _find_installed_printer(value, physical=physical)
+        if resolved:
+            return resolved
+        raise RuntimeError(
+            f"{label}={value!r} is not installed on this PC. "
+            f"Check Windows Printers or fix .env."
+        )
+
+    direct = (os.environ.get(env_key) or "").strip()
+    if direct:
+        return _resolve_configured(direct, label=env_key)
 
     fallback = (os.environ.get(fallback_env) or "").strip()
     if fallback:
-        if _is_virtual_printer(fallback):
-            raise RuntimeError(
-                f"{fallback_env}={fallback!r} is a virtual printer. "
-                f"Set {env_key} to your physical Zebra name in .env."
-            )
-        if not _printer_exists(fallback):
-            raise RuntimeError(
-                f"{fallback_env}={fallback!r} is not installed on this PC."
-            )
-        return fallback
+        return _resolve_configured(fallback, label=fallback_env)
 
-    physical = list_installed_printers(include_virtual=False)
-    needles = [default_substring.lower()]
-    if "zebra" not in needles[0]:
+    needles = [default_substring]
+    if not _is_zebra_label_printer(default_substring):
         needles.append("zebra")
     for needle in needles:
         for name in physical:
-            if needle in name.lower():
+            if _printer_name_matches(name, needle):
+                return name
+    if _is_zebra_label_printer(default_substring) or "zebra" in default_substring.lower():
+        for name in physical:
+            if _is_zebra_label_printer(name):
                 return name
 
     installed = list_installed_printers(include_virtual=True)
