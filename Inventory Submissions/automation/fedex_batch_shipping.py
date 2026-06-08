@@ -51,7 +51,7 @@ from automation.warehouse_print_vendors import (
     load_warehouse_print_vendors,
     order_splitter_watcher_path,
 )
-from automation.windows_save_as import fill_save_as_dialog
+from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
 
 
 def _log(msg: str) -> None:
@@ -1820,6 +1820,197 @@ def _pdf_looks_like_batch_list_ui(path: Path) -> bool:
     return sum(1 for m in markers if m in text) >= 2
 
 
+_BLOB_TO_B64_JS = """async (href) => {
+    const url = href || location.href;
+    if (!url || !url.startsWith('blob:')) return null;
+    const resp = await fetch(url);
+    const buf = await resp.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}"""
+
+
+def _label_tab_pdf_url(page: Page) -> str | None:
+    url = (page.url or "").strip()
+    if url.startswith("blob:"):
+        return url
+    if url.startswith(("http://", "https://")):
+        low = url.lower()
+        if low.endswith(".pdf") or ".pdf?" in low or "label" in low or "print" in low:
+            return url
+    try:
+        src = page.evaluate(
+            """() => {
+                const el = document.querySelector(
+                    'embed[type="application/pdf"], object[type="application/pdf"]'
+                );
+                if (!el) return null;
+                return el.src || el.data || null;
+            }"""
+        )
+        if isinstance(src, str) and src.strip():
+            return src.strip()
+    except Exception:
+        pass
+    return url if url.startswith(("blob:", "http://", "https://")) else None
+
+
+def _fetch_pdf_bytes_via_blob(page: Page, href: str | None = None) -> bytes | None:
+    target = (href or page.url or "").strip()
+    if not target.startswith("blob:"):
+        return None
+    try:
+        b64 = page.evaluate(_BLOB_TO_B64_JS, target)
+        if not b64:
+            return None
+        data = base64.b64decode(b64)
+        if len(data) > 800 and data.startswith(b"%PDF"):
+            return data
+    except Exception as exc:
+        _log(f"WARN: blob PDF fetch failed: {exc}")
+    return None
+
+
+def _fetch_pdf_bytes_via_http(context: BrowserContext, url: str) -> bytes | None:
+    if not url.startswith(("http://", "https://")):
+        return None
+    try:
+        resp = context.request.get(url, timeout=60_000)
+        body = resp.body()
+        if resp.ok and body.startswith(b"%PDF") and len(body) > 800:
+            return body
+    except Exception as exc:
+        _log(f"WARN: HTTP PDF fetch failed: {exc}")
+    return None
+
+
+def _fetch_label_pdf_bytes(page: Page, context: BrowserContext) -> bytes | None:
+    """Read actual label PDF bytes from Edge's PDF viewer tab (not printToPDF)."""
+    pdf_url = _label_tab_pdf_url(page)
+    if pdf_url:
+        if pdf_url.startswith("blob:"):
+            data = _fetch_pdf_bytes_via_blob(page, pdf_url)
+            if data:
+                _log(f"Fetched label PDF from blob URL ({len(data):,} bytes).")
+                return data
+        if pdf_url.startswith(("http://", "https://")):
+            data = _fetch_pdf_bytes_via_http(context, pdf_url)
+            if data:
+                _log(f"Fetched label PDF from HTTP URL ({len(data):,} bytes).")
+                return data
+    data = _fetch_pdf_bytes_via_blob(page)
+    if data:
+        _log(f"Fetched label PDF from tab blob ({len(data):,} bytes).")
+        return data
+    return None
+
+
+def _wait_for_label_pdf_ready(page: Page, *, timeout_ms: int) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        pdf_url = _label_tab_pdf_url(page)
+        if pdf_url and pdf_url.startswith("blob:"):
+            try:
+                size = page.evaluate(
+                    """async (href) => {
+                        try {
+                            const r = await fetch(href || location.href);
+                            return (await r.arrayBuffer()).byteLength;
+                        } catch (e) {
+                            return 0;
+                        }
+                    }""",
+                    pdf_url,
+                )
+                if isinstance(size, (int, float)) and size > 2000:
+                    return True
+            except Exception:
+                pass
+        elif pdf_url and pdf_url.startswith("http"):
+            return True
+        try:
+            if page.locator("embed[type='application/pdf']").count() > 0:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+    return False
+
+
+def _pdf_looks_like_blank_label(path: Path) -> bool:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return True
+    if len(data) < 800 or not data.startswith(b"%PDF"):
+        return True
+    text = data[:160_000].decode("latin-1", errors="ignore").lower()
+    label_signals = (
+        "fedex",
+        "tracking",
+        "ship date",
+        "weight",
+        "barcode",
+        "/image",
+        "express",
+        "ground",
+    )
+    if any(sig in text for sig in label_signals):
+        return False
+    if text.count(" re ") < 2 and "/font" not in text and "/image" not in text:
+        return True
+    return len(data) < 4000
+
+
+def _pdf_is_valid_label(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 800:
+        return False
+    if _pdf_looks_like_batch_list_ui(path):
+        return False
+    if _pdf_looks_like_blank_label(path):
+        return False
+    return True
+
+
+def _save_via_edge_pdf_viewer(page: Page, dest: Path, *, timeout_s: float) -> bool:
+    """Edge built-in PDF viewer: Ctrl+S / Save → download or Windows Save As."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        page.bring_to_front()
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    download_ms = int(min(timeout_s, 45) * 1000)
+    try:
+        with page.expect_download(timeout=download_ms) as dl_info:
+            page.keyboard.press("Control+s")
+        dl_info.value.save_as(dest)
+        if _pdf_is_valid_label(dest):
+            _log(f"Saved label PDF via browser download ({dest.stat().st_size:,} bytes).")
+            return True
+        dest.unlink(missing_ok=True)
+    except Exception:
+        _log("No direct download from Ctrl+S; trying Save As dialog…")
+
+    try:
+        page.keyboard.press("Control+s")
+    except Exception:
+        return False
+    time.sleep(0.9)
+    hwnd = wait_for_save_as_dialog(timeout_s=min(timeout_s, 20))
+    if not hwnd:
+        return False
+    if not fill_save_as_dialog(dest, timeout_s=timeout_s, dialog_hwnd=hwnd):
+        return False
+    return _pdf_is_valid_label(dest)
+
+
 def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
     try:
         page.bring_to_front()
@@ -1866,22 +2057,36 @@ def _save_pdf_from_label_tab(
         _log("ERROR: refusing to save — target tab is the batch list, not labels.")
         return False
 
-    if not _cdp_save_pdf(label_tab, context, dest):
-        if bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
-            if fill_save_as_dialog(dest, timeout_s=label_save_timeout_s()):
-                pass
-        if not dest.is_file() or dest.stat().st_size < 500:
-            return False
+    ready_ms = max(pdf_page_wait_ms(), 12_000)
+    if not _wait_for_label_pdf_ready(label_tab, timeout_ms=ready_ms):
+        _log("WARN: label PDF may not be fully loaded yet — trying capture anyway.")
 
-    if _pdf_looks_like_batch_list_ui(dest):
-        _log(
-            "ERROR: saved file looks like the batch list UI, not shipping labels — "
-            "deleting bad PDF."
+    saved = False
+    pdf_bytes = _fetch_label_pdf_bytes(label_tab, context)
+    if pdf_bytes:
+        dest.write_bytes(pdf_bytes)
+        saved = _pdf_is_valid_label(dest)
+
+    if not saved and bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
+        saved = _save_via_edge_pdf_viewer(
+            label_tab, dest, timeout_s=label_save_timeout_s()
         )
+
+    if not saved:
+        _log("WARN: blob/HTTP/download capture failed; trying printToPDF as last resort.")
+        if _cdp_save_pdf(label_tab, context, dest):
+            saved = _pdf_is_valid_label(dest)
+
+    if not saved:
         try:
             dest.unlink(missing_ok=True)
         except OSError:
             pass
+        _log(
+            "ERROR: could not capture a valid label PDF. "
+            "Edge printToPDF on the PDF viewer produces blank pages — "
+            "confirm the label tab shows FedEx labels before finalize."
+        )
         return False
 
     _log(f"Saved shipping labels ({dest.stat().st_size:,} bytes) → {dest.name}")
