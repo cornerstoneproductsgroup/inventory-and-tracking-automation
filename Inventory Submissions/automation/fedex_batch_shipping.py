@@ -62,6 +62,9 @@ class FedexBatchError(Exception):
     pass
 
 
+_REFERENCE_RE = re.compile(r"(\d{5,}\s+\S+)")
+
+
 @dataclass
 class ShipmentRowState:
     index: int
@@ -70,6 +73,10 @@ class ShipmentRowState:
     tracking: str
     done: bool
     order: ReferenceOrder
+
+
+def _normalize_reference(ref: str) -> str:
+    return re.sub(r"\s+", " ", (ref or "").strip())
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -1175,7 +1182,7 @@ def _parse_ready_count(row) -> int:
     return 0
 
 
-def _wait_for_batch_ready(page: Page, csv_basename: str) -> None:
+def _wait_for_batch_ready(page: Page, csv_basename: str) -> int:
     deadline = time.monotonic() + upload_poll_timeout_s()
     interval = upload_poll_interval_s()
     while time.monotonic() < deadline:
@@ -1184,7 +1191,7 @@ def _wait_for_batch_ready(page: Page, csv_basename: str) -> None:
             ready = _parse_ready_count(row)
             if ready > 0:
                 _log(f"Batch {csv_basename!r} ready to finalize: {ready} shipment(s).")
-                return
+                return ready
             body = (row.inner_text() or "").lower()
             if "in queue" in body:
                 _log("Batch still in queue for upload…")
@@ -1211,6 +1218,38 @@ def _open_batch_shipments(page: Page, cfg: dict[str, Any], csv_basename: str) ->
     _log(f"Opened shipment list for {csv_basename!r}")
 
 
+def _wait_for_shipment_list_loaded(
+    page: Page,
+    cfg: dict[str, Any],
+    *,
+    min_rows: int = 1,
+    timeout_ms: int = 60_000,
+) -> list[ShipmentRowState]:
+    """Wait until the shipment table has parsed reference rows (Angular paint)."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    last_count = 0
+    while time.monotonic() < deadline:
+        states = _scan_shipment_rows(page, cfg)
+        if len(states) >= min_rows:
+            _log(f"Shipment list loaded: {len(states)} row(s) with PO reference.")
+            return states
+        row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
+        try:
+            last_count = page.locator(row_sel).count()
+        except Exception:
+            last_count = 0
+        page.wait_for_timeout(500)
+    states = _scan_shipment_rows(page, cfg)
+    if states:
+        _log(f"Shipment list loaded: {len(states)} row(s) with PO reference.")
+        return states
+    raise FedexBatchError(
+        f"Shipment list did not load within {timeout_ms / 1000:.0f}s "
+        f"({last_count} table row(s) visible, 0 with readable PO reference). "
+        "Check fedex_batch.json selectors for shipment_table_row / reference column."
+    )
+
+
 def _row_reference_text(row) -> str:
     ref_cell = row.locator(
         "td.mat-column-reference, [data-label='Reference'], .cdk-column-reference"
@@ -1218,13 +1257,27 @@ def _row_reference_text(row) -> str:
     if ref_cell.count() > 0:
         inner = ref_cell.locator('[data-test-id="rowText"]').first
         if inner.count() > 0:
-            return (inner.inner_text() or "").strip()
-        return (ref_cell.inner_text() or "").strip()
+            text = _normalize_reference(inner.inner_text() or "")
+            if text:
+                return text
+        text = _normalize_reference(ref_cell.inner_text() or "")
+        if text:
+            m = _REFERENCE_RE.search(text)
+            if m:
+                return m.group(1)
     texts = row.locator('[data-test-id="rowText"]')
     for i in range(texts.count()):
-        t = (texts.nth(i).inner_text() or "").strip()
-        if re.match(r"^\d{5,}\s+\S", t):
-            return t
+        t = _normalize_reference(texts.nth(i).inner_text() or "")
+        m = _REFERENCE_RE.search(t)
+        if m:
+            return m.group(1)
+    try:
+        row_text = _normalize_reference(row.inner_text() or "")
+        m = _REFERENCE_RE.search(row_text)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
     return ""
 
 
@@ -1247,11 +1300,21 @@ def _row_tracking_text(row) -> str:
     return ""
 
 
-def _is_row_done(status: str, tracking: str) -> bool:
+def _is_row_pending_finalize(status: str) -> bool:
     st = (status or "").lower()
-    if tracking and re.search(r"\d{10,}", tracking):
+    return "ready to be finalized" in st or "ready to finalize" in st
+
+
+def _is_row_done(status: str, tracking: str) -> bool:
+    if _is_row_pending_finalize(status):
+        return False
+    st = (status or "").lower()
+    tr = (tracking or "").strip()
+    if tr and re.search(r"\d{10,}", tr):
         return True
-    if "created" in st and "printed" in st:
+    if "shipment created" in st and "printed" in st:
+        return True
+    if "created & printed" in st or "created and printed" in st:
         return True
     return False
 
@@ -1296,7 +1359,7 @@ def _clear_row_selection(page: Page, cfg: dict[str, Any]) -> None:
 
 
 def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[ReferenceOrder]) -> int:
-    refs = {g.reference for g in group}
+    refs = {_normalize_reference(g.reference) for g in group}
     row_sel = _sel(cfg, "shipment_table_row", "table tbody tr.mat-mdc-row, tr.mat-mdc-row")
     cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
     _clear_row_selection(page, cfg)
@@ -1305,7 +1368,7 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
     rows = page.locator(row_sel)
     for i in range(rows.count()):
         row = rows.nth(i)
-        ref = _row_reference_text(row)
+        ref = _normalize_reference(_row_reference_text(row))
         if ref not in refs:
             continue
         try:
@@ -1548,6 +1611,7 @@ def _process_vendor_groups(
     cfg: dict[str, Any],
     *,
     order_date: date | None,
+    expected_row_count: int = 0,
 ) -> tuple[int, int]:
     saved_pdfs = 0
     printed_groups = 0
@@ -1563,14 +1627,36 @@ def _process_vendor_groups(
             f"Check {bundled_warehouse_vendors_path()} or Order Splitter at "
             f"{order_splitter_watcher_path()}"
         )
+    loaded = _wait_for_shipment_list_loaded(page, cfg, min_rows=1)
+    if expected_row_count > 0 and len(loaded) < expected_row_count:
+        _log(
+            f"WARN: batch reported {expected_row_count} ready shipment(s) but parsed "
+            f"{len(loaded)} row reference(s) on the list page."
+        )
+
     pass_num = 0
     while pass_num < 50:
         pass_num += 1
         states = _scan_shipment_rows(page, cfg)
         pending = [s for s in states if not s.done]
         if not pending:
-            _log("All shipment rows finalized (tracking present or status printed).")
+            if not states:
+                raise FedexBatchError(
+                    "No shipment rows found on the batch list — cannot finalize or print labels."
+                )
+            ready_count = sum(1 for s in states if _is_row_pending_finalize(s.status))
+            if ready_count > 0:
+                raise FedexBatchError(
+                    f"{ready_count} shipment(s) still show 'ready to be finalized' but were not "
+                    "selected/processed. Check row checkbox selectors in fedex_batch.json."
+                )
+            _log(
+                f"All {len(states)} shipment row(s) finalized "
+                "(tracking present or status printed)."
+            )
             break
+
+        _log(f"Pass {pass_num}: {len(pending)} shipment(s) pending finalize/print.")
 
         orders = [s.order for s in pending]
         groups = group_consecutive_by_vendor(orders)
@@ -1593,8 +1679,11 @@ def _process_vendor_groups(
 
         selected = _select_rows_for_group(page, cfg, group)
         if selected == 0:
-            _log(f"WARN: no rows selected for {vendor!r}; skipping group.")
-            break
+            raise FedexBatchError(
+                f"Could not check any row checkboxes for vendor {vendor!r} "
+                f"({len(group)} shipment(s): {', '.join(refs)}). "
+                "FedEx may have changed the shipment table UI."
+            )
 
         list_page = page
         _finalize_and_print_manual(page, cfg)
@@ -1908,18 +1997,31 @@ def run_fedex_batch(
                 skip_auto_login=skip_auto_login,
             )
 
+            ready_count = 0
             if not skip_upload:
                 _upload_lowes_csv(page, cfg, upload_csv)
-                _wait_for_batch_ready(page, csv_basename)
+                ready_count = _wait_for_batch_ready(page, csv_basename)
                 mark_file_used(csv_basename, note="uploaded to FedEx batch")
             else:
                 _log("skip_upload: opening existing batch from table…")
 
             _open_batch_shipments(page, cfg, csv_basename)
-            saved, printed = _process_vendor_groups(page, context, cfg, order_date=d)
+            saved, printed = _process_vendor_groups(
+                page,
+                context,
+                cfg,
+                order_date=d,
+                expected_row_count=ready_count,
+            )
             _log(f"Saved {saved} vendor label PDF(s) to share.")
             if printed:
                 _log(f"Printed {printed} warehouse vendor group(s) on Zebra.")
+
+            if ready_count > 0 and saved == 0 and printed == 0:
+                raise FedexBatchError(
+                    f"Batch had {ready_count} shipment(s) ready to finalize but no labels were "
+                    "saved or printed. Skipping shipment report export."
+                )
 
             _export_shipment_report_for_tracking(page, cfg)
 
