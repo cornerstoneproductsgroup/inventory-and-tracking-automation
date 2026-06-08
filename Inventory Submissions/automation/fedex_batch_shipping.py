@@ -1604,8 +1604,80 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
     return selected
 
 
-def _finalize_and_print_manual(page: Page, cfg: dict[str, Any]) -> None:
-    """Open Finalize dropdown → Finalize and print manually → print preview tab."""
+def _label_tab_timeout_ms(cfg: dict[str, Any]) -> int:
+    timing = cfg.get("timing") or {}
+    raw = (
+        str(timing.get("label_tab_timeout_ms") or "")
+        or (os.environ.get("FEDEX_LABEL_TAB_TIMEOUT_MS") or "90000")
+    ).strip()
+    try:
+        return max(15_000, int(raw))
+    except ValueError:
+        return 90_000
+
+
+def _is_batch_list_page_content(p: Page) -> bool:
+    """True when a page/tab is the FedEx batch shipment list (not a label PDF)."""
+    try:
+        body = (p.locator("body").inner_text(timeout=3000) or "").lower()
+    except Exception:
+        return False
+    markers = (
+        "batch shipping",
+        "shipment selected",
+        "clear selection",
+        "ready to be finalized",
+        "documents not printed",
+        "shipment created & printed",
+        "batch uploads",
+    )
+    return sum(1 for m in markers if m in body) >= 2
+
+
+def _looks_like_label_tab(p: Page, list_page: Page) -> bool:
+    if p == list_page:
+        url = (p.url or "").lower()
+        if "blob:" in url or url.endswith(".pdf"):
+            return not _is_batch_list_page_content(p)
+        return False
+    if _is_batch_list_page_content(p):
+        return False
+    url = (p.url or "").lower()
+    if "blob:" in url or ".pdf" in url or "print" in url:
+        return True
+    try:
+        if p.locator("embed[type='application/pdf']").count() > 0:
+            return True
+        if p.locator(".pdfViewer, #viewer").count() > 0:
+            return True
+    except Exception:
+        pass
+    return True
+
+
+def _wait_for_label_tab(
+    list_page: Page,
+    context: BrowserContext,
+    pages_before: set[Page],
+    *,
+    timeout_ms: int,
+) -> Page | None:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for candidate in context.pages:
+            if candidate in pages_before:
+                continue
+            if _looks_like_label_tab(candidate, list_page):
+                return candidate
+        url = (list_page.url or "").lower()
+        if ("blob:" in url or ".pdf" in url) and not _is_batch_list_page_content(list_page):
+            return list_page
+        list_page.wait_for_timeout(350)
+    return None
+
+
+def _click_finalize_and_print_manual(page: Page, cfg: dict[str, Any]) -> None:
+    """Open Finalize dropdown → Finalize and print manually (label tab opens separately)."""
     _log("Opening Finalize menu…")
     opened = _click_any(
         page,
@@ -1665,32 +1737,87 @@ def _finalize_and_print_manual(page: Page, cfg: dict[str, Any]) -> None:
     if not menu_clicked:
         raise FedexBatchError('Could not click "Finalize and print manually".')
 
-    page.wait_for_timeout(1200)
+
+def _finalize_and_open_label_tab(
+    list_page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+) -> Page:
+    """Click Finalize and print manually; return the new tab that contains label PDF(s)."""
+    pages_before = set(context.pages)
+    tab_timeout = _label_tab_timeout_ms(cfg)
+    label_tab: Page | None = None
+
+    try:
+        with context.expect_page(timeout=tab_timeout) as page_info:
+            _click_finalize_and_print_manual(list_page, cfg)
+        label_tab = page_info.value
+        _log("Label tab opened (expect_page).")
+    except PlaywrightTimeout:
+        _log("Waiting for label tab after Finalize and print manually…")
+        label_tab = _wait_for_label_tab(
+            list_page, context, pages_before, timeout_ms=tab_timeout
+        )
+
+    if label_tab is None:
+        raise FedexBatchError(
+            "FedEx did not open a label browser tab after Finalize and print manually. "
+            "Confirm labels open in a new tab when you finalize manually."
+        )
+
+    if _is_batch_list_page_content(label_tab):
+        raise FedexBatchError(
+            "Opened tab is still the batch shipment list, not shipping labels. "
+            "Refusing to save the wrong page as a label PDF."
+        )
+
+    try:
+        label_tab.wait_for_load_state("domcontentloaded", timeout=30_000)
+    except PlaywrightTimeout:
+        _log("WARN: label tab domcontentloaded timeout — continuing.")
+    label_tab.wait_for_timeout(min(pdf_page_wait_ms(), 6000))
+    _log(f"Label tab ready: {label_tab.url[:140]}")
+    return label_tab
 
 
-def _print_preview_candidate_pages(page: Page, context: BrowserContext) -> list[Page]:
-    pages = list(context.pages)
-    candidates = [p for p in pages if p != page]
-    if not candidates:
-        candidates = [page]
-
-    def _score(p: Page) -> int:
-        url = (p.url or "").lower()
-        if "pdf" in url or "print" in url or "blob:" in url:
-            return 1
-        return 0
-
-    return sorted(candidates, key=_score)
-
-
-def _close_print_preview_pages(page: Page, context: BrowserContext) -> None:
-    for candidate in _print_preview_candidate_pages(page, context):
-        if candidate == page:
+def _close_label_tabs(
+    list_page: Page,
+    context: BrowserContext,
+    pages_before: set[Page],
+) -> None:
+    """Close label tab(s) opened for printing; keep the batch shipment list tab."""
+    for candidate in list(context.pages):
+        if candidate == list_page:
+            continue
+        if candidate in pages_before:
             continue
         try:
             candidate.close()
+            _log("Closed label tab.")
         except Exception:
             pass
+    try:
+        list_page.bring_to_front()
+    except Exception:
+        pass
+
+
+def _pdf_looks_like_batch_list_ui(path: Path) -> bool:
+    try:
+        head = path.read_bytes()[:24_000]
+    except OSError:
+        return True
+    if not head.startswith(b"%PDF"):
+        return True
+    text = head.decode("latin-1", errors="ignore").upper()
+    markers = (
+        "BATCH SHIPPING",
+        "SHIPMENT SELECTED",
+        "CLEAR SELECTION",
+        "READY TO BE FINALIZED",
+        "DOCUMENTS NOT PRINTED",
+    )
+    return sum(1 for m in markers if m in text) >= 2
 
 
 def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
@@ -1725,28 +1852,40 @@ def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
             return False
 
 
-def _capture_print_preview_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
-    for candidate in reversed(_print_preview_candidate_pages(page, context)):
-        if _cdp_save_pdf(candidate, context, dest):
-            return True
-    return False
-
-
-def _save_print_pdf(page: Page, context: BrowserContext, dest: Path, cfg: dict[str, Any]) -> bool:
-    """Save label PDF from print preview tab or native Save dialog."""
+def _save_pdf_from_label_tab(
+    label_tab: Page,
+    context: BrowserContext,
+    dest: Path,
+    cfg: dict[str, Any],
+) -> bool:
+    """Save shipping label PDF from the tab FedEx opens after Finalize and print manually."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    _log(f"Saving label PDF → {dest}")
+    _log(f"Saving label PDF from print tab → {dest}")
 
-    if _capture_print_preview_pdf(page, context, dest):
-        _log(f"Saved via print-to-PDF ({dest.stat().st_size:,} bytes)")
-        _close_print_preview_pages(page, context)
-        return True
+    if _is_batch_list_page_content(label_tab):
+        _log("ERROR: refusing to save — target tab is the batch list, not labels.")
+        return False
 
-    if bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
-        if fill_save_as_dialog(dest, timeout_s=label_save_timeout_s()):
-            return True
+    if not _cdp_save_pdf(label_tab, context, dest):
+        if bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
+            if fill_save_as_dialog(dest, timeout_s=label_save_timeout_s()):
+                pass
+        if not dest.is_file() or dest.stat().st_size < 500:
+            return False
 
-    return dest.is_file() and dest.stat().st_size > 500
+    if _pdf_looks_like_batch_list_ui(dest):
+        _log(
+            "ERROR: saved file looks like the batch list UI, not shipping labels — "
+            "deleting bad PDF."
+        )
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+    _log(f"Saved shipping labels ({dest.stat().st_size:,} bytes) → {dest.name}")
+    return True
 
 
 def _zebra_label_printer() -> str:
@@ -1757,8 +1896,14 @@ def _zebra_label_printer() -> str:
     )
 
 
-def _print_label_pdf(page: Page, context: BrowserContext, cfg: dict[str, Any], *, vendor: str) -> bool:
-    """Capture FedEx print preview to a temp PDF and send to the warehouse Zebra."""
+def _print_label_pdf(
+    label_tab: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    *,
+    vendor: str,
+) -> bool:
+    """Capture label PDF from the print tab and send to the warehouse Zebra."""
     fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="fedex_warehouse_label_")
     os.close(fd)
     dest = Path(tmp_name)
@@ -1766,8 +1911,8 @@ def _print_label_pdf(page: Page, context: BrowserContext, cfg: dict[str, Any], *
     _log(f"Warehouse vendor {vendor!r}: printing labels on {printer!r} (not saving to share)")
 
     try:
-        if not _capture_print_preview_pdf(page, context, dest):
-            _log(f"WARN: could not capture print preview PDF for {vendor!r}")
+        if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
+            _log(f"WARN: could not capture label PDF for {vendor!r}")
             return False
         print_pdf_windows(dest, printer)
         time.sleep(2.0)
@@ -1777,7 +1922,6 @@ def _print_label_pdf(page: Page, context: BrowserContext, cfg: dict[str, Any], *
         _log(f"ERROR: Zebra print failed for {vendor!r}: {exc}")
         return False
     finally:
-        _close_print_preview_pages(page, context)
         try:
             dest.unlink(missing_ok=True)
         except OSError:
@@ -1865,26 +2009,24 @@ def _process_vendor_groups(
             )
 
         list_page = page
-        _finalize_and_print_manual(page, cfg)
-        if is_warehouse_print_vendor(vendor):
-            if _print_label_pdf(page, context, cfg, vendor=vendor):
-                printed_groups += 1
-            else:
-                _log(f"WARN: could not print labels on Zebra for {vendor!r}")
-        else:
-            dest = vendor_label_pdf_path(vendor, order_date)
-            if _save_print_pdf(page, context, dest, cfg):
-                saved_pdfs += 1
-                _log(f"Saved {dest.name}")
-            else:
-                _log(f"WARN: could not save PDF for {vendor!r}")
-
+        pages_before = set(context.pages)
+        label_tab = _finalize_and_open_label_tab(list_page, context, cfg)
         try:
-            list_page.bring_to_front()
-        except Exception:
-            pass
-        page.wait_for_timeout(1500)
-        page.wait_for_load_state("domcontentloaded")
+            if is_warehouse_print_vendor(vendor):
+                if _print_label_pdf(label_tab, context, cfg, vendor=vendor):
+                    printed_groups += 1
+                else:
+                    _log(f"WARN: could not print labels on Zebra for {vendor!r}")
+            else:
+                dest = vendor_label_pdf_path(vendor, order_date)
+                if _save_pdf_from_label_tab(label_tab, context, dest, cfg):
+                    saved_pdfs += 1
+                else:
+                    _log(f"WARN: could not save label PDF for {vendor!r}")
+        finally:
+            _close_label_tabs(list_page, context, pages_before)
+            page.wait_for_timeout(1200)
+            page.wait_for_load_state("domcontentloaded")
 
     return saved_pdfs, printed_groups
 
