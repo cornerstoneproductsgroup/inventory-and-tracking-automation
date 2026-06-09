@@ -428,6 +428,104 @@ def _filename_matches(edit_hwnd: int, dest: Path) -> bool:
     return c == want_name.lower() or c == want_stem.lower()
 
 
+def _enum_visible_dialog_hwnds() -> list[tuple[int, str]]:
+    try:
+        import win32gui
+    except ImportError:
+        return []
+
+    found: list[tuple[int, str]] = []
+
+    def _cb(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        cls = win32gui.GetClassName(hwnd) or ""
+        if cls != "#32770":
+            return True
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+        found.append((hwnd, title))
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    return found
+
+
+def _dialog_text_blob(hwnd: int) -> str:
+    parts = [_dialog_title(hwnd), *_safe_enum_child_text(hwnd)]
+    return " ".join(p for p in parts if p)
+
+
+def _safe_enum_child_text(hwnd: int) -> list[str]:
+    import win32gui
+
+    parts: list[str] = []
+
+    def _cb(child, _):
+        try:
+            text = (win32gui.GetWindowText(child) or "").strip()
+            if text:
+                parts.append(text)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+    except Exception:
+        pass
+    return parts
+
+
+def _click_ok_on_dialog(hwnd: int, *, label: str = "dialog") -> bool:
+    import win32con
+    import win32gui
+
+    _focus_dialog(hwnd)
+    time.sleep(0.15)
+    for dlg_id in (1, 2):
+        try:
+            ok_btn = win32gui.GetDlgItem(hwnd, dlg_id)
+            if not ok_btn:
+                continue
+            text = (win32gui.GetWindowText(ok_btn) or "").strip().lower().replace("&", "")
+            if text not in ("ok", ""):
+                continue
+            win32gui.PostMessage(ok_btn, win32con.BM_CLICK, 0, 0)
+            _log(f"Clicked OK on {label!r}.")
+            time.sleep(0.35)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def dismiss_worldship_could_not_print_dialog(*, timeout_s: float = 8.0) -> bool:
+    """
+  WorldShip shows a small OK dialog when Save Print Output closes without printing.
+  Click OK so the batch can open the next Save dialog.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for hwnd, title in _enum_visible_dialog_hwnds():
+            blob = _dialog_text_blob(hwnd).lower()
+            if "could not print" in blob or "unable to print" in blob:
+                if _click_ok_on_dialog(hwnd, label=title or "could not print"):
+                    return True
+        time.sleep(0.25)
+    return False
+
+
+def recover_after_failed_worldship_save(
+    *,
+    previous_hwnd: int = 0,
+    timeout_s: float = 20.0,
+) -> int:
+    """After a failed save: dismiss Could not print, wait for the next Save dialog."""
+    dismiss_worldship_could_not_print_dialog()
+    time.sleep(0.6)
+    return wait_for_next_save_dialog(previous_hwnd=previous_hwnd, timeout_s=timeout_s)
+
+
 def _click_save_button(hwnd: int) -> bool:
     """
     Click the Save button on the Save Print Output As dialog only.
@@ -673,6 +771,15 @@ def _click_save_and_confirm(
     pause = _pause_s("WORLDSHIP_SAVE_BEFORE_CLICK_S", 0.35)
     time.sleep(pause)
 
+    # Re-read immediately before Save — never click if PO filename is empty or wrong.
+    if not _assert_ready_to_save(hwnd, dest):
+        current = _read_filename_field(hwnd) or "(empty)"
+        _log(
+            f"ERROR: refusing Save — filename not ready before click "
+            f"(have {current!r}, want {dest.name!r})."
+        )
+        return False
+
     save_clicked_at = time.time()
     if not _click_save_button(hwnd):
         return False
@@ -867,9 +974,9 @@ def fill_save_as_dialog(
 
     if not _dialog_still_open(hwnd):
         _log(
-            "ERROR: Save dialog closed but file was not written to the target path. "
-            "Fix folder/filename manually before the next label."
+            "WARN: Save dialog closed but file was not written to the target path."
         )
+        dismiss_worldship_could_not_print_dialog()
         return False
 
     return False

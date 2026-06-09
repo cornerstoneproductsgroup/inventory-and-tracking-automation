@@ -200,22 +200,22 @@ def _open_fedex_browser(
         seen.add(channel)
         label = channel or "playwright chromium"
         try:
-            common: dict[str, Any] = {
+            launch_kwargs: dict[str, Any] = {
                 "headless": headless,
                 "slow_mo": slow_mo,
                 "args": args,
-                "accept_downloads": True,
             }
             if ignore_default_args:
-                common["ignore_default_args"] = ignore_default_args
+                launch_kwargs["ignore_default_args"] = ignore_default_args
             if channel:
-                common["channel"] = channel
+                launch_kwargs["channel"] = channel
 
             if user_data_dir is not None:
                 user_data_dir.mkdir(parents=True, exist_ok=True)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
-                    **common,
+                    accept_downloads=True,
+                    **launch_kwargs,
                 )
                 _apply_fedex_stealth(context)
                 page = context.pages[0] if context.pages else context.new_page()
@@ -225,7 +225,7 @@ def _open_fedex_browser(
                 )
                 return None, context, page, True
 
-            browser = p.chromium.launch(**common)
+            browser = p.chromium.launch(**launch_kwargs)
             storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
             context = browser.new_context(
                 accept_downloads=True,

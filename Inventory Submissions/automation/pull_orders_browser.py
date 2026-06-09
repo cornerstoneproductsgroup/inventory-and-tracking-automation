@@ -137,28 +137,28 @@ def open_pull_orders_browser(
         seen.add(channel)
         label = channel or "playwright chromium"
         try:
-            common: dict[str, Any] = {
+            launch_kwargs: dict[str, Any] = {
                 "headless": headless,
                 "slow_mo": slow_mo,
                 "args": args,
-                "accept_downloads": True,
                 "ignore_default_args": ["--enable-automation"],
             }
             if channel:
-                common["channel"] = channel
+                launch_kwargs["channel"] = channel
 
             if user_data_dir is not None:
                 user_data_dir.mkdir(parents=True, exist_ok=True)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
-                    **common,
+                    accept_downloads=True,
+                    **launch_kwargs,
                 )
                 _apply_stealth(context)
                 page = context.pages[0] if context.pages else context.new_page()
                 _log(f"{leg}: {label} with persistent profile ({user_data_dir})")
                 return None, context, page, True
 
-            browser = p.chromium.launch(**common)
+            browser = p.chromium.launch(**launch_kwargs)
             state = storage_state if storage_state and storage_state.is_file() else None
             context = browser.new_context(
                 accept_downloads=True,

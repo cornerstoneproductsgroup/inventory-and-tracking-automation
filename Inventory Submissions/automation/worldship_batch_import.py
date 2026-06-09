@@ -1317,13 +1317,28 @@ def _pause_between_labels(*, previous_hwnd: int, saved_dest: Path) -> None:
     if not wait_for_save_dialog_handoff(
         previous_hwnd, timeout_s=8.0, saved_dest=saved_dest
     ):
-        raise RuntimeError(
-            "The same Save Print Output As window did not close after save. "
-            "If the next label dialog is already open, pull the latest script update."
+        _log(
+            "WARN: Save Print Output window may still be open — "
+            "continuing to wait for the next label dialog."
         )
 
 
-def _run_save_label_phase(plan) -> int:
+def _log_failed_label_summary(failed: list[dict[str, str]]) -> None:
+    if not failed:
+        return
+    _log("=" * 62)
+    _log(
+        f"LABELS NOT SAVED ON DISK ({len(failed)}) — re-print these PO(s) manually:"
+    )
+    for entry in failed:
+        _log(
+            f"  PO {entry['po']!r} (row {entry['row']}, save {entry['index']}/{entry['total']}) "
+            f"→ {entry['dest']}"
+        )
+    _log("=" * 62)
+
+
+def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
     """Phase 1: consecutive Save dialogs — one per save_items entry, strict verify."""
     from automation.windows_save_as import (
         fill_save_as_dialog,
@@ -1334,7 +1349,7 @@ def _run_save_label_phase(plan) -> int:
 
     items = plan.save_items
     if not items:
-        return 0
+        return 0, []
 
     _log(f"=== Phase 1/2: SAVE {len(items)} label(s) to share ===")
     from automation.windows_save_as import reset_last_save_folder
@@ -1347,6 +1362,7 @@ def _run_save_label_phase(plan) -> int:
     )
     last_hwnd = 0
     saved = 0
+    failed: list[dict[str, str]] = []
 
     for item in items:
         order = item.order
@@ -1411,25 +1427,58 @@ def _run_save_label_phase(plan) -> int:
         _log(f"  → folder: {dest.parent}")
         _log(f"  → file:   {dest.name}")
 
-        if not fill_save_as_dialog(
-            dest,
-            timeout_s=90.0,
-            dialog_hwnd=dialog_hwnd,
-            po=order.po,
-            sku=order.sku,
-        ):
-            raise RuntimeError(
-                f"Failed to save label {item.index}/{len(items)} for PO {order.po!r} "
-                f"(row {order.row_number}) to:\n  {dest}"
+        from automation.windows_save_as import recover_after_failed_worldship_save
+
+        save_ok = False
+        try:
+            save_ok = fill_save_as_dialog(
+                dest,
+                timeout_s=90.0,
+                dialog_hwnd=dialog_hwnd,
+                po=order.po,
+                sku=order.sku,
             )
-        _verify_saved_label(dest, order)
+            if save_ok:
+                _verify_saved_label(dest, order)
+        except Exception as exc:
+            _log(f"WARN: save verification failed for PO {order.po!r}: {exc}")
+            save_ok = False
+
+        if not save_ok:
+            failed.append(
+                {
+                    "po": order.po,
+                    "row": str(order.row_number),
+                    "index": str(item.index),
+                    "total": str(len(items)),
+                    "dest": str(dest),
+                }
+            )
+            _log(
+                f"WARN: skipping PO {order.po!r} (save {item.index}/{len(items)}) — "
+                "file not on disk; continuing batch."
+            )
+            next_hwnd = recover_after_failed_worldship_save(
+                previous_hwnd=last_hwnd,
+                timeout_s=min(90.0, save_dialog_timeout_s(first=False)),
+            )
+            if next_hwnd:
+                last_hwnd = next_hwnd
+            continue
+
         saved += 1
         _log(f"Completed save {saved}/{len(items)}: {dest.name}")
         if item.index < len(items):
             _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=dest)
 
-    _log(f"Phase 1 complete: {saved} label(s) saved and verified.")
-    return saved
+    _log(f"Phase 1 complete: {saved}/{len(items)} label(s) saved and verified.")
+    if failed:
+        _log(
+            f"WARN: {len(failed)} label(s) were not saved on disk — "
+            "batch will continue; re-print failed POs listed below."
+        )
+        _log_failed_label_summary(failed)
+    return saved, failed
 
 
 def _run_warehouse_print_phase(plan) -> int:
@@ -1468,10 +1517,10 @@ def _save_shipping_labels(app, main) -> int:
     )
     log_worldship_label_work_plan(plan, vendor_maps)
 
-    saved = _run_save_label_phase(plan)
-    if saved != len(plan.save_items):
-        raise RuntimeError(
-            f"Expected {len(plan.save_items)} saved label(s), completed {saved}."
+    saved, failed_labels = _run_save_label_phase(plan)
+    if failed_labels:
+        _log(
+            f"Continuing WorldShip batch with {len(failed_labels)} label(s) to re-print later."
         )
 
     if plan.save_items and plan.print_orders:
@@ -1495,10 +1544,13 @@ def _save_shipping_labels(app, main) -> int:
 
     run_after_print_workflow(app, main, print_label_count=printed)
 
-    _log(
+    summary = (
         f"Label processing complete: {saved} saved to share, "
         f"{printed} warehouse print, End of Day + Batch Export done."
     )
+    if failed_labels:
+        summary += f" {len(failed_labels)} PO(s) need manual re-print (see list above)."
+    _log(summary)
     return saved
 
 
