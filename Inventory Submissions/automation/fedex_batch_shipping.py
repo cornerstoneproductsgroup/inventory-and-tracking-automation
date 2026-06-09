@@ -1576,7 +1576,13 @@ def _is_row_checked(row, cfg: dict[str, Any]) -> bool:
         return False
 
 
-def _click_row_checkbox(row, cfg: dict[str, Any], ref: str) -> bool:
+def _click_row_checkbox(
+    row,
+    cfg: dict[str, Any],
+    ref: str,
+    *,
+    ctrl_click: bool = False,
+) -> bool:
     try:
         row.scroll_into_view_if_needed(timeout=5000)
     except Exception:
@@ -1584,7 +1590,20 @@ def _click_row_checkbox(row, cfg: dict[str, Any], ref: str) -> bool:
     if _is_row_checked(row, cfg):
         return True
 
+    page = row.page
     cb_sel = _sel(cfg, "row_checkbox", "input[type='checkbox']")
+
+    def _do_click(click_fn) -> bool:
+        if ctrl_click:
+            page.keyboard.down("Control")
+        try:
+            click_fn()
+            page.wait_for_timeout(300)
+            return _is_row_checked(row, cfg)
+        finally:
+            if ctrl_click:
+                page.keyboard.up("Control")
+
     for label_sel in (
         "label.fdx-c-form-group__label[data-test-id='label']",
         "label.fdx-c-form-group__label",
@@ -1593,9 +1612,7 @@ def _click_row_checkbox(row, cfg: dict[str, Any], ref: str) -> bool:
         label = row.locator(label_sel).first
         try:
             if label.count() > 0 and label.is_visible():
-                label.click(timeout=8000)
-                row.page.wait_for_timeout(250)
-                if _is_row_checked(row, cfg):
+                if _do_click(lambda: label.click(timeout=8000)):
                     return True
         except Exception:
             continue
@@ -1604,15 +1621,20 @@ def _click_row_checkbox(row, cfg: dict[str, Any], ref: str) -> bool:
     try:
         if cb.count() > 0:
             if not cb.is_checked():
-                cb.click(timeout=8000)
-            row.page.wait_for_timeout(250)
-            if _is_row_checked(row, cfg):
-                return True
+                if _do_click(lambda: cb.click(timeout=8000)):
+                    return True
+            return _is_row_checked(row, cfg)
     except Exception:
         pass
     try:
-        cb.check(force=True, timeout=8000)
-        row.page.wait_for_timeout(250)
+        if ctrl_click:
+            page.keyboard.down("Control")
+        try:
+            cb.check(force=True, timeout=8000)
+        finally:
+            if ctrl_click:
+                page.keyboard.up("Control")
+        page.wait_for_timeout(250)
         return _is_row_checked(row, cfg)
     except Exception as exc:
         _log(f"WARN: could not check row {ref!r}: {exc}")
@@ -1666,14 +1688,16 @@ def _select_rows_for_group(page: Page, cfg: dict[str, Any], group: list[Referenc
     expected = len(group)
     for attempt in range(1, 4):
         missing = []
-        for order in group:
+        for idx, order in enumerate(group):
             ref = order.reference
             row = _find_shipment_row_for_reference(page, cfg, ref)
             if row is None:
                 missing.append(ref)
                 continue
-            if not _click_row_checkbox(row, cfg, ref):
+            if not _click_row_checkbox(row, cfg, ref, ctrl_click=idx > 0):
                 missing.append(ref)
+            else:
+                _log(f"  Checked row {ref!r}")
 
         checked_refs = _count_checked_refs(page, cfg, group)
         ui_selected = _read_shipments_selected_count(page)
@@ -2080,6 +2104,62 @@ def _pdf_is_valid_label(path: Path) -> bool:
     return True
 
 
+def _label_save_verify_timeout_s() -> float:
+    raw = (os.environ.get("FEDEX_LABEL_SAVE_VERIFY_TIMEOUT_S") or "25").strip()
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 25.0
+
+
+def _wait_label_pdf_on_disk(dest: Path, *, timeout_s: float | None = None) -> bool:
+    """UNC shares can lag — poll until the PDF exists and looks like a real label."""
+    deadline = time.monotonic() + (timeout_s or _label_save_verify_timeout_s())
+    while time.monotonic() < deadline:
+        if _pdf_is_valid_label(dest):
+            return True
+        time.sleep(0.5)
+    return _pdf_is_valid_label(dest)
+
+
+def _persist_label_pdf_to_disk(dest: Path, data: bytes) -> bool:
+    """Write PDF bytes and confirm the file exists at the exact target path."""
+    if len(data) < 800 or not data.startswith(b"%PDF"):
+        return False
+    dest = dest.resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(f"{dest.stem}.partial{dest.suffix}")
+    try:
+        partial.write_bytes(data)
+        if not _pdf_is_valid_label(partial):
+            return False
+        if dest.is_file():
+            dest.unlink()
+        partial.replace(dest)
+    except OSError as exc:
+        _log(f"ERROR: could not write label PDF to {dest}: {exc}")
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            if partial.is_file():
+                partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if _wait_label_pdf_on_disk(dest):
+        return True
+    _log(f"ERROR: label PDF not found on disk after write: {dest}")
+    try:
+        dest.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
 def _save_via_edge_pdf_viewer(page: Page, dest: Path, *, timeout_s: float) -> bool:
     """Edge built-in PDF viewer: Ctrl+S / Save → download or Windows Save As."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2111,7 +2191,7 @@ def _save_via_edge_pdf_viewer(page: Page, dest: Path, *, timeout_s: float) -> bo
         return False
     if not fill_save_as_dialog(dest, timeout_s=timeout_s, dialog_hwnd=hwnd):
         return False
-    return _pdf_is_valid_label(dest)
+    return _wait_label_pdf_on_disk(dest, timeout_s=_label_save_verify_timeout_s())
 
 
 def _cdp_save_pdf(page: Page, context: BrowserContext, dest: Path) -> bool:
@@ -2165,34 +2245,49 @@ def _save_pdf_from_label_tab(
         _log("WARN: label PDF may not be fully loaded yet — trying capture anyway.")
 
     saved = False
+    verify_s = _label_save_verify_timeout_s()
+
     pdf_bytes = _fetch_label_pdf_bytes(label_tab, context)
-    if pdf_bytes:
-        dest.write_bytes(pdf_bytes)
-        saved = _pdf_is_valid_label(dest)
+    if pdf_bytes and _persist_label_pdf_to_disk(dest, pdf_bytes):
+        saved = True
 
     if not saved and bool(cfg.get("label_save", {}).get("use_native_save_dialog", True)):
-        saved = _save_via_edge_pdf_viewer(
+        if _save_via_edge_pdf_viewer(
             label_tab, dest, timeout_s=label_save_timeout_s()
-        )
+        ) and _wait_label_pdf_on_disk(dest, timeout_s=verify_s):
+            saved = True
 
     if not saved:
-        _log("WARN: blob/HTTP/download capture failed; trying printToPDF as last resort.")
-        if _cdp_save_pdf(label_tab, context, dest):
-            saved = _pdf_is_valid_label(dest)
+        _log("WARN: blob/download capture failed; trying printToPDF as last resort.")
+        fd, tmp_name = tempfile.mkstemp(suffix=".pdf", prefix="fedex_label_cdp_")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            if _cdp_save_pdf(label_tab, context, tmp) and _pdf_is_valid_label(tmp):
+                data = tmp.read_bytes()
+                saved = _persist_label_pdf_to_disk(dest, data)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    if not saved:
+    if not saved or not _wait_label_pdf_on_disk(dest, timeout_s=verify_s):
         try:
             dest.unlink(missing_ok=True)
         except OSError:
             pass
         _log(
-            "ERROR: could not capture a valid label PDF. "
-            "Edge printToPDF on the PDF viewer produces blank pages — "
-            "confirm the label tab shows FedEx labels before finalize."
+            f"ERROR: label PDF was not saved to disk at:\n  {dest}\n"
+            "Confirm the label tab shows FedEx labels and the share folder is writable."
         )
         return False
 
-    _log(f"Saved shipping labels ({dest.stat().st_size:,} bytes) → {dest.name}")
+    size = dest.stat().st_size
+    pages = _count_pdf_pages(dest)
+    _log(
+        f"Confirmed label PDF on disk ({size:,} bytes, {pages} page(s)) → {dest}"
+    )
     return True
 
 
@@ -2571,6 +2666,133 @@ def _capture_label_from_finalize(
     return _finalize_and_open_label_tab(list_page, context, cfg)
 
 
+def _finalize_and_save_vendor_group(
+    page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    group: list[ReferenceOrder],
+    *,
+    order_date: date | None,
+) -> tuple[bool, int]:
+    """Select all rows in the group, Finalize once, save/print one label PDF."""
+    vendor = group[0].vendor_folder
+    warehouse = is_warehouse_print_vendor(vendor)
+    refs = [o.reference for o in group]
+
+    if len(group) > 1:
+        _log(
+            f"  → Checking all {len(group)} row(s) together, then one Finalize: "
+            f"{', '.join(refs)}"
+        )
+
+    pages_before = set(context.pages)
+    try:
+        label_tab = _capture_label_from_finalize(page, context, cfg, orders=group)
+        try:
+            if warehouse:
+                printer = _zebra_label_printer()
+                ok = _print_warehouse_label_with_fallback(
+                    label_tab,
+                    context,
+                    cfg,
+                    printer=printer,
+                    order_ref=refs[0] if len(refs) == 1 else f"{vendor} ({len(group)} labels)",
+                )
+                return ok, len(group) if ok else 0
+
+            dest = vendor_label_pdf_path(vendor, order_date)
+            if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
+                return False, 0
+            pages = _count_pdf_pages(dest)
+            if pages < len(group):
+                _log(
+                    f"WARN: saved PDF has {pages} page(s) but {len(group)} "
+                    f"shipment(s) were selected for {vendor!r}."
+                )
+            return True, pages
+        finally:
+            _close_label_tabs(page, context, pages_before)
+            settle_ms = warehouse_after_print_ms() if warehouse else 1200
+            page.wait_for_timeout(settle_ms)
+            try:
+                page.wait_for_load_state("domcontentloaded")
+            except PlaywrightTimeout:
+                pass
+    except FedexBatchError:
+        raise
+    except Exception as exc:
+        _log(f"ERROR: batch finalize/save failed for {vendor!r}: {exc}")
+        return False, 0
+
+
+def _process_vendor_group_labels_sequential(
+    page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    group: list[ReferenceOrder],
+    *,
+    order_date: date | None,
+) -> tuple[bool, int]:
+    """Fallback: one row at a time when batch select/finalize fails."""
+    vendor = group[0].vendor_folder
+    warehouse = is_warehouse_print_vendor(vendor)
+    label_parts: list[Path] = []
+    printed_jobs = 0
+
+    _log(f"  → Fallback: finalize {len(group)} shipment(s) one at a time for {vendor!r}")
+    for idx, order in enumerate(group, start=1):
+        pages_before = set(context.pages)
+        try:
+            label_tab = _capture_label_from_finalize(
+                page, context, cfg, orders=[order]
+            )
+            try:
+                if warehouse:
+                    if _print_warehouse_label_with_fallback(
+                        label_tab,
+                        context,
+                        cfg,
+                        printer=_zebra_label_printer(),
+                        order_ref=order.reference,
+                    ):
+                        printed_jobs += 1
+                else:
+                    fd, tmp_name = tempfile.mkstemp(
+                        suffix=".pdf", prefix=f"fedex_label_{idx}_"
+                    )
+                    os.close(fd)
+                    part = Path(tmp_name)
+                    try:
+                        if _save_pdf_from_label_tab(label_tab, context, part, cfg):
+                            label_parts.append(part)
+                            part = None
+                    finally:
+                        if part is not None:
+                            part.unlink(missing_ok=True)
+            finally:
+                _close_label_tabs(page, context, pages_before)
+                page.wait_for_timeout(1200)
+        except FedexBatchError as exc:
+            _log(f"WARN: sequential save failed for {order.reference!r}: {exc}")
+
+    if warehouse:
+        return printed_jobs > 0, printed_jobs
+
+    if not label_parts:
+        return False, 0
+    dest = vendor_label_pdf_path(vendor, order_date)
+    if len(label_parts) == 1:
+        if not _persist_label_pdf_to_disk(dest, label_parts[0].read_bytes()):
+            return False, 0
+    else:
+        _merge_pdf_files(label_parts, dest)
+        if not _wait_label_pdf_on_disk(dest):
+            return False, 0
+    for part in label_parts:
+        part.unlink(missing_ok=True)
+    return True, _count_pdf_pages(dest)
+
+
 def _process_vendor_group_labels(
     page: Page,
     context: BrowserContext,
@@ -2579,118 +2801,22 @@ def _process_vendor_group_labels(
     *,
     order_date: date | None,
 ) -> tuple[bool, int]:
-    """
-    Finalize and capture labels for one vendor group.
-    Multiple orders are finalized one at a time so every label is saved, then merged.
-    """
+    """Finalize all vendor rows together; fall back to one-at-a-time if needed."""
     vendor = group[0].vendor_folder
-    warehouse = is_warehouse_print_vendor(vendor)
-    label_parts: list[Path] = []
-    printed_jobs = 0
-
     try:
-        for idx, order in enumerate(group, start=1):
-            if len(group) > 1:
-                _log(
-                    f"  Order {idx}/{len(group)} for {vendor!r}: "
-                    f"{order.reference!r} ({order.sku})"
-                )
+        ok, count = _finalize_and_save_vendor_group(
+            page, context, cfg, group, order_date=order_date
+        )
+        if ok:
+            return ok, count
+    except FedexBatchError as exc:
+        _log(f"WARN: batch finalize for {vendor!r} failed: {exc}")
 
-            pages_before = set(context.pages)
-            label_tab = _capture_label_from_finalize(
-                page, context, cfg, orders=[order]
-            )
-            try:
-                if warehouse:
-                    printer = _zebra_label_printer()
-                    if _print_warehouse_label_with_fallback(
-                        label_tab,
-                        context,
-                        cfg,
-                        printer=printer,
-                        order_ref=order.reference,
-                    ):
-                        printed_jobs += 1
-                    else:
-                        _log(
-                            f"WARN: could not print warehouse label for {order.reference!r}"
-                        )
-                else:
-                    fd, tmp_name = tempfile.mkstemp(
-                        suffix=".pdf",
-                        prefix=f"fedex_label_{idx}_",
-                    )
-                    os.close(fd)
-                    part = Path(tmp_name)
-                    try:
-                        if not _save_pdf_from_label_tab(label_tab, context, part, cfg):
-                            _log(
-                                f"WARN: could not capture label PDF for {order.reference!r}"
-                            )
-                            continue
-                        pages = _count_pdf_pages(part)
-                        _log(
-                            f"  Captured label PDF ({pages} page(s)) for {order.reference!r}"
-                        )
-                        label_parts.append(part)
-                        part = None
-                    finally:
-                        if part is not None:
-                            try:
-                                part.unlink(missing_ok=True)
-                            except OSError:
-                                pass
-            finally:
-                _close_label_tabs(page, context, pages_before)
-                settle_ms = warehouse_after_print_ms() if warehouse else 1200
-                page.wait_for_timeout(settle_ms)
-                try:
-                    page.wait_for_load_state("domcontentloaded")
-                except PlaywrightTimeout:
-                    pass
-
-        if warehouse:
-            if printed_jobs == len(group):
-                _log(f"Printed {printed_jobs} Zebra label job(s) for {vendor!r}")
-                return True, printed_jobs
-            _log(
-                f"WARN: printed {printed_jobs}/{len(group)} Zebra label job(s) for {vendor!r}"
-            )
-            return printed_jobs > 0, printed_jobs
-
-        if not label_parts:
-            return False, 0
-        if len(label_parts) != len(group):
-            _log(
-                f"WARN: captured {len(label_parts)}/{len(group)} label PDF(s) for {vendor!r}"
-            )
-
-        dest = vendor_label_pdf_path(vendor, order_date)
-        if len(label_parts) == 1:
-            label_parts[0].replace(dest)
-        else:
-            _merge_pdf_files(label_parts, dest)
-            total_pages = _count_pdf_pages(dest)
-            _log(
-                f"Merged {len(label_parts)} label PDF(s) → {dest.name} "
-                f"({total_pages} page(s))"
-            )
-        for part in label_parts:
-            try:
-                part.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return True, len(label_parts)
-    except FedexBatchError:
-        raise
-    except Exception as exc:
-        _log(f"ERROR: vendor label processing failed for {vendor!r}: {exc}")
-        for part in label_parts:
-            try:
-                part.unlink(missing_ok=True)
-            except OSError:
-                pass
+    if len(group) <= 1:
         return False, 0
+    return _process_vendor_group_labels_sequential(
+        page, context, cfg, group, order_date=order_date
+    )
 
 
 def _print_label_pdf(
@@ -2797,8 +2923,8 @@ def _process_vendor_groups(
             _log(f"  → Save PDF: {dest}")
             if len(group) > 1:
                 _log(
-                    f"  → {len(group)} orders: finalize each shipment separately, "
-                    f"then merge into one PDF"
+                    f"  → {len(group)} orders: check all rows, one Finalize, "
+                    f"one PDF with all labels"
                 )
 
         ok, label_count = _process_vendor_group_labels(
