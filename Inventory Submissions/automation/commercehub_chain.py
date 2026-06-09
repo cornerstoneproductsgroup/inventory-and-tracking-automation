@@ -34,7 +34,7 @@ def main() -> int:
     os.environ["COMMERCEHUB_CHAIN_FAST"] = "1"
 
     try:
-        from automation.config import load_settings
+        from automation.config import apply_rithum_env_to_lowes_config, load_settings
         from automation.depot_rithum_playwright import (
             run_depot_invoicing_with_page,
             run_depot_special_order_invoicing_with_page,
@@ -101,7 +101,7 @@ def main() -> int:
         )
 
         settings = load_settings()
-        config = copy.deepcopy(load_config(args.lowes_config))
+        config = apply_rithum_env_to_lowes_config(copy.deepcopy(load_config(args.lowes_config)))
         delays = config["rithum"].setdefault("login_delays_ms", {})
         for key in list(delays.keys()):
             delays[key] = max(120, int(delays[key]) // 2)

@@ -15,9 +15,42 @@ def _log(msg: str) -> None:
     print(f"[pull-orders/print] {msg}", flush=True)
 
 
+_DATE_IN_WAREHOUSE_NAME = re.compile(r"\d{1,2}-\d{1,2}-\d{4}")
+
+
 def warehouse_pdf_names(d: date | None = None) -> tuple[str, str]:
     stamp = date_stamp(d)
     return f"Warehouse Print {stamp}.pdf", f"Warehouse SOS Tags {stamp}.pdf"
+
+
+def warehouse_pdf_has_expected_date(path: Path, order_date: date | None = None) -> bool:
+    """True when the PDF filename contains only the expected order date stamp."""
+    expected = date_stamp(order_date)
+    if expected not in path.name:
+        return False
+    for found in _DATE_IN_WAREHOUSE_NAME.findall(path.name):
+        if found != expected:
+            return False
+    return True
+
+
+def _validate_warehouse_pdf_for_print(path: Path, order_date: date | None = None) -> None:
+    """Refuse to print warehouse PDFs that are not named for the target order date."""
+    expected = date_stamp(order_date)
+    if not path.is_file():
+        raise FileNotFoundError(f"Warehouse PDF not found: {path}")
+    if not warehouse_pdf_has_expected_date(path, order_date):
+        other_dates = [
+            d for d in _DATE_IN_WAREHOUSE_NAME.findall(path.name) if d != expected
+        ]
+        if other_dates:
+            raise ValueError(
+                f"Refusing to print {path.name}: filename date {other_dates[0]!r} "
+                f"does not match expected {expected!r}."
+            )
+        raise ValueError(
+            f"Refusing to print {path.name}: expected today's date {expected!r} in filename."
+        )
 
 
 def _wait_interval_s() -> float:
@@ -86,7 +119,9 @@ def wait_for_warehouse_pdfs(
     _log(f"  Expect: {sos_name}")
     while time.monotonic() < deadline:
         if _file_stable(print_path) and _file_stable(sos_path):
-            _log("Both warehouse PDFs are ready.")
+            _validate_warehouse_pdf_for_print(print_path, order_date)
+            _validate_warehouse_pdf_for_print(sos_path, order_date)
+            _log("Both warehouse PDFs are ready for today's date.")
             return print_path, sos_path
         time.sleep(interval)
     missing = []
@@ -289,17 +324,26 @@ def print_warehouse_files(
     daily_dir: Path | None = None,
     skip_wait: bool = False,
 ) -> None:
+    target_date = order_date or date.today()
     if skip_wait:
         folder = daily_dir or _DAILY_VENDOR
-        print_name, sos_name = warehouse_pdf_names(order_date)
+        print_name, sos_name = warehouse_pdf_names(target_date)
         print_path = folder / print_name
         sos_path = folder / sos_name
-        if not print_path.is_file() or not sos_path.is_file():
-            raise FileNotFoundError(
-                f"Warehouse PDFs not found in {folder} ({print_name}, {sos_name})."
-            )
+        _validate_warehouse_pdf_for_print(print_path, target_date)
+        _validate_warehouse_pdf_for_print(sos_path, target_date)
     else:
-        print_path, sos_path = wait_for_warehouse_pdfs(order_date=order_date, daily_dir=daily_dir)
+        print_path, sos_path = wait_for_warehouse_pdfs(
+            order_date=target_date, daily_dir=daily_dir
+        )
+
+    _validate_warehouse_pdf_for_print(print_path, target_date)
+    _validate_warehouse_pdf_for_print(sos_path, target_date)
+
+    _log(
+        f"Printing warehouse PDFs for {date_stamp(target_date)}: "
+        f"{print_path.name}, {sos_path.name}"
+    )
 
     office_printer = _resolve_printer(
         "PULL_ORDERS_WAREHOUSE_PRINT_PRINTER",

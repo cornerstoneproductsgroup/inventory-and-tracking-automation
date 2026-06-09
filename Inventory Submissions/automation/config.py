@@ -64,6 +64,29 @@ def load_sps_settings() -> SpsSettings:
     )
 
 
+def apply_rithum_env_to_lowes_config(config: dict) -> dict:
+    """
+    Overlay CommerceHub login from Inventory Submissions/.env onto a Lowe's config dict.
+
+    Same RITHUM_USERNAME / RITHUM_PASSWORD / RITHUM_URL used by commercehub_chain,
+    inventory, and tracking — not credentials embedded in config.json.
+    """
+    _load_env()
+    username = (os.getenv("RITHUM_USERNAME") or "").strip()
+    password = (os.getenv("RITHUM_PASSWORD") or "").strip()
+    login_url = (os.getenv("RITHUM_URL") or "").strip()
+    if not username:
+        raise ValueError(f"Missing RITHUM_USERNAME in {_ENV_FILE} (or environment).")
+    if not password:
+        raise ValueError(f"Missing RITHUM_PASSWORD in {_ENV_FILE} (or environment).")
+    rithum = config.setdefault("rithum", {})
+    rithum["username"] = username
+    rithum["password"] = password
+    if login_url:
+        rithum["login_url"] = login_url
+    return config
+
+
 def load_settings() -> Settings:
     _load_env()
 
