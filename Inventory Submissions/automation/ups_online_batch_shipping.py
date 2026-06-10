@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -25,8 +24,6 @@ from automation.ups_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_HOME_URL,
     STORAGE_STATE,
-    chrome_cdp_port,
-    chrome_executable,
     chrome_profile_directory,
     depot_labels_pdf_path,
     label_save_timeout_s,
@@ -36,6 +33,12 @@ from automation.ups_batch_config import (
     use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
+from automation.ups_chrome_launch import (
+    chrome_process_count,
+    connect_playwright_cdp,
+    launch_chrome_for_cdp,
+    launch_chrome_persistent_playwright,
+)
 from automation.ups_popup_dismiss import clear_blocking_overlays, dismiss_ups_startup_popups
 from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
 from automation.windows_open_file import fill_open_file_dialog
@@ -180,45 +183,22 @@ def _open_system_chrome_via_cdp(
     p: Playwright,
     cfg: dict[str, Any],
 ) -> tuple[Browser, BrowserContext, Page]:
-    exe = chrome_executable()
-    user_data = system_chrome_user_data_dir()
-    if exe is None or user_data is None:
-        raise UpsBatchError(
-            "Google Chrome or Chrome User Data folder not found. "
-            "Install Chrome or set UPS_CHROME_EXE / UPS_CHROME_USER_DATA_DIR."
-        )
-
     home_url = _ups_home_url(cfg)
-    port = chrome_cdp_port()
     profile = chrome_profile_directory()
     _log(
         f"Launching Chrome with your profile ({profile}) and opening UPS… "
         "Close all Chrome windows first."
     )
 
-    cmd = [
-        str(exe),
-        f"--user-data-dir={user_data}",
-        f"--profile-directory={profile}",
-        f"--remote-debugging-port={port}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        "--disable-notifications",
-        home_url,
-    ]
-    subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-    )
+    try:
+        port = launch_chrome_for_cdp(home_url=home_url)
+    except RuntimeError as exc:
+        raise UpsBatchError(str(exc)) from exc
 
-    deadline = time.monotonic() + 60.0
     last_err: Exception | None = None
-    while time.monotonic() < deadline:
+    for _ in range(15):
         try:
-            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            browser = connect_playwright_cdp(p, port)
             if not browser.contexts:
                 time.sleep(0.5)
                 continue
@@ -229,12 +209,38 @@ def _open_system_chrome_via_cdp(
             return browser, context, page
         except Exception as exc:
             last_err = exc
-            time.sleep(0.8)
+            time.sleep(1.0)
 
     raise UpsBatchError(
-        f"Chrome opened but automation could not connect (port {port}). "
-        f"Close all Chrome windows and retry. {last_err}"
+        f"Chrome debug port {port} was ready but Playwright could not attach. {last_err}"
     )
+
+
+def _open_system_chrome_persistent_fallback(
+    p: Playwright,
+    cfg: dict[str, Any],
+    *,
+    headless: bool,
+    slow_mo: int,
+    user_data_dir: Path,
+    launch_args: list[str],
+) -> tuple[None, BrowserContext, Page, bool]:
+    try:
+        context = launch_chrome_persistent_playwright(
+            p,
+            cfg,
+            home_url=_ups_home_url(cfg),
+            headless=headless,
+            slow_mo=slow_mo,
+            launch_args=launch_args,
+        )
+    except RuntimeError as exc:
+        raise UpsBatchError(str(exc)) from exc
+    context.add_init_script(_STEALTH_INIT)
+    page = _pick_ups_page(context, home_url=_ups_home_url(cfg))
+    _ensure_ups_home_page(page, cfg)
+    _log(f"Chrome ready via Playwright — {page.url}")
+    return None, context, page, True
 
 
 def _open_browser(
@@ -260,8 +266,24 @@ def _open_browser(
     if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
         browser_cfg
     ):
-        browser, context, page = _open_system_chrome_via_cdp(p, cfg)
-        return browser, context, page, True
+        try:
+            browser, context, page = _open_system_chrome_via_cdp(p, cfg)
+            return browser, context, page, True
+        except UpsBatchError as exc:
+            _log(f"WARN: CDP Chrome launch failed: {exc}")
+            if chrome_process_count() > 0:
+                raise UpsBatchError(
+                    f"{exc} Close ALL Chrome windows (Task Manager → end chrome.exe), then retry."
+                ) from exc
+            _log("Trying Playwright Chrome profile launcher…")
+            return _open_system_chrome_persistent_fallback(
+                p,
+                cfg,
+                headless=headless,
+                slow_mo=slow_mo,
+                user_data_dir=user_data_dir,
+                launch_args=args,
+            )
 
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
         _log(
