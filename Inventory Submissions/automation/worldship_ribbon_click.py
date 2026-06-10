@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v3"
+_RIBBON_VERSION = "ribbon-click-v4"
 
 
 def _log_default(msg: str) -> None:
@@ -142,39 +142,130 @@ def _click_hwnd(hwnd: int, *, log: Callable[[str], None] | None = None) -> bool:
         return False
 
 
-def _click_rect_center(rect, *, log: Callable[[str], None] | None = None) -> bool:
+def _control_type(target) -> str:
+    try:
+        return (target.element_info.control_type or "").strip()
+    except Exception:
+        return ""
+
+
+def _home_tab_click_y(win) -> int | None:
+    """Y coordinate that reliably hits a ribbon tab (not the window drag border)."""
+    for el in _descendant_controls(win, "Home", ("TabItem", "Button")):
+        try:
+            if not el.is_visible():
+                continue
+            r = el.rectangle()
+            # Use lower half of Home tab — avoids resize/move cursor on top edge.
+            return r.top + max(12, (r.bottom - r.top) * 2 // 3)
+        except Exception:
+            continue
+    return None
+
+
+def _click_point_in_rect(
+    rect,
+    *,
+    control_type: str = "",
+    win=None,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """
+    Click inside a control rect. TabItem rects from UIA often include the window
+    top border; center clicks land on the move/resize zone (four-arrow cursor).
+    """
     from pywinauto import mouse
 
     emit = log or _log_default
     try:
-        x = (rect.left + rect.right) // 2
-        y = (rect.top + rect.bottom) // 2
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        w = right - left
+        h = bottom - top
+        if w < 2 or h < 2:
+            return False
+
+        x = left + w // 2
+        if control_type == "TabItem":
+            home_y = _home_tab_click_y(win) if win is not None else None
+            if home_y is not None:
+                y = home_y
+            else:
+                # Skip top third — that band is window chrome / drag handles.
+                inset_top = max(16, h // 3)
+                y = top + inset_top + (h - inset_top) // 2
+        else:
+            y = top + max(6, h // 2)
+
+        emit(f"Mouse click at ({x}, {y}) [{control_type or 'control'}]")
         mouse.click(button="left", coords=(x, y))
         return True
     except Exception as exc:
-        emit(f"WARN: pywinauto mouse at rect center: {exc}")
+        emit(f"WARN: mouse click in rect: {exc}")
         return False
 
 
-def _try_uia_click(target, *, log: Callable[[str], None] | None = None) -> bool:
+def _try_uia_click(
+    target,
+    *,
+    win=None,
+    log: Callable[[str], None] | None = None,
+) -> bool:
     emit = log or _log_default
-    for method_name in ("invoke", "click", "click_input"):
+    ctype = _control_type(target)
+
+    if ctype == "TabItem":
+        # Tabs use SelectionItem — not Invoke. click_input() hits the drag border.
+        for method_name in ("select", "set_focus"):
+            try:
+                method = getattr(target, method_name)
+                method()
+                time.sleep(0.15)
+                try:
+                    from pywinauto.keyboard import send_keys
+
+                    send_keys("{SPACE}")
+                except Exception:
+                    pass
+                return True
+            except Exception as exc:
+                emit(f"WARN: TabItem {method_name}() failed: {type(exc).__name__}")
+        try:
+            rect = target.rectangle()
+            if _click_point_in_rect(rect, control_type=ctype, win=win, log=emit):
+                return True
+        except Exception:
+            pass
+        return False
+
+    for method_name in ("invoke", "click"):
         try:
             method = getattr(target, method_name)
             method()
             return True
         except Exception as exc:
             emit(f"WARN: {method_name}() failed: {type(exc).__name__}")
+
+    try:
+        rect = target.rectangle()
+        if _click_point_in_rect(rect, control_type=ctype, win=win, log=emit):
+            return True
+    except Exception:
+        pass
+
+    # click_input last — can land on window chrome for ribbon controls.
+    try:
+        target.click_input()
+        return True
+    except Exception as exc:
+        emit(f"WARN: click_input() failed: {type(exc).__name__}")
+
     try:
         ch = int(target.handle)
         if ch:
             return _click_hwnd(ch, log=emit)
     except Exception:
         pass
-    try:
-        return _click_rect_center(target.rectangle(), log=emit)
-    except Exception:
-        return False
+    return False
 
 
 def _enum_hwnds_with_text(root_hwnd: int, needle: str, *, max_depth: int = 24) -> list[int]:
@@ -351,7 +442,7 @@ def _click_import_export_by_position(
     if home_rect is not None:
         offset = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_OFFSET_X", 300.0)
         x = int(home_rect.right + offset)
-        y = (home_rect.top + home_rect.bottom) // 2
+        y = home_rect.top + max(12, (home_rect.bottom - home_rect.top) * 2 // 3)
     else:
         try:
             wr = win.rectangle()
@@ -462,7 +553,7 @@ def click_ribbon(
                 except Exception:
                     continue
                 emit(f"Clicking {title!r} ({ctrl_type}) via UIA…")
-                if _try_uia_click(target, log=emit):
+                if _try_uia_click(target, win=win, log=emit):
                     clicked = True
                     break
             if clicked:
