@@ -9,7 +9,7 @@ from pathlib import Path
 from automation.fedex_batch_config import LOWES_LABELS_ROOT, label_filename, warehouse_label_queue_path
 from automation.fedex_lowes_csv import LowesOrderRow
 from automation.warehouse_print_vendors import is_warehouse_print_vendor
-from automation.worldship_vendor_map import VendorMapRegistry, lookup_vendor_folder, load_vendor_map
+from automation.fedex_reference import vendor_for_sku
 
 
 def _log(msg: str) -> None:
@@ -35,29 +35,19 @@ class VendorLabelGroup:
     targets: tuple[FedexLabelTarget, ...]
 
 
-def _vendor_for_sku(sku: str, registry: VendorMapRegistry | None = None) -> str:
-    reg = registry or VendorMapRegistry()
-    try:
-        return reg.lookup(sku, "lowes")
-    except KeyError:
-        mapping = load_vendor_map(retailer_key="lowes")
-        return lookup_vendor_folder(sku, mapping)
-
-
 def build_label_targets(
     orders: list[LowesOrderRow],
     *,
     labels_root: Path | None = None,
 ) -> list[FedexLabelTarget]:
     root = labels_root or LOWES_LABELS_ROOT
-    registry = VendorMapRegistry()
     targets: list[FedexLabelTarget] = []
     for seq, order in enumerate(orders, start=1):
         try:
-            vendor = _vendor_for_sku(order.sku, registry)
-        except (KeyError, ValueError) as exc:
-            _log(f"WARN: line {order.line_number} SKU {order.sku!r}: {exc}; using SKU as folder.")
-            vendor = order.sku.strip().upper() or "Unknown"
+            vendor = vendor_for_sku(order.sku)
+        except (KeyError, ValueError, FileNotFoundError) as exc:
+            _log(f"WARN: line {order.line_number} SKU {order.sku!r}: {exc}; using Unknown folder.")
+            vendor = "Unknown"
         save_dir = root / vendor
         save_dir.mkdir(parents=True, exist_ok=True)
         dest = save_dir / label_filename(order.po, order.sku)

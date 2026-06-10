@@ -172,6 +172,11 @@ def load_vendor_map(path: Path | None = None, *, retailer_key: str | None = None
     return mapping
 
 
+def _compact_sku_key(sku: str) -> str:
+    """Ignore spaces when matching (FedEx output often drops spaces in model numbers)."""
+    return re.sub(r"\s+", "", (sku or "").strip().upper())
+
+
 def is_sku_in_vendor_map(sku: str, mapping: dict[str, str]) -> bool:
     """True when SKU matches the vendor map (exact or longest-prefix match)."""
     key = (sku or "").strip().upper()
@@ -181,6 +186,14 @@ def is_sku_in_vendor_map(sku: str, mapping: dict[str, str]) -> bool:
         return True
     for prefix in sorted(mapping, key=len, reverse=True):
         if key.startswith(prefix):
+            return True
+    compact = _compact_sku_key(key)
+    if not compact:
+        return False
+    for map_sku in mapping:
+        if _compact_sku_key(map_sku) == compact:
+            return True
+        if compact.startswith(_compact_sku_key(map_sku)):
             return True
     return False
 
@@ -194,7 +207,69 @@ def lookup_vendor_folder(sku: str, mapping: dict[str, str]) -> str:
     for prefix in sorted(mapping, key=len, reverse=True):
         if key.startswith(prefix):
             return mapping[prefix]
+
+    compact = _compact_sku_key(key)
+    if compact:
+        for map_sku, vendor in mapping.items():
+            if _compact_sku_key(map_sku) == compact:
+                if map_sku != key:
+                    _log(
+                        f"SKU {sku!r} matched vendor map entry {map_sku!r} "
+                        f"(ignoring spaces) → {vendor!r}"
+                    )
+                return vendor
+        for map_sku in sorted(mapping, key=lambda k: len(_compact_sku_key(k)), reverse=True):
+            map_compact = _compact_sku_key(map_sku)
+            if map_compact and compact.startswith(map_compact):
+                if map_sku != key:
+                    _log(
+                        f"SKU {sku!r} prefix-matched map entry {map_sku!r} "
+                        f"(ignoring spaces) → {mapping[map_sku]!r}"
+                    )
+                return mapping[map_sku]
+
     raise KeyError(f"No vendor mapping for SKU {sku!r}")
+
+
+def _sku_lookup_keys(sku: str) -> list[str]:
+    """Ordered SKU strings to try against the vendor map (exact, + variants, tokens)."""
+    raw = (sku or "").strip()
+    if not raw:
+        return []
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        key = (value or "").strip().upper()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    add(raw)
+    upper = raw.upper()
+    add(re.sub(r"\s+", "", upper))
+    if "+" in upper:
+        add(upper.replace("+", ""))
+        add(upper.replace("+", " "))
+        add(upper.split("+", 1)[0])
+        for part in upper.split("+"):
+            add(part)
+    for token in upper.split():
+        add(token)
+    return keys
+
+
+def lookup_vendor_folder_resilient(sku: str, mapping: dict[str, str]) -> str:
+    """Try exact/prefix match with + and multi-token SKU variants."""
+    last_error: KeyError | None = None
+    for key in _sku_lookup_keys(sku):
+        try:
+            return lookup_vendor_folder(key, mapping)
+        except KeyError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise ValueError("SKU is empty.")
 
 
 class VendorMapRegistry:

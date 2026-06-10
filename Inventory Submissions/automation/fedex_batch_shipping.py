@@ -77,7 +77,7 @@ class FedexBatchError(Exception):
     pass
 
 
-_REFERENCE_RE = re.compile(r"(\d{5,}\s+\S+)")
+_REFERENCE_RE = re.compile(r"(\d{5,}\s+.+)")
 
 
 @dataclass
