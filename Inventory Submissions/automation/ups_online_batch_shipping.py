@@ -564,19 +564,16 @@ def _ups_login(
         _log("Already logged in (Chrome profile session) — skipping login.")
         return
 
-    skip_auto = _env_bool(
+    has_creds = bool((creds.username or "").strip() and (creds.password or "").strip())
+    skip_auto = launch_source in ("cdp", "manual") and _env_bool(
         "UPS_SKIP_AUTO_LOGIN",
-        default=launch_source in ("cdp", "manual") and use_system_chrome_profile(
-            cfg.get("browser")
-        ),
+        default=use_system_chrome_profile(cfg.get("browser")),
     )
+
     if skip_auto:
         clear_blocking_overlays(page, cfg, log=_log)
         if _is_ups_logged_in(page, cfg):
             _log("Logged in after clearing popups — continuing.")
-            return
-        if launch_source == "dedicated":
-            _wait_for_manual_ups_login(page, cfg)
             return
         raise UpsBatchError(
             "Not logged into UPS (Log In still visible). Popups may be blocking the page. "
@@ -584,7 +581,19 @@ def _ups_login(
             "UPS_USERNAME/UPS_PASSWORD in .env."
         )
 
-    _log("Step 2/6: Logging into UPS…")
+    if not has_creds:
+        if launch_source == "dedicated":
+            raise UpsBatchError(
+                "UPS credentials required for auto-login. Add to Inventory Submissions/.env:\n"
+                "  UPS_USERNAME=your-ups-login\n"
+                "  UPS_PASSWORD=your-ups-password\n"
+                "Or run once with: python run_ups_online_batch.py --setup-login"
+            )
+        raise UpsBatchError(
+            "Missing UPS_USERNAME / UPS_PASSWORD in .env for auto-login."
+        )
+
+    _log(f"Step 2/6: Logging into UPS as {creds.username[:3]}…")
 
     if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
         raise UpsBatchError("Could not click header Log In")
@@ -816,12 +825,14 @@ def run_ups_depot_batch(
 ) -> UpsBatchResult:
     cfg = _load_config(config_path)
     browser_cfg = cfg.get("browser", {})
-    creds_optional = _env_bool(
+    mode = ups_browser_mode(browser_cfg)
+    creds_optional = mode != "dedicated" and _env_bool(
         "UPS_SKIP_AUTO_LOGIN",
-        default=ups_browser_mode(browser_cfg) == "cdp"
-        and use_system_chrome_profile(browser_cfg),
+        default=mode == "cdp" and use_system_chrome_profile(browser_cfg),
     )
     creds = load_ups_credentials(cfg, optional=creds_optional)
+    if creds.username:
+        _log(f"UPS credentials loaded for {creds.username[:3]}… (auto-login enabled)")
     slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
     if headless is None:
         headless = bool(browser_cfg.get("headless", False))
