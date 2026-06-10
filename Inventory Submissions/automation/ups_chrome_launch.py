@@ -1,7 +1,8 @@
-"""Launch installed Google Chrome for UPS automation (CDP + fallbacks)."""
+"""Launch installed Google Chrome for UPS automation — CDP attach only."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -40,10 +41,7 @@ def chrome_process_count() -> int:
 
 
 def close_chrome_processes(*, force: bool | None = None) -> int:
-    """
-    End chrome.exe so Playwright can open the profile with a debug session.
-    Returns remaining chrome process count.
-    """
+    """End chrome.exe so automation can open the profile with a debug session."""
     remaining = chrome_process_count()
     if remaining == 0:
         return 0
@@ -105,6 +103,70 @@ def wait_for_cdp_endpoint(port: int, *, timeout_s: float = 90.0) -> bool:
     return False
 
 
+def _devtools_active_port_file(user_data: Path, profile: str) -> Path | None:
+    for rel in (Path(profile) / "DevToolsActivePort", Path("DevToolsActivePort")):
+        path = user_data / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def read_devtools_port(user_data: Path, profile: str) -> int | None:
+    """Chrome writes the real debug port here when --remote-debugging-port is used."""
+    path = _devtools_active_port_file(user_data, profile)
+    if path is None:
+        return None
+    try:
+        first_line = path.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+        port = int(first_line)
+        return port if port > 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def discover_cdp_port(
+    *,
+    preferred: int,
+    user_data: Path,
+    profile: str,
+    timeout_s: float = 90.0,
+) -> int | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for port in (preferred, read_devtools_port(user_data, profile)):
+            if port and cdp_endpoint_ready(port, timeout_s=1.0):
+                return port
+        time.sleep(0.5)
+    return None
+
+
+def list_cdp_tabs(port: int) -> list[dict[str, Any]]:
+    url = f"http://127.0.0.1:{port}/json/list"
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return []
+
+
+def wait_for_ups_tab(
+    port: int,
+    *,
+    home_url: str,
+    timeout_s: float = 120.0,
+) -> bool:
+    """Wait until Chrome has a tab on ups.com (opened by real Chrome, not Playwright)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for tab in list_cdp_tabs(port):
+            target_url = str(tab.get("url") or "").lower()
+            if "ups.com" in target_url:
+                _log(f"UPS tab visible in Chrome: {tab.get('url')}")
+                return True
+        time.sleep(0.75)
+    return False
+
+
 def _build_chrome_cmd(
     *,
     exe: Path,
@@ -123,10 +185,37 @@ def _build_chrome_cmd(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-session-crashed-bubble",
+        "--disable-restore-session-state",
         "--disable-notifications",
         "--new-window",
         home_url,
     ]
+
+
+def _launch_chrome_process(cmd: list[str], *, log_dir: Path | None = None) -> None:
+    """Start real Chrome (not Playwright) — same as double-clicking Chrome with flags."""
+    _log("Chrome command: " + " ".join(cmd))
+    stderr_log: int | None = None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_path = log_dir / "chrome_launch_stderr.log"
+        stderr_log = os.open(str(stderr_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if stderr_log is not None:
+        popen_kwargs["stderr"] = stderr_log
+    else:
+        popen_kwargs["stderr"] = subprocess.DEVNULL
+
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    subprocess.Popen(cmd, **popen_kwargs)
+    if stderr_log is not None:
+        os.close(stderr_log)
 
 
 def launch_chrome_for_cdp(
@@ -134,10 +223,11 @@ def launch_chrome_for_cdp(
     home_url: str,
     port: int | None = None,
     wait_for_close_s: float = 8.0,
+    log_dir: Path | None = None,
 ) -> int:
     """
-    Start Chrome with remote debugging on a fixed port.
-    Returns the debug port used.
+    Start installed Chrome with remote debugging, opening UPS in a normal window.
+    Playwright only attaches afterward — it never launches the browser.
     """
     exe = chrome_executable()
     user_data = system_chrome_user_data_dir()
@@ -168,29 +258,42 @@ def launch_chrome_for_cdp(
         port=port,
         home_url=home_url,
     )
-    _log(f"Starting Chrome (profile {profile!r}, debug port {port})…")
-    subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    _log(f"Starting real Chrome (profile {profile!r}, debug port {port})…")
+    _launch_chrome_process(cmd, log_dir=log_dir)
 
-    if not wait_for_cdp_endpoint(port, timeout_s=90.0):
-        raise RuntimeError(
+    discovered = discover_cdp_port(
+        preferred=port,
+        user_data=user_data,
+        profile=profile,
+        timeout_s=90.0,
+    )
+    if discovered is None:
+        hint = (
             f"Chrome did not open debug port {port} within 90s. "
-            "Close all Chrome windows and retry. If this persists, set "
-            "UPS_USE_CHROME_CDP=0 in .env to use Playwright's Chrome launcher."
+            "Close all Chrome windows and retry. "
+            "You can also run 'Run UPS Chrome Debug.bat' manually, then re-run the batch. "
+            "Check logs/chrome_launch_stderr.log if present."
         )
-    _log(f"Chrome debug port {port} is ready.")
-    return port
+        raise RuntimeError(hint)
+
+    if discovered != port:
+        _log(f"Chrome debug port is {discovered} (configured {port}).")
+
+    if not wait_for_ups_tab(discovered, home_url=home_url, timeout_s=120.0):
+        _log(
+            "WARN: Chrome opened but no ups.com tab detected yet — "
+            "Playwright will navigate after attach."
+        )
+
+    _log(f"Chrome debug port {discovered} is ready.")
+    return discovered
 
 
 def connect_playwright_cdp(playwright, port: int):
     return playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
 
 
-def _pick_active_page(context, *, home_url: str):
+def pick_ups_page_from_context(context, *, home_url: str):
     for pg in context.pages:
         try:
             if "ups.com" in (pg.url or "").lower():
@@ -199,13 +302,15 @@ def _pick_active_page(context, *, home_url: str):
         except Exception:
             continue
     if context.pages:
-        return context.pages[0]
+        pg = context.pages[0]
+        pg.bring_to_front()
+        return pg
     return context.new_page()
 
 
-def _goto_ups_home(page, home_url: str) -> None:
+def goto_ups_home(page, home_url: str) -> None:
     current = (page.url or "").strip()
-    _log(f"Chrome tab before navigation: {current!r}")
+    _log(f"Active tab before navigation: {current!r}")
     if "ups.com" in current.lower():
         _log(f"Already on UPS: {current}")
         return
@@ -215,10 +320,6 @@ def _goto_ups_home(page, home_url: str) -> None:
         try:
             _log(f"Navigating to {home_url} (attempt {attempt}/3)…")
             page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=20_000)
-            except Exception:
-                pass
             if "ups.com" in (page.url or "").lower():
                 _log(f"UPS loaded: {page.url}")
                 return
@@ -233,63 +334,3 @@ def _goto_ups_home(page, home_url: str) -> None:
         time.sleep(1.0)
 
     raise RuntimeError(f"Chrome stayed on {page.url!r}; could not open UPS. {last_err}")
-
-
-def _close_blank_tabs(context) -> None:
-    for pg in list(context.pages):
-        try:
-            url = (pg.url or "").strip().lower()
-        except Exception:
-            continue
-        if url in ("about:blank", "", "chrome://newtab/") and len(context.pages) > 1:
-            try:
-                pg.close()
-            except Exception:
-                pass
-
-
-def launch_chrome_persistent_playwright(
-    playwright,
-    cfg: dict[str, Any],
-    *,
-    home_url: str,
-    headless: bool,
-    slow_mo: int,
-    launch_args: list[str],
-):
-    """Playwright launches installed Chrome with the system User Data folder."""
-    user_data = system_chrome_user_data_dir()
-    if user_data is None:
-        raise RuntimeError("Chrome User Data folder not found.")
-
-    ensure_chrome_closed()
-
-    profile = chrome_profile_directory()
-    _log(
-        f"Playwright launching Chrome — User Data: {user_data} "
-        f"(profile {profile!r})…"
-    )
-
-    chrome_args = list(launch_args)
-    for flag in ("--disable-restore-session-state",):
-        if flag not in chrome_args:
-            chrome_args.append(flag)
-
-    # Playwright forbids a startup URL in args for launch_persistent_context;
-    # navigate with page.goto() after launch instead.
-    context = playwright.chromium.launch_persistent_context(
-        str(user_data),
-        channel="chrome",
-        headless=headless,
-        slow_mo=slow_mo,
-        args=chrome_args,
-        ignore_default_args=["--enable-automation", "--no-sandbox"],
-        accept_downloads=True,
-    )
-    _log(f"Chrome launched — {len(context.pages)} tab(s) open.")
-    _close_blank_tabs(context)
-
-    page = _pick_active_page(context, home_url=home_url)
-    page.bring_to_front()
-    _goto_ups_home(page, home_url)
-    return context

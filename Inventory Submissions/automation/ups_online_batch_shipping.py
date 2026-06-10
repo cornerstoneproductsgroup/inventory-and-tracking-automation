@@ -24,11 +24,14 @@ from automation.ups_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_HOME_URL,
     STORAGE_STATE,
+    chrome_cdp_port,
     chrome_profile_directory,
+    dedicated_ups_profile_dir,
     depot_labels_pdf_path,
     label_save_timeout_s,
     resolve_browser_user_data_dir,
     system_chrome_user_data_dir,
+    ups_browser_mode,
     use_chrome_cdp_launch,
     use_system_chrome_profile,
 )
@@ -37,7 +40,8 @@ from automation.ups_chrome_launch import (
     close_chrome_processes,
     connect_playwright_cdp,
     launch_chrome_for_cdp,
-    launch_chrome_persistent_playwright,
+    pick_ups_page_from_context,
+    wait_for_cdp_endpoint,
 )
 from automation.ups_popup_dismiss import clear_blocking_overlays, dismiss_ups_startup_popups
 from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
@@ -202,33 +206,24 @@ def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
     clear_blocking_overlays(page, cfg, log=_log)
 
 
-def _open_system_chrome_via_cdp(
+def _attach_playwright_to_cdp(
     p: Playwright,
     cfg: dict[str, Any],
+    *,
+    port: int,
 ) -> tuple[Browser, BrowserContext, Page]:
     home_url = _ups_home_url(cfg)
-    profile = chrome_profile_directory()
-    _log(
-        f"Launching Chrome with your profile ({profile}) and opening UPS… "
-        "Close all Chrome windows first."
-    )
-
-    try:
-        port = launch_chrome_for_cdp(home_url=home_url)
-    except RuntimeError as exc:
-        raise UpsBatchError(str(exc)) from exc
-
     last_err: Exception | None = None
-    for _ in range(15):
+    for _ in range(20):
         try:
             browser = connect_playwright_cdp(p, port)
             if not browser.contexts:
                 time.sleep(0.5)
                 continue
             context = browser.contexts[0]
-            page = _pick_ups_page(context, home_url=home_url)
+            page = pick_ups_page_from_context(context, home_url=home_url)
             _ensure_ups_home_page(page, cfg)
-            _log(f"Connected to Chrome — {page.url}")
+            _log(f"Attached to Chrome on port {port} — {page.url}")
             return browser, context, page
         except Exception as exc:
             last_err = exc
@@ -239,31 +234,78 @@ def _open_system_chrome_via_cdp(
     )
 
 
-def _open_system_chrome_persistent_fallback(
+def _open_system_chrome_via_cdp(
+    p: Playwright,
+    cfg: dict[str, Any],
+) -> tuple[Browser, BrowserContext, Page]:
+    home_url = _ups_home_url(cfg)
+    profile = chrome_profile_directory()
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    _log(
+        f"Launching real Chrome with profile {profile!r} and opening UPS "
+        "(Playwright will attach — it does not launch the browser)."
+    )
+
+    try:
+        port = launch_chrome_for_cdp(home_url=home_url, log_dir=log_dir)
+    except RuntimeError as exc:
+        raise UpsBatchError(str(exc)) from exc
+
+    return _attach_playwright_to_cdp(p, cfg, port=port)
+
+
+def _open_manual_cdp_attach(
+    p: Playwright,
+    cfg: dict[str, Any],
+) -> tuple[Browser, BrowserContext, Page]:
+    port = chrome_cdp_port()
+    _log(
+        f"Manual attach mode — start Chrome with 'Run UPS Chrome Debug.bat', "
+        f"then press Enter here when UPS is open (port {port})…"
+    )
+    try:
+        input()
+    except EOFError:
+        pass
+
+    if not wait_for_cdp_endpoint(port, timeout_s=5.0):
+        raise UpsBatchError(
+            f"No Chrome debug port on {port}. Run 'Run UPS Chrome Debug.bat' first."
+        )
+    return _attach_playwright_to_cdp(p, cfg, port=port)
+
+
+def _open_dedicated_profile_browser(
     p: Playwright,
     cfg: dict[str, Any],
     *,
     headless: bool,
     slow_mo: int,
-    user_data_dir: Path,
-    launch_args: list[str],
 ) -> tuple[None, BrowserContext, Page, bool]:
-    try:
-        context = launch_chrome_persistent_playwright(
-            p,
-            cfg,
-            home_url=_ups_home_url(cfg),
-            headless=headless,
-            slow_mo=slow_mo,
-            launch_args=launch_args,
-        )
-    except RuntimeError as exc:
-        raise UpsBatchError(str(exc)) from exc
+    """
+    FedEx-style local profile under Inventory Submissions/ups_browser_profile.
+    Run with --setup-login once to save a UPS session here.
+    """
+    profile_dir = dedicated_ups_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    args = _launch_args(cfg.get("browser", {}), user_data_dir=profile_dir)
+    home = _ups_home_url(cfg)
+
+    _log(f"Using dedicated UPS profile at {profile_dir}")
+    context = p.chromium.launch_persistent_context(
+        str(profile_dir),
+        channel="chrome",
+        headless=headless,
+        slow_mo=slow_mo,
+        args=args,
+        ignore_default_args=["--enable-automation", "--no-sandbox"],
+        accept_downloads=True,
+    )
     context.add_init_script(_STEALTH_INIT)
-    page = _pick_ups_page(context, home_url=_ups_home_url(cfg))
+    page = _pick_ups_page(context, home_url=home)
     page.bring_to_front()
     _ensure_ups_home_page(page, cfg)
-    _log(f"Chrome ready via Playwright — {page.url}")
+    _log(f"Chrome ready (dedicated profile) — {page.url}")
     return None, context, page, True
 
 
@@ -287,48 +329,42 @@ def _open_browser(
             channels.append(alt)
     channels.append(None)
 
-    if _using_system_chrome_profile(user_data_dir, browser_cfg):
-        close_chrome_processes()
-        profile = chrome_profile_directory()
-        cdp_enabled = use_chrome_cdp_launch(browser_cfg)
-        cdp_error: UpsBatchError | None = None
+    mode = ups_browser_mode(browser_cfg)
 
-        if cdp_enabled:
-            _log("Trying CDP Chrome launch first (recommended on RDP)…")
-            try:
-                browser, context, page = _open_system_chrome_via_cdp(p, cfg)
-                return browser, context, page, True
-            except UpsBatchError as exc:
-                cdp_error = exc
-                _log(f"WARN: CDP Chrome launch failed: {exc}")
-                close_chrome_processes(force=True)
-        else:
-            _log(
-                "CDP launch disabled (UPS_USE_CHROME_CDP=0) — "
-                "using Playwright Chrome launcher."
-            )
+    if mode == "manual":
+        browser, context, page = _open_manual_cdp_attach(p, cfg)
+        return browser, context, page, True
 
-        _log(
-            "Using installed Google Chrome profile via Playwright "
-            f"({user_data_dir} / {profile})."
+    if mode == "dedicated":
+        return _open_dedicated_profile_browser(
+            p, cfg, headless=headless, slow_mo=slow_mo
         )
+
+    if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
+        browser_cfg
+    ):
+        close_chrome_processes()
         try:
-            return _open_system_chrome_persistent_fallback(
-                p,
-                cfg,
-                headless=headless,
-                slow_mo=slow_mo,
-                user_data_dir=user_data_dir,
-                launch_args=args,
-            )
-        except UpsBatchError as exc:
-            if cdp_enabled:
-                raise
-            _log(f"WARN: Playwright Chrome launch failed: {exc}")
-            _log("Retrying with CDP Chrome launch…")
-            close_chrome_processes(force=True)
             browser, context, page = _open_system_chrome_via_cdp(p, cfg)
             return browser, context, page, True
+        except UpsBatchError as exc:
+            _log(f"WARN: CDP attach failed: {exc}")
+            _log(
+                "Falling back to dedicated UPS profile "
+                f"({dedicated_ups_profile_dir()}). "
+                "Run with --setup-login once if not logged in."
+            )
+            close_chrome_processes(force=True)
+            return _open_dedicated_profile_browser(
+                p, cfg, headless=headless, slow_mo=slow_mo
+            )
+
+    if _using_system_chrome_profile(user_data_dir, browser_cfg):
+        raise UpsBatchError(
+            "System Chrome profile requires CDP attach (default). "
+            "Do not set UPS_USE_CHROME_CDP=0. "
+            "Or set UPS_BROWSER_MODE=dedicated and run --setup-login once."
+        )
 
     last_err: Exception | None = None
     seen_channels: set[str | None] = set()
@@ -781,3 +817,39 @@ def run_ups_depot_batch(
         labels_path=labels_dest,
         shipment_count=None,
     )
+
+
+def run_ups_browser_setup(*, config_path: Path) -> None:
+    """
+    One-time UPS login into the dedicated local profile (FedEx-style).
+    Log in manually, then press Enter in the console to save the session.
+    """
+    cfg = _load_config(config_path)
+    browser_cfg = cfg.get("browser", {})
+    slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
+    home = _ups_home_url(cfg)
+    profile_dir = dedicated_ups_profile_dir()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    _log(f"Opening dedicated UPS browser profile: {profile_dir}")
+    _log("Log into UPS in the browser window, then return here.")
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            channel="chrome",
+            headless=False,
+            slow_mo=slow_mo,
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto(home, wait_until="domcontentloaded", timeout=120_000)
+        print("\n>>> Log into UPS in Chrome, then press Enter here to save the session…")
+        try:
+            input()
+        except EOFError:
+            pass
+        context.close()
+
+    _log(f"Session saved in {profile_dir}. Set UPS_BROWSER_MODE=dedicated to use it.")

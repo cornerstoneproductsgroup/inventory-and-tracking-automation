@@ -112,16 +112,34 @@ def chrome_executable() -> Path | None:
 
 
 def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
-    """CDP launch is tried first for system Chrome unless UPS_USE_CHROME_CDP=0."""
+    """System Chrome always uses CDP unless UPS_USE_CHROME_CDP=0 (JSON cannot disable)."""
+    _ = browser_cfg
+    return _env_bool("UPS_USE_CHROME_CDP", default=True)
+
+
+def ups_browser_mode(browser_cfg: dict | None = None) -> str:
+    """
+    How to open UPS in a browser.
+
+    - cdp (default): start real Chrome + attach Playwright (best for RDP + logged-in profile)
+    - dedicated: project-local ups_browser_profile (FedEx-style; run --setup-login once)
+    - manual: connect to Chrome you start via Run UPS Chrome Debug.bat
+    """
     browser_cfg = browser_cfg or {}
-    env_raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip()
-    if env_raw:
-        return _env_bool("UPS_USE_CHROME_CDP", default=True)
-    if browser_cfg.get("use_chrome_cdp") is False:
-        return False
-    if browser_cfg.get("use_chrome_cdp") is True:
-        return True
-    return True
+    raw = (
+        (os.environ.get("UPS_BROWSER_MODE") or "").strip().lower()
+        or str(browser_cfg.get("browser_mode") or "").strip().lower()
+        or "cdp"
+    )
+    if raw in ("dedicated", "profile", "local"):
+        return "dedicated"
+    if raw in ("manual", "attach"):
+        return "manual"
+    return "cdp"
+
+
+def dedicated_ups_profile_dir() -> Path:
+    return DEFAULT_BROWSER_PROFILE_DIR
 
 
 def kill_chrome_before_launch() -> bool:

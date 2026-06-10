@@ -59,6 +59,14 @@ def main() -> int:
         action="store_true",
         help="Verify UPS_USERNAME and UPS_PASSWORD in .env (no browser).",
     )
+    parser.add_argument(
+        "--setup-login",
+        action="store_true",
+        help=(
+            "One-time setup: open dedicated ups_browser_profile, log into UPS manually, "
+            "save session (use UPS_BROWSER_MODE=dedicated afterward)."
+        ),
+    )
     args = parser.parse_args()
 
     if str(_HERE) not in sys.path:
@@ -77,6 +85,19 @@ def main() -> int:
             print(f"ERROR: {exc}", flush=True)
             return 1
         print(f"OK — UPS username configured ({creds.username[:3]}…)", flush=True)
+        return 0
+
+    if args.setup_login:
+        from automation.ups_online_batch_shipping import run_ups_browser_setup
+
+        if not args.config.is_file():
+            print(f"ERROR: config not found: {args.config}", flush=True)
+            return 1
+        try:
+            run_ups_browser_setup(config_path=args.config)
+        except Exception as exc:
+            print(f"[ups] ERROR: {exc}", flush=True)
+            return 1
         return 0
 
     order_date = _parse_date(args.date) if args.date else None
