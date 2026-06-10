@@ -55,6 +55,7 @@
     "preview_batch": "button:has-text('Preview Batch')",
     "process_all": "#nwsCartProcessAll, button:has-text('Process All')",
     "cookie_close": "#onetrust-close-btn-container button, button.onetrust-close-btn-handler, button[aria-label='Close']",
+    "cookie_accept": "#onetrust-accept-btn-handler, button:has-text('Accept All Cookies')",
     "cookie_settings_close": "#onetrust-pc-sdk button.onetrust-close-btn-handler, #onetrust-pc-sdk button[aria-label='Close']",
     "location_deny": "button:has-text('Never allow'), button:has-text('Block')",
     "extension_dismiss": "button[aria-label='Close'], button[aria-label='Dismiss']"

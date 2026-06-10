@@ -107,7 +107,10 @@ def main() -> int:
         print(f"[ups] ERROR: {exc}", flush=True)
         return 1
     except Exception as exc:
+        import traceback
+
         print(f"[ups] ERROR: {exc}", flush=True)
+        traceback.print_exc()
         return 1
 
     print(

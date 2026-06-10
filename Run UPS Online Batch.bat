@@ -8,17 +8,23 @@ if not exist "%PY%" (
   set "PY=python"
 )
 
+if not exist "logs" mkdir "logs"
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%i"
+set "LOG=logs\ups_batch_%STAMP%.log"
+
 echo.
 echo === UPS.com Batch Shipping — Home Depot ===
+echo Log: %LOG%
 echo.
 
-"%PY%" -u run_ups_online_batch.py %*
+"%PY%" -u run_ups_online_batch.py %* > "%LOG%" 2>&1
 set "EXITCODE=%ERRORLEVEL%"
+type "%LOG%"
 echo.
 if "%EXITCODE%"=="0" (
   echo Completed OK.
 ) else (
-  echo Failed ^(exit %EXITCODE%^).
+  echo Failed ^(exit %EXITCODE%^). See log: %LOG%
 )
 pause
 exit /b %EXITCODE%

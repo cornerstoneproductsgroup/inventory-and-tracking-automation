@@ -36,7 +36,7 @@ from automation.ups_batch_config import (
     use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
-from automation.ups_popup_dismiss import dismiss_ups_startup_popups
+from automation.ups_popup_dismiss import clear_blocking_overlays, dismiss_ups_startup_popups
 from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
 from automation.windows_open_file import fill_open_file_dialog
 from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
@@ -173,7 +173,7 @@ def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
         except Exception as exc:
             raise UpsBatchError(f"Could not open UPS home page: {exc}") from exc
         page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
-    dismiss_ups_startup_popups(page, cfg, log=_log)
+    clear_blocking_overlays(page, cfg, log=_log)
 
 
 def _open_system_chrome_via_cdp(
@@ -383,8 +383,9 @@ def _type_login_field(page: Page, selector: str, text: str) -> None:
 
 
 def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
+    """Only True on positive logged-in signals — never guess when UI is blocked."""
     try:
-        if page.locator("#username").first.is_visible(timeout=1500):
+        if page.locator("#username").first.is_visible(timeout=1200):
             return False
     except Exception:
         pass
@@ -402,18 +403,19 @@ def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
             continue
     try:
         login = page.locator(_sel(cfg, "header_login")).first
-        if not login.is_visible(timeout=2500):
-            return True
-        text = (login.inner_text(timeout=2000) or "").lower()
-        if "log in" not in text:
-            return True
+        if login.is_visible(timeout=2500):
+            text = (login.inner_text(timeout=2000) or "").lower()
+            if "log in" in text:
+                return False
     except Exception:
-        return True
+        pass
     return False
 
 
 def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual: bool) -> None:
+    _log("Step 1/6: Open UPS home and clear popups…")
     _ensure_ups_home_page(page, cfg)
+    clear_blocking_overlays(page, cfg, log=_log)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
         _log("Manual login — complete UPS sign-in in the browser, then press Enter here.")
@@ -425,11 +427,17 @@ def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual
         return
 
     if _env_bool("UPS_SKIP_AUTO_LOGIN", default=use_system_chrome_profile(cfg.get("browser"))):
+        clear_blocking_overlays(page, cfg, log=_log)
+        if _is_ups_logged_in(page, cfg):
+            _log("Logged in after clearing popups — continuing.")
+            return
         raise UpsBatchError(
-            "UPS login required but UPS_SKIP_AUTO_LOGIN is enabled. "
-            "Log into UPS in Chrome first, close Chrome, then re-run — "
-            "or set UPS_SKIP_AUTO_LOGIN=0 and UPS_USERNAME/UPS_PASSWORD in .env."
+            "Not logged into UPS (Log In still visible). Popups may be blocking the page. "
+            "Dismiss them manually in Chrome, or set UPS_SKIP_AUTO_LOGIN=0 with "
+            "UPS_USERNAME/UPS_PASSWORD in .env."
         )
+
+    _log("Step 2/6: Logging into UPS…")
 
     if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
         raise UpsBatchError("Could not click header Log In")
@@ -460,24 +468,60 @@ def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual
     _log("Login submitted.")
 
 
+def _on_create_shipment_page(page: Page, cfg: dict[str, Any]) -> bool:
+    browse = _sel(cfg, "browse_file")
+    try:
+        return page.locator(browse).first.is_visible(timeout=2000)
+    except Exception:
+        return False
+
+
 def _navigate_batch_shipping(page: Page, cfg: dict[str, Any]) -> None:
-    dismiss_ups_startup_popups(page, cfg, log=_log)
-    if not _click_any(page, _sel(cfg, "shipping_tab"), label="Shipping tab"):
-        raise UpsBatchError("Could not open Shipping tab")
-    page.wait_for_timeout(600)
-    if not _click_any(page, _sel(cfg, "batch_file_shipping"), label="Batch File Shipping"):
-        ups = cfg.get("ups") or {}
-        landing = str(ups.get("batch_landing_url") or DEFAULT_BATCH_LANDING_URL).strip()
-        _log(f"WARN: menu link failed — opening {landing}")
+    _log("Step 3/6: Navigate to Batch File Shipping…")
+    ups = cfg.get("ups") or {}
+    landing = str(ups.get("batch_landing_url") or DEFAULT_BATCH_LANDING_URL).strip()
+
+    if _on_create_shipment_page(page, cfg):
+        _log("Already on Create a Shipment page.")
+        return
+
+    menu_ok = False
+    for attempt in range(1, 4):
+        clear_blocking_overlays(page, cfg, log=_log)
+        if _click_any(
+            page, _sel(cfg, "shipping_tab"), label=f"Shipping tab (try {attempt})", timeout_ms=10_000
+        ):
+            page.wait_for_timeout(700)
+            if _click_any(
+                page,
+                _sel(cfg, "batch_file_shipping"),
+                label="Batch File Shipping",
+                timeout_ms=10_000,
+            ):
+                menu_ok = True
+                break
+        _log(f"WARN: Shipping menu not ready (attempt {attempt}/3).")
+        page.wait_for_timeout(800)
+
+    if not menu_ok:
+        _log(f"Opening batch page directly: {landing}")
         page.goto(landing, wait_until="domcontentloaded", timeout=90_000)
-    page.wait_for_timeout(800)
-    if not _click_any(page, _sel(cfg, "ship_now"), label="Ship Now"):
-        raise UpsBatchError("Could not click Ship Now")
+        clear_blocking_overlays(page, cfg, log=_log)
+
+    if not _click_any(page, _sel(cfg, "ship_now"), label="Ship Now", timeout_ms=15_000):
+        if _on_create_shipment_page(page, cfg):
+            _log("Ship Now skipped — upload form already visible.")
+        else:
+            raise UpsBatchError(
+                "Could not reach Batch File Shipping (Ship Now / upload form not found). "
+                "Popups may still be blocking the page."
+            )
     page.wait_for_timeout(1200)
-    _log("Create a Shipment page loading…")
+    _log("Create a Shipment page ready.")
 
 
 def _upload_csv(page: Page, cfg: dict[str, Any], csv_path: Path) -> None:
+    _log(f"Step 4/6: Upload CSV {csv_path.name}…")
     browse = _sel(cfg, "browse_file")
     file_input = _sel(cfg, "file_input")
 
@@ -512,6 +556,7 @@ def _upload_csv(page: Page, cfg: dict[str, Any], csv_path: Path) -> None:
 
 
 def _fill_ship_from(page: Page, cfg: dict[str, Any]) -> None:
+    _log("Step 5/6: Fill Ship From and payment…")
     ship = cfg.get("ship_from") or {}
     _fill_field(page, _sel(cfg, "company_name"), str(ship.get("company") or "HomeDepot.com"), label="Company")
     _fill_field(page, _sel(cfg, "contact_name"), str(ship.get("contact") or "Cornerstone Products Group"), label="Contact")
@@ -553,6 +598,7 @@ def _fill_payment(page: Page, cfg: dict[str, Any]) -> None:
 
 
 def _preview_and_process(page: Page, cfg: dict[str, Any], context: BrowserContext) -> Page:
+    _log("Step 6/6: Preview Batch and Process All…")
     if not _click_any(page, _sel(cfg, "preview_batch"), label="Preview Batch"):
         raise UpsBatchError("Could not click Preview Batch")
     page.wait_for_timeout(3000)
@@ -635,6 +681,7 @@ def run_ups_depot_batch(
     upload_csv = resolve_upload_csv(order_date=order_date, explicit_path=csv_path) if not skip_upload else None
     labels_dest = depot_labels_pdf_path(order_date)
 
+    leave_browser_open = False
     with sync_playwright() as p:
         browser, context, page, persistent = _open_browser(
             p, cfg, headless=headless, slow_mo=slow_mo
@@ -649,8 +696,19 @@ def run_ups_depot_batch(
             labels_page = _preview_and_process(page, cfg, context)
             _save_labels_pdf(labels_page, labels_dest)
             _save_session(context, persistent=persistent)
+        except Exception as exc:
+            leave_browser_open = _env_bool("UPS_LEAVE_BROWSER_OPEN_ON_ERROR", default=True)
+            _log(f"ERROR: {exc}")
+            if leave_browser_open:
+                _log(
+                    "Leaving Chrome open so you can inspect the page. "
+                    "Close Chrome manually when done."
+                )
+            raise
         finally:
-            if browser is not None:
+            if leave_browser_open:
+                pass
+            elif browser is not None:
                 browser.close()
             else:
                 context.close()
