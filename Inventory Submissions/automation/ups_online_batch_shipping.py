@@ -127,7 +127,15 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
     base = ["--disable-blink-features=AutomationControlled"]
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
         profile = chrome_profile_directory()
-        base.append(f"--profile-directory={profile}")
+        base.extend(
+            [
+                f"--profile-directory={profile}",
+                "--disable-session-crashed-bubble",
+                "--disable-restore-session-state",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+        )
     out: list[str] = []
     for arg in [*base, *extra]:
         text = str(arg).strip()
@@ -167,15 +175,30 @@ def _pick_ups_page(context: BrowserContext, *, home_url: str) -> Page:
 def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
     home_url = _ups_home_url(cfg)
     current = (page.url or "").strip().lower()
-    if "ups.com" in current:
-        _log(f"On UPS: {page.url}")
+    if "ups.com" not in current:
+        _log(f"Navigating to {home_url} (current tab: {page.url!r})")
+        last_err: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
+                if "ups.com" in (page.url or "").lower():
+                    break
+            except Exception as exc:
+                last_err = exc
+                _log(f"WARN: UPS navigation attempt {attempt}/3: {exc}")
+                if attempt < 3:
+                    try:
+                        page = page.context.new_page()
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+        else:
+            raise UpsBatchError(
+                f"Could not open UPS home page (stuck on {page.url!r}). {last_err}"
+            )
     else:
-        _log(f"Navigating to {home_url}")
-        try:
-            page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-        except Exception as exc:
-            raise UpsBatchError(f"Could not open UPS home page: {exc}") from exc
-        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+        _log(f"On UPS: {page.url}")
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
     clear_blocking_overlays(page, cfg, log=_log)
 
 
@@ -238,6 +261,7 @@ def _open_system_chrome_persistent_fallback(
         raise UpsBatchError(str(exc)) from exc
     context.add_init_script(_STEALTH_INIT)
     page = _pick_ups_page(context, home_url=_ups_home_url(cfg))
+    page.bring_to_front()
     _ensure_ups_home_page(page, cfg)
     _log(f"Chrome ready via Playwright — {page.url}")
     return None, context, page, True
@@ -253,7 +277,7 @@ def _open_browser(
     browser_cfg = cfg.get("browser", {})
     user_data_dir = resolve_browser_user_data_dir(browser_cfg)
     args = _launch_args(browser_cfg, user_data_dir=user_data_dir)
-    ignore_default_args = ["--enable-automation"]
+    ignore_default_args = ["--enable-automation", "--no-sandbox"]
     channels: list[str | None] = []
     primary = _resolve_channel(browser_cfg)
     if primary:
@@ -265,25 +289,40 @@ def _open_browser(
 
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
         close_chrome_processes()
-        if use_chrome_cdp_launch(browser_cfg):
+        profile = chrome_profile_directory()
+        cdp_enabled = use_chrome_cdp_launch(browser_cfg)
+        cdp_error: UpsBatchError | None = None
+
+        if cdp_enabled:
             try:
                 browser, context, page = _open_system_chrome_via_cdp(p, cfg)
                 return browser, context, page, True
             except UpsBatchError as exc:
+                cdp_error = exc
                 _log(f"WARN: CDP Chrome launch failed: {exc}")
                 close_chrome_processes(force=True)
+
         _log(
             "Using installed Google Chrome profile via Playwright "
-            f"({user_data_dir} / {chrome_profile_directory()})."
+            f"({user_data_dir} / {profile})."
         )
-        return _open_system_chrome_persistent_fallback(
-            p,
-            cfg,
-            headless=headless,
-            slow_mo=slow_mo,
-            user_data_dir=user_data_dir,
-            launch_args=args,
-        )
+        try:
+            return _open_system_chrome_persistent_fallback(
+                p,
+                cfg,
+                headless=headless,
+                slow_mo=slow_mo,
+                user_data_dir=user_data_dir,
+                launch_args=args,
+            )
+        except UpsBatchError as exc:
+            if cdp_enabled:
+                raise
+            _log(f"WARN: Playwright Chrome launch failed: {exc}")
+            _log("Retrying with CDP Chrome launch…")
+            close_chrome_processes(force=True)
+            browser, context, page = _open_system_chrome_via_cdp(p, cfg)
+            return browser, context, page, True
 
     last_err: Exception | None = None
     seen_channels: set[str | None] = set()
@@ -305,13 +344,18 @@ def _open_browser(
             if user_data_dir is not None:
                 if not _using_system_chrome_profile(user_data_dir, browser_cfg):
                     user_data_dir.mkdir(parents=True, exist_ok=True)
+                home = _ups_home_url(cfg)
+                launch_kwargs["args"] = list(args)
+                if home not in launch_kwargs["args"]:
+                    launch_kwargs["args"].append(home)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,
                     **launch_kwargs,
                 )
                 context.add_init_script(_STEALTH_INIT)
-                page = _pick_ups_page(context, home_url=_ups_home_url(cfg))
+                page = _pick_ups_page(context, home_url=home)
+                page.bring_to_front()
                 _ensure_ups_home_page(page, cfg)
                 _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
                 return None, context, page, True

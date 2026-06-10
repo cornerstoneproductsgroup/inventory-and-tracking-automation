@@ -7,6 +7,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,7 @@ def _build_chrome_cmd(
         f"--profile-directory={profile}",
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
+        "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-session-crashed-bubble",
@@ -189,6 +191,86 @@ def connect_playwright_cdp(playwright, port: int):
     return playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
 
 
+def _pick_active_page(context, *, home_url: str):
+    for pg in context.pages:
+        try:
+            if "ups.com" in (pg.url or "").lower():
+                pg.bring_to_front()
+                return pg
+        except Exception:
+            continue
+    if context.pages:
+        return context.pages[0]
+    return context.new_page()
+
+
+def _goto_ups_home(page, home_url: str) -> None:
+    current = (page.url or "").strip()
+    _log(f"Chrome tab before navigation: {current!r}")
+    if "ups.com" in current.lower():
+        _log(f"Already on UPS: {current}")
+        return
+
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            _log(f"Navigating to {home_url} (attempt {attempt}/3)…")
+            page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+            if "ups.com" in (page.url or "").lower():
+                _log(f"UPS loaded: {page.url}")
+                return
+        except Exception as exc:
+            last_err = exc
+            _log(f"WARN: navigation attempt {attempt} failed: {exc}")
+            try:
+                page = page.context.new_page()
+                page.bring_to_front()
+            except Exception:
+                pass
+        time.sleep(1.0)
+
+    raise RuntimeError(f"Chrome stayed on {page.url!r}; could not open UPS. {last_err}")
+
+
+def _close_blank_tabs(context) -> None:
+    for pg in list(context.pages):
+        try:
+            url = (pg.url or "").strip().lower()
+        except Exception:
+            continue
+        if url in ("about:blank", "", "chrome://newtab/") and len(context.pages) > 1:
+            try:
+                pg.close()
+            except Exception:
+                pass
+
+
+def _launch_persistent_context_timed(
+    playwright,
+    user_data_dir: str,
+    *,
+    timeout_s: float = 90.0,
+    **kwargs,
+):
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            playwright.chromium.launch_persistent_context,
+            user_data_dir,
+            **kwargs,
+        )
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeout as exc:
+            raise RuntimeError(
+                f"Playwright Chrome launch timed out after {timeout_s:.0f}s. "
+                "Close Chrome and retry, or set UPS_USE_CHROME_CDP=1."
+            ) from exc
+
+
 def launch_chrome_persistent_playwright(
     playwright,
     cfg: dict[str, Any],
@@ -198,24 +280,41 @@ def launch_chrome_persistent_playwright(
     slow_mo: int,
     launch_args: list[str],
 ):
-    """Fallback: Playwright launches Chrome with the system User Data folder."""
+    """Playwright launches installed Chrome with the system User Data folder."""
     user_data = system_chrome_user_data_dir()
     if user_data is None:
         raise RuntimeError("Chrome User Data folder not found.")
 
     ensure_chrome_closed()
 
+    profile = chrome_profile_directory()
     _log(
-        f"Playwright launching Chrome with profile "
-        f"{chrome_profile_directory()!r}…"
+        f"Playwright launching Chrome — User Data: {user_data} "
+        f"(profile {profile!r})…"
     )
-    context = playwright.chromium.launch_persistent_context(
+
+    chrome_args = list(launch_args)
+    for flag in ("--new-window", "--disable-restore-session-state"):
+        if flag not in chrome_args:
+            chrome_args.append(flag)
+    if home_url not in chrome_args:
+        chrome_args.append(home_url)
+
+    context = _launch_persistent_context_timed(
+        playwright,
         str(user_data),
+        timeout_s=90.0,
         channel="chrome",
         headless=headless,
         slow_mo=slow_mo,
-        args=launch_args,
-        ignore_default_args=["--enable-automation"],
+        args=chrome_args,
+        ignore_default_args=["--enable-automation", "--no-sandbox"],
         accept_downloads=True,
     )
+    _log(f"Chrome launched — {len(context.pages)} tab(s) open.")
+    _close_blank_tabs(context)
+
+    page = _pick_active_page(context, home_url=home_url)
+    page.bring_to_front()
+    _goto_ups_home(page, home_url)
     return context

@@ -112,14 +112,16 @@ def chrome_executable() -> Path | None:
 
 
 def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
-    """Optional CDP launch — off by default; Playwright Chrome is more reliable on RDP."""
+    """CDP launch is tried first for system Chrome unless UPS_USE_CHROME_CDP=0."""
     browser_cfg = browser_cfg or {}
     env_raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip()
     if env_raw:
-        return _env_bool("UPS_USE_CHROME_CDP", default=False)
+        return _env_bool("UPS_USE_CHROME_CDP", default=True)
+    if browser_cfg.get("use_chrome_cdp") is False:
+        return False
     if browser_cfg.get("use_chrome_cdp") is True:
         return True
-    return False
+    return True
 
 
 def kill_chrome_before_launch() -> bool:
