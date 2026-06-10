@@ -294,6 +294,7 @@ def _open_browser(
         cdp_error: UpsBatchError | None = None
 
         if cdp_enabled:
+            _log("Trying CDP Chrome launch first (recommended on RDP)…")
             try:
                 browser, context, page = _open_system_chrome_via_cdp(p, cfg)
                 return browser, context, page, True
@@ -301,6 +302,11 @@ def _open_browser(
                 cdp_error = exc
                 _log(f"WARN: CDP Chrome launch failed: {exc}")
                 close_chrome_processes(force=True)
+        else:
+            _log(
+                "CDP launch disabled (UPS_USE_CHROME_CDP=0) — "
+                "using Playwright Chrome launcher."
+            )
 
         _log(
             "Using installed Google Chrome profile via Playwright "

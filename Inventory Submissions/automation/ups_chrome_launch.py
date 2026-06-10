@@ -7,7 +7,6 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Any
 
@@ -249,28 +248,6 @@ def _close_blank_tabs(context) -> None:
                 pass
 
 
-def _launch_persistent_context_timed(
-    playwright,
-    user_data_dir: str,
-    *,
-    timeout_s: float = 90.0,
-    **kwargs,
-):
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(
-            playwright.chromium.launch_persistent_context,
-            user_data_dir,
-            **kwargs,
-        )
-        try:
-            return future.result(timeout=timeout_s)
-        except FuturesTimeout as exc:
-            raise RuntimeError(
-                f"Playwright Chrome launch timed out after {timeout_s:.0f}s. "
-                "Close Chrome and retry, or set UPS_USE_CHROME_CDP=1."
-            ) from exc
-
-
 def launch_chrome_persistent_playwright(
     playwright,
     cfg: dict[str, Any],
@@ -300,10 +277,9 @@ def launch_chrome_persistent_playwright(
     if home_url not in chrome_args:
         chrome_args.append(home_url)
 
-    context = _launch_persistent_context_timed(
-        playwright,
+    # Playwright sync API must run on the main thread (no ThreadPoolExecutor).
+    context = playwright.chromium.launch_persistent_context(
         str(user_data),
-        timeout_s=90.0,
         channel="chrome",
         headless=headless,
         slow_mo=slow_mo,
