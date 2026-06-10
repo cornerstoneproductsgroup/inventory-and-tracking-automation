@@ -3,7 +3,9 @@ Orchestrates the full daily workflow.
 
 Two independent lanes run in parallel (default); neither waits on the other:
 
-  **Phase 0** — CommerceHub invoice reports (Depot, Lowe's, Tractor) run as a separate subprocess
+  **Phase 0** (optional, All Steps) — Outlook vendor emails from z- Daily Vendor Orders (all vendors).
+
+  **Phase 1** — CommerceHub invoice reports (Depot, Lowe's, Tractor) run as a separate subprocess
   (``commercehub_invoice_export.py``), same as menu **R**. This is more reliable than attaching
   to the chain browser via CDP.
 
@@ -420,6 +422,30 @@ _INVOICE_MODE_LABELS = {
 }
 
 
+def _run_vendor_emails_phase(python_exe: str) -> list[str]:
+    """Send daily vendor-order emails to all vendors (no interactive menu)."""
+    vendor_script = INVENTORY_DIR / "run_vendor_emails.py"
+    if not vendor_script.is_file():
+        msg = (
+            f"Vendor email script not found:\n  {vendor_script}\n"
+            "Update/pull Inventory Submissions and retry."
+        )
+        print(f"\nWARN: {msg}")
+        return [msg]
+
+    print(
+        "\n"
+        + "=" * 60
+        + "\nPhase 0 — Vendor emails (ALL vendors, Outlook send)\n"
+        + "=" * 60
+    )
+    return _run_single(
+        "Vendor Emails",
+        [python_exe, str(vendor_script), "--send", "--no-menu"],
+        INVENTORY_DIR,
+    )
+
+
 def _run_invoice_report_phase(
     invoice_modes: list[str],
     invoice_report_dir: Path,
@@ -449,7 +475,7 @@ def _run_invoice_report_phase(
     print(
         "\n"
         + "=" * 60
-        + "\nPhase 0 — Invoice reports (Depot, Lowe's, Tractor)\n"
+        + "\nPhase 1 — Invoice reports (Depot, Lowe's, Tractor)\n"
         + "=" * 60
         + f"\n  Modes: {', '.join(invoice_modes)}\n"
         + (
@@ -625,6 +651,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--with-vendor-emails",
+        action="store_true",
+        help=(
+            "At the start of a full workflow run, send vendor emails to ALL configured vendors "
+            "(Outlook, no vendor menu). Used by main menu All Steps."
+        ),
+    )
+    parser.add_argument(
         "--sequential-lanes",
         action="store_true",
         help="Within each phase, run CommerceHub then SPS one after the other instead of parallel.",
@@ -706,6 +740,8 @@ def main() -> int:
         parser.error("--vendor-emails-only cannot be combined with --fedex-batch-only")
     if args.vendor_emails_only and args.amazon_seller_download_only:
         parser.error("--vendor-emails-only cannot be combined with --amazon-seller-download-only")
+    if args.with_vendor_emails and args.vendor_emails_only:
+        parser.error("Use either --with-vendor-emails or --vendor-emails-only, not both.")
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
     pull_orders_only = bool(args.pull_orders_only)
@@ -713,6 +749,7 @@ def main() -> int:
     fedex_batch_only = bool(args.fedex_batch_only)
     amazon_seller_download_only = bool(args.amazon_seller_download_only)
     vendor_emails_only = bool(args.vendor_emails_only)
+    with_vendor_emails = bool(args.with_vendor_emails)
     grainger_only = bool(args.grainger_only)
     invoice_report_only = bool(args.invoice_report_only)
     skip_inventory = bool(args.skip_inventory) or tracking_invoicing_only
@@ -1053,6 +1090,9 @@ def main() -> int:
         return 1
 
     errors: list[str] = []
+
+    if with_vendor_emails:
+        errors.extend(_run_vendor_emails_phase(python_exe))
 
     if invoice_modes:
         errors.extend(
