@@ -320,15 +320,6 @@ def _wait_and_dismiss_startup_dialogs(*, timeout_s: float) -> bool:
     return clicked_any
 
 
-def _import_export_ribbon_active(win) -> bool:
-    """True only when Import-Export ribbon actions are on screen (not merely the tab label)."""
-    return _ribbon_action_available(
-        win, "Batch Import", ("Button", "MenuItem", "SplitButton")
-    ) or _ribbon_action_available(
-        win, "Batch Export", ("Button", "MenuItem", "SplitButton")
-    )
-
-
 def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False) -> bool:
     if _blocking_dialog_visible():
         return False
@@ -337,7 +328,21 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         if not win.exists(timeout=win_timeout):
             return False
-        return _import_export_ribbon_active(win)
+        if _ribbon_action_available(
+            win, "Batch Import", ("Button", "MenuItem", "SplitButton")
+        ):
+            return True
+        for tab in _matching_controls(
+            win, title="Import-Export", control_types=("TabItem", "Button")
+        ):
+            try:
+                if tab.is_enabled() and tab.is_visible():
+                    return True
+                if _is_tab_selected(tab):
+                    return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
 
@@ -345,6 +350,7 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
 def _focus_main_window(win) -> None:
     import win32con
     import win32gui
+    import win32process
 
     hwnd: int | None = None
     try:
@@ -359,9 +365,25 @@ def _focus_main_window(win) -> None:
     if hwnd:
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
+            fg = win32gui.GetForegroundWindow()
+            if fg and fg != hwnd:
+                fg_thread, _ = win32process.GetWindowThreadProcessId(fg)
+                target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+                attached = False
+                try:
+                    win32process.AttachThreadInput(fg_thread, target_thread, True)
+                    attached = True
+                    win32gui.SetForegroundWindow(hwnd)
+                finally:
+                    if attached:
+                        win32process.AttachThreadInput(fg_thread, target_thread, False)
+            else:
+                win32gui.SetForegroundWindow(hwnd)
         except Exception:
-            pass
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
     try:
         win.set_focus()
     except Exception:
@@ -381,67 +403,44 @@ def _bring_worldship_to_front(app) -> bool:
         return False
 
 
-def _worldship_ui_loaded(app, *, fast: bool = False) -> bool:
-    """True when the main ribbon is usable (Home or Import-Export tab visible)."""
-    if _blocking_dialog_visible():
-        return False
-    win_timeout = 0.4 if fast else 3.0
-    try:
-        win = app.window(title_re=WORLDSHIP_TITLE_RE)
-        if not win.exists(timeout=win_timeout):
-            return False
-        for tab_title in ("Home", "Import-Export"):
-            for tab in _matching_controls(
-                win, title=tab_title, control_types=("TabItem", "Button")
-            ):
-                try:
-                    if tab.is_visible() and tab.is_enabled():
-                        return True
-                except Exception:
-                    continue
-        return _import_export_ribbon_active(win)
-    except Exception:
-        return False
-
-
-def _wait_until_worldship_usable(app, *, timeout_s: float, poll_interval_s: float = 2.0):
-    _log(f"Waiting up to {timeout_s:.0f}s for WorldShip to finish loading…")
+def _wait_until_import_export_ready(app, *, timeout_s: float, poll_interval_s: float = 2.0):
+    _log(f"Waiting up to {timeout_s:.0f}s for Import-Export tab to be ready…")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         _dismiss_blocking_dialogs_once()
-        if not _blocking_dialog_visible() and _worldship_ui_loaded(app, fast=False):
+        if not _blocking_dialog_visible() and _import_export_tab_ready(app, fast=False):
             win = app.window(title_re=WORLDSHIP_TITLE_RE)
             _focus_main_window(win)
-            _log("WorldShip main window is ready (no blocking dialogs).")
+            _log("Import-Export tab is ready (no blocking dialogs).")
             return win
         time.sleep(poll_interval_s)
     raise TimeoutError(
-        f"WorldShip did not become usable within {timeout_s:.0f}s. "
+        f"WorldShip Import-Export tab did not become ready within {timeout_s:.0f}s. "
         "A dialog (Software Update, database check, etc.) may still be open, or the app "
-        "is still loading — increase WORLDSHIP_READY_TIMEOUT_S or WORLDSHIP_WARM_READY_TIMEOUT_S."
+        "is still loading — increase WORLDSHIP_READY_TIMEOUT_S."
     )
 
 
 def _resolve_main_window(app, *, cold_start: bool):
-    """Return the main WorldShip window; Import-Export ribbon is opened in the next step."""
+    """Return the main WorldShip window; skip long waits when already loaded."""
     _dismiss_blocking_dialogs_once()
     _bring_worldship_to_front(app)
     win = app.window(title_re=WORLDSHIP_TITLE_RE)
-
     if _import_export_tab_ready(app, fast=True):
         _focus_main_window(win)
-        _log("WorldShip ready — Import-Export ribbon already active.")
+        if not cold_start:
+            _log("WorldShip already open — proceeding immediately.")
+        else:
+            _log("Import-Export tab is ready (no blocking dialogs).")
         return win
-
-    if not cold_start and _worldship_ui_loaded(app, fast=True):
+    if not cold_start:
         _focus_main_window(win)
-        _log("WorldShip already open on Home — will switch to Import-Export next.")
+        _log("WorldShip already open — proceeding immediately.")
         return win
-
-    return _wait_until_worldship_usable(
+    return _wait_until_import_export_ready(
         app,
         timeout_s=_ready_timeout_s(cold_start=cold_start),
-        poll_interval_s=2.0 if cold_start else 0.5,
+        poll_interval_s=2.0 if cold_start else 0.15,
     )
 
 
@@ -571,7 +570,7 @@ def _matching_controls(
     title: str | None = None,
     title_re: str | None = None,
     control_types: tuple[str, ...],
-    max_index: int = 12,
+    max_index: int = 3,
 ):
     """Yield controls when WorldShip exposes duplicate UIA nodes for one ribbon item."""
     exist_ms = 30
@@ -620,149 +619,21 @@ def _ribbon_action_available(
     return False
 
 
-def _ribbon_tab_rect_ok(rect) -> bool:
-    """Ignore UIA nodes that span the whole window (cause move cursor / no click)."""
-    try:
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-    except Exception:
-        return False
-    return 20 <= width <= 320 and 12 <= height <= 60
-
-
-def _sorted_ribbon_targets(targets) -> list:
-    """Prefer small TabItem rectangles in the ribbon band (top of main window)."""
-
-    def sort_key(target):
-        try:
-            rect = target.rectangle()
-            return (rect.top, rect.left, rect.right - rect.left)
-        except Exception:
-            return (99999, 99999, 99999)
-
-    visible = []
-    for target in targets:
-        try:
-            if not target.is_visible():
-                continue
-            rect = target.rectangle()
-            if not _ribbon_tab_rect_ok(rect):
-                continue
-            visible.append(target)
-        except Exception:
-            continue
-    return sorted(visible, key=sort_key)
-
-
-def _activate_uia_control(target, *, label: str = "") -> str | None:
-    """
-    Activate a ribbon control without relying on click_input first (RDP-friendly).
-
-    Returns the method name used, or None if every attempt failed.
-    """
-    for method_name, action in (
-        ("invoke", lambda: target.invoke()),
-        ("click", lambda: target.click()),
-        ("select", lambda: target.select()),
-    ):
-        try:
-            action()
-            time.sleep(0.15)
-            return method_name
-        except Exception:
-            continue
-    try:
-        target.set_focus()
-        target.type_keys("{SPACE}", pause=0.05, set_foreground=False)
-        time.sleep(0.15)
-        return "space"
-    except Exception:
-        pass
-    try:
-        rect = target.rectangle()
-        if not _ribbon_tab_rect_ok(rect):
-            return None
-        import win32api
-        import win32con
-
-        x = (rect.left + rect.right) // 2
-        y = (rect.top + rect.bottom) // 2
-        win32api.SetCursorPos((x, y))
-        time.sleep(0.06)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(0.15)
-        return "mouse_center"
-    except Exception:
-        return None
-
-
-def _click_ribbon_tab(main, title: str, *, timeout_s: float = 30.0) -> None:
-    """Click a top-level ribbon tab (Import-Export, Home, …)."""
-    deadline = time.monotonic() + timeout_s
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        _focus_main_window(main)
-        candidates = list(
-            _matching_controls(main, title=title, control_types=("TabItem",))
-        )
-        for target in _sorted_ribbon_targets(candidates):
-            try:
-                if not target.is_enabled():
-                    continue
-                method = _activate_uia_control(target, label=title)
-                if method:
-                    _log(f"Activated ribbon tab {title!r} via {method}.")
-                    return
-            except Exception as exc:
-                last_err = exc
-        time.sleep(0.2)
-    raise RuntimeError(f"Could not activate ribbon tab {title!r}: {last_err or 'no valid tab'}")
-
-
 def _ensure_import_export_tab(main) -> None:
-    """Open Import-Export ribbon and verify Batch Import appears (Home tab is not enough)."""
-    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
-    verify_s = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 30.0)
-    attempts = int((os.environ.get("WORLDSHIP_STEP_RETRY_ATTEMPTS") or "5").strip() or "5")
-
-    if _import_export_ribbon_active(main):
-        _log("Import-Export ribbon already active (Batch Import visible).")
+    """Open Import-Export ribbon; skip click if Batch Import is already visible."""
+    _focus_main_window(main)
+    if _ribbon_action_available(
+        main, "Batch Import", ("Button", "MenuItem", "SplitButton")
+    ):
+        _log("Import-Export tab already active — skipping tab click.")
         return
-
-    for attempt in range(1, max(1, attempts) + 1):
-        if _import_export_ribbon_active(main):
-            _log("Import-Export ribbon active (Batch Import visible).")
-            return
-
-        _log(f"Clicking Import-Export tab (attempt {attempt}/{attempts})…")
-        try:
-            _click_ribbon_tab(main, "Import-Export", timeout_s=min(30.0, verify_s))
-        except Exception as exc:
-            _log(f"Import-Export tab activation failed: {exc}")
-            if attempt >= attempts:
-                raise
-            time.sleep(1.0)
-            continue
-
-        deadline = time.monotonic() + verify_s
-        while time.monotonic() < deadline:
-            if _import_export_ribbon_active(main):
-                _log("Verified: Batch Import is on the ribbon.")
-                if after_tab_s > 0:
-                    time.sleep(after_tab_s)
-                return
-            time.sleep(0.25)
-
-        _log(
-            f"Batch Import not visible after Import-Export click "
-            f"(attempt {attempt}/{attempts})."
-        )
-        time.sleep(1.0)
-
-    raise RuntimeError(
-        f"Import-Export tab did not show Batch Import after {attempts} attempt(s). "
-        "WorldShip may still be on the Home tab — check for blocking dialogs."
+    _log("Clicking Import-Export tab…")
+    _focus_main_window(main)
+    _click_when_ready(
+        main,
+        title="Import-Export",
+        control_types=("TabItem", "Button"),
+        timeout_s=8.0,
     )
 
 
@@ -781,6 +652,7 @@ def _click_when_ready(
     last_err: Exception | None = None
     saw_any = False
     while time.monotonic() < deadline:
+        _focus_main_window(win)
         clicked = False
         for target in _matching_controls(win, title=title, control_types=control_types):
             saw_any = True
@@ -791,11 +663,6 @@ def _click_when_ready(
                     if title == "Import-Export" and _is_tab_selected(target):
                         return
                     continue
-                method = _activate_uia_control(target, label=title)
-                if method:
-                    _log(f"Activated {title!r} via {method}.")
-                    clicked = True
-                    break
                 target.click_input()
                 clicked = True
                 break
@@ -1719,7 +1586,12 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
 
+    _focus_main_window(main)
     _ensure_import_export_tab(main)
+
+    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
+    if after_tab_s > 0:
+        time.sleep(after_tab_s)
 
     _log("Clicking Batch Import…")
     _focus_main_window(main)
@@ -1727,7 +1599,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         main,
         title="Batch Import",
         control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=_step_wait_s("WORLDSHIP_BATCH_IMPORT_CLICK_TIMEOUT_S", 20.0),
+        timeout_s=8.0,
     )
 
     _log("Waiting for Batch Import wizard…")
