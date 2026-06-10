@@ -571,7 +571,7 @@ def _matching_controls(
     title: str | None = None,
     title_re: str | None = None,
     control_types: tuple[str, ...],
-    max_index: int = 3,
+    max_index: int = 12,
 ):
     """Yield controls when WorldShip exposes duplicate UIA nodes for one ribbon item."""
     exist_ms = 30
@@ -620,6 +620,106 @@ def _ribbon_action_available(
     return False
 
 
+def _ribbon_tab_rect_ok(rect) -> bool:
+    """Ignore UIA nodes that span the whole window (cause move cursor / no click)."""
+    try:
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+    except Exception:
+        return False
+    return 20 <= width <= 320 and 12 <= height <= 60
+
+
+def _sorted_ribbon_targets(targets) -> list:
+    """Prefer small TabItem rectangles in the ribbon band (top of main window)."""
+
+    def sort_key(target):
+        try:
+            rect = target.rectangle()
+            return (rect.top, rect.left, rect.right - rect.left)
+        except Exception:
+            return (99999, 99999, 99999)
+
+    visible = []
+    for target in targets:
+        try:
+            if not target.is_visible():
+                continue
+            rect = target.rectangle()
+            if not _ribbon_tab_rect_ok(rect):
+                continue
+            visible.append(target)
+        except Exception:
+            continue
+    return sorted(visible, key=sort_key)
+
+
+def _activate_uia_control(target, *, label: str = "") -> str | None:
+    """
+    Activate a ribbon control without relying on click_input first (RDP-friendly).
+
+    Returns the method name used, or None if every attempt failed.
+    """
+    for method_name, action in (
+        ("invoke", lambda: target.invoke()),
+        ("click", lambda: target.click()),
+        ("select", lambda: target.select()),
+    ):
+        try:
+            action()
+            time.sleep(0.15)
+            return method_name
+        except Exception:
+            continue
+    try:
+        target.set_focus()
+        target.type_keys("{SPACE}", pause=0.05, set_foreground=False)
+        time.sleep(0.15)
+        return "space"
+    except Exception:
+        pass
+    try:
+        rect = target.rectangle()
+        if not _ribbon_tab_rect_ok(rect):
+            return None
+        import win32api
+        import win32con
+
+        x = (rect.left + rect.right) // 2
+        y = (rect.top + rect.bottom) // 2
+        win32api.SetCursorPos((x, y))
+        time.sleep(0.06)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.15)
+        return "mouse_center"
+    except Exception:
+        return None
+
+
+def _click_ribbon_tab(main, title: str, *, timeout_s: float = 30.0) -> None:
+    """Click a top-level ribbon tab (Import-Export, Home, …)."""
+    deadline = time.monotonic() + timeout_s
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        _focus_main_window(main)
+        candidates = list(
+            _matching_controls(main, title=title, control_types=("TabItem",))
+        )
+        for target in _sorted_ribbon_targets(candidates):
+            try:
+                if not target.is_enabled():
+                    continue
+                method = _activate_uia_control(target, label=title)
+                if method:
+                    _log(f"Activated ribbon tab {title!r} via {method}.")
+                    return
+            except Exception as exc:
+                last_err = exc
+        time.sleep(0.2)
+    raise RuntimeError(f"Could not activate ribbon tab {title!r}: {last_err or 'no valid tab'}")
+
+
 def _ensure_import_export_tab(main) -> None:
     """Open Import-Export ribbon and verify Batch Import appears (Home tab is not enough)."""
     after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
@@ -636,13 +736,14 @@ def _ensure_import_export_tab(main) -> None:
             return
 
         _log(f"Clicking Import-Export tab (attempt {attempt}/{attempts})…")
-        _focus_main_window(main)
-        _click_when_ready(
-            main,
-            title="Import-Export",
-            control_types=("TabItem", "Button"),
-            timeout_s=min(30.0, verify_s),
-        )
+        try:
+            _click_ribbon_tab(main, "Import-Export", timeout_s=min(30.0, verify_s))
+        except Exception as exc:
+            _log(f"Import-Export tab activation failed: {exc}")
+            if attempt >= attempts:
+                raise
+            time.sleep(1.0)
+            continue
 
         deadline = time.monotonic() + verify_s
         while time.monotonic() < deadline:
@@ -690,6 +791,11 @@ def _click_when_ready(
                     if title == "Import-Export" and _is_tab_selected(target):
                         return
                     continue
+                method = _activate_uia_control(target, label=title)
+                if method:
+                    _log(f"Activated {title!r} via {method}.")
+                    clicked = True
+                    break
                 target.click_input()
                 clicked = True
                 break

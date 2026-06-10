@@ -479,17 +479,28 @@ def _ribbon_action_available(
 
 
 def _click_ribbon(main, title: str, *, timeout_s: float = 8.0) -> None:
+    if title in ("Home", "Import-Export"):
+        from automation.worldship_batch_import import _click_ribbon_tab
+
+        _click_ribbon_tab(main, title, timeout_s=timeout_s)
+        return
+
+    from automation.worldship_batch_import import _activate_uia_control
+
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        for ctrl_type in ("TabItem", "Button", "SplitButton", "MenuItem"):
+        for ctrl_type in ("Button", "SplitButton", "MenuItem"):
             try:
                 for target in _matching_controls(
                     main, title=title, control_types=(ctrl_type,)
                 ):
-                    if target.is_visible() and target.is_enabled():
-                        target.click_input()
+                    if not target.is_visible() or not target.is_enabled():
+                        continue
+                    if _activate_uia_control(target, label=title):
                         return
+                    target.click_input()
+                    return
             except Exception as exc:
                 last_err = exc
         time.sleep(0.08)
