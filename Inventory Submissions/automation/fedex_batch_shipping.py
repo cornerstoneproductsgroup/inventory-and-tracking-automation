@@ -30,6 +30,7 @@ from automation.fedex_batch_config import (
     STORAGE_STATE,
     WAREHOUSE_LABEL_QUEUE_DIR,
     label_save_timeout_s,
+    resolve_fedex_warehouse_label_printer,
     lowes_fedex_master_path,
     pdf_page_wait_ms,
     shipment_report_download_timeout_ms,
@@ -2649,11 +2650,13 @@ def _merge_pdf_files(sources: list[Path], dest: Path) -> None:
 
 
 def _zebra_label_printer() -> str:
-    return _resolve_printer(
-        "FEDEX_WAREHOUSE_LABEL_PRINTER",
-        "PULL_ORDERS_SOS_LABEL_PRINTER",
-        "Zebra ZP 450-200 dpi",
-    )
+    name, _source = resolve_fedex_warehouse_label_printer()
+    return name
+
+
+def _zebra_label_printer_source() -> str:
+    _name, source = resolve_fedex_warehouse_label_printer()
+    return source
 
 
 def _warehouse_labels_use_queue() -> bool:
@@ -2989,8 +2992,8 @@ def _process_vendor_groups(
             if _warehouse_labels_use_queue():
                 dest = warehouse_label_queue_path(vendor, order_date)
                 _log(
-                    f"  → Warehouse print queue ({_zebra_label_printer()!r}): "
-                    f"save label PDF, watcher prints — {dest}"
+                    f"  → Warehouse print queue → Zebra {_zebra_label_printer()!r} "
+                    f"({_zebra_label_printer_source()}): save PDF, watcher prints — {dest}"
                 )
             else:
                 _log(
@@ -3284,15 +3287,15 @@ def run_fedex_batch(
     warehouse_watcher: FedexWarehouseLabelWatcher | None = None
     if warehouse_vendors:
         try:
-            zebra = _zebra_label_printer()
-            _log(f"Warehouse Zebra printer resolved: {zebra!r}")
+            zebra, zebra_source = resolve_fedex_warehouse_label_printer()
+            _log(f"Warehouse Zebra printer: {zebra!r} (from {zebra_source})")
         except Exception as exc:
             raise FedexBatchError(
                 f"Cannot resolve Zebra printer for warehouse labels: {exc}"
             ) from exc
         if _warehouse_labels_use_queue():
             _log(f"Warehouse labels: save to queue at {WAREHOUSE_LABEL_QUEUE_DIR}")
-            warehouse_watcher = FedexWarehouseLabelWatcher(WAREHOUSE_LABEL_QUEUE_DIR, zebra)
+            warehouse_watcher = FedexWarehouseLabelWatcher.for_queue_dir(WAREHOUSE_LABEL_QUEUE_DIR)
             warehouse_watcher.start()
         else:
             _log("Warehouse labels: legacy Edge print UI (FEDEX_WAREHOUSE_LABEL_PRINT_MODE=edge)")

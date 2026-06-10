@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+from automation.fedex_batch_config import resolve_fedex_warehouse_label_printer
 from automation.pull_orders_warehouse_print import print_pdf_windows
 
 
@@ -47,9 +48,10 @@ class FedexWarehouseLabelWatcher:
     to ``_printed/`` so FedEx label saving and Zebra printing are separate steps.
     """
 
-    def __init__(self, queue_dir: Path, printer: str) -> None:
+    def __init__(self, queue_dir: Path, printer: str, *, printer_source: str = "") -> None:
         self.queue_dir = queue_dir.resolve()
         self.printer = printer
+        self.printer_source = printer_source or "configured"
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -57,10 +59,19 @@ class FedexWarehouseLabelWatcher:
         self._printed_count = 0
         self._errors: list[str] = []
 
+    @classmethod
+    def for_queue_dir(cls, queue_dir: Path) -> FedexWarehouseLabelWatcher:
+        """Start a watcher that prints queue PDFs on the Zebra from .env."""
+        printer, source = resolve_fedex_warehouse_label_printer()
+        return cls(queue_dir, printer, printer_source=source)
+
     def start(self) -> None:
         self.queue_dir.mkdir(parents=True, exist_ok=True)
         _printed_subdir(self.queue_dir).mkdir(parents=True, exist_ok=True)
-        _log(f"Watching {self.queue_dir} → printer {self.printer!r}")
+        _log(
+            f"Watching {self.queue_dir} → Zebra {self.printer!r} "
+            f"(from {self.printer_source})"
+        )
         self._thread = threading.Thread(target=self._run, name="fedex-warehouse-label-watcher", daemon=True)
         self._thread.start()
 
@@ -97,12 +108,15 @@ class FedexWarehouseLabelWatcher:
         try:
             if not _file_stable(path):
                 return
-            _log(f"Printing {path.name}…")
+            _log(
+                f"Printing {path.name} on Zebra {self.printer!r} "
+                f"({self.printer_source})…"
+            )
             print_pdf_windows(path, self.printer)
             self._archive_printed(path)
             with self._lock:
                 self._printed_count += 1
-            _log(f"Printed and archived {path.name}.")
+            _log(f"Sent {path.name} to Zebra {self.printer!r}.")
         except Exception as exc:
             msg = f"{path.name}: {exc}"
             with self._lock:

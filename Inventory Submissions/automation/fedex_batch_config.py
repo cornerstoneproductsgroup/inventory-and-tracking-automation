@@ -162,3 +162,63 @@ def warehouse_after_print_ms() -> int:
         return max(2000, int(raw))
     except ValueError:
         return 6000
+
+
+_WAREHOUSE_ZEBRA_ENV_KEYS = (
+    "FEDEX_WAREHOUSE_LABEL_PRINTER",
+    "PULL_ORDERS_SOS_LABEL_PRINTER",
+    "PULL_ORDERS_LABEL_PRINTER",
+)
+
+
+def resolve_fedex_warehouse_label_printer() -> tuple[str, str]:
+    """
+    Resolve the Zebra used for FedEx warehouse label printing.
+
+    Uses the first configured env var from ``_WAREHOUSE_ZEBRA_ENV_KEYS``, then
+    auto-detects a physical Zebra ZP 450 on this PC. Refuses virtual printers
+    and non-Zebra names so queue labels cannot be sent to the wrong device.
+    """
+    from automation.pull_orders_warehouse_print import (
+        _find_installed_printer,
+        _is_virtual_printer,
+        _is_zebra_label_printer,
+        _resolve_printer,
+        list_installed_printers,
+    )
+
+    physical = list_installed_printers(include_virtual=False)
+    for env_key in _WAREHOUSE_ZEBRA_ENV_KEYS:
+        raw = (os.environ.get(env_key) or "").strip()
+        if not raw:
+            continue
+        if _is_virtual_printer(raw):
+            raise RuntimeError(
+                f"{env_key}={raw!r} is a virtual printer. "
+                f"Set {env_key} in Inventory Submissions\\.env to your physical Zebra name."
+            )
+        resolved = _find_installed_printer(raw, physical=physical)
+        if not resolved:
+            installed = ", ".join(physical[:10]) or "(none)"
+            raise RuntimeError(
+                f"{env_key}={raw!r} is not installed on this PC. "
+                f"Physical printers: {installed}"
+            )
+        if not _is_zebra_label_printer(resolved):
+            raise RuntimeError(
+                f"{env_key}={raw!r} resolved to {resolved!r}, which is not a Zebra label printer. "
+                f"Set FEDEX_WAREHOUSE_LABEL_PRINTER to the exact Zebra name from Windows Printers."
+            )
+        return resolved, env_key
+
+    resolved = _resolve_printer(
+        "FEDEX_WAREHOUSE_LABEL_PRINTER",
+        "PULL_ORDERS_SOS_LABEL_PRINTER",
+        "Zebra ZP 450-200 dpi",
+    )
+    if not _is_zebra_label_printer(resolved):
+        raise RuntimeError(
+            f"Auto-detected printer {resolved!r} is not a Zebra label printer. "
+            "Set FEDEX_WAREHOUSE_LABEL_PRINTER in .env to your Zebra ZP 450 name."
+        )
+    return resolved, "auto-detected Zebra on this PC"
