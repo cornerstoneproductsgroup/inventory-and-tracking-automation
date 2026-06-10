@@ -112,9 +112,15 @@ def chrome_executable() -> Path | None:
 
 
 def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
-    """System Chrome always uses CDP unless UPS_USE_CHROME_CDP=0 (JSON cannot disable)."""
+    """System Chrome always attaches via CDP. UPS_USE_CHROME_CDP is deprecated/ignored."""
     _ = browser_cfg
-    return _env_bool("UPS_USE_CHROME_CDP", default=True)
+    return True
+
+
+def chrome_cdp_env_disabled() -> bool:
+    """True when .env still has UPS_USE_CHROME_CDP=0 (ignored; logged once at launch)."""
+    raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip().lower()
+    return raw in ("0", "false", "no", "off")
 
 
 def ups_browser_mode(browser_cfg: dict | None = None) -> str:

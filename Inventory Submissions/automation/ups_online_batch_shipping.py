@@ -31,6 +31,7 @@ from automation.ups_batch_config import (
     label_save_timeout_s,
     resolve_browser_user_data_dir,
     system_chrome_user_data_dir,
+    chrome_cdp_env_disabled,
     ups_browser_mode,
     use_chrome_cdp_launch,
     use_system_chrome_profile,
@@ -343,6 +344,11 @@ def _open_browser(
     if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
         browser_cfg
     ):
+        if chrome_cdp_env_disabled():
+            _log(
+                "NOTE: UPS_USE_CHROME_CDP=0 in .env is ignored — "
+                "system Chrome always uses CDP attach now."
+            )
         close_chrome_processes()
         try:
             browser, context, page = _open_system_chrome_via_cdp(p, cfg)
@@ -358,13 +364,6 @@ def _open_browser(
             return _open_dedicated_profile_browser(
                 p, cfg, headless=headless, slow_mo=slow_mo
             )
-
-    if _using_system_chrome_profile(user_data_dir, browser_cfg):
-        raise UpsBatchError(
-            "System Chrome profile requires CDP attach (default). "
-            "Do not set UPS_USE_CHROME_CDP=0. "
-            "Or set UPS_BROWSER_MODE=dedicated and run --setup-login once."
-        )
 
     last_err: Exception | None = None
     seen_channels: set[str | None] = set()
