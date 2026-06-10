@@ -320,6 +320,15 @@ def _wait_and_dismiss_startup_dialogs(*, timeout_s: float) -> bool:
     return clicked_any
 
 
+def _import_export_ribbon_active(win) -> bool:
+    """True only when Import-Export ribbon actions are on screen (not merely the tab label)."""
+    return _ribbon_action_available(
+        win, "Batch Import", ("Button", "MenuItem", "SplitButton")
+    ) or _ribbon_action_available(
+        win, "Batch Export", ("Button", "MenuItem", "SplitButton")
+    )
+
+
 def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False) -> bool:
     if _blocking_dialog_visible():
         return False
@@ -328,21 +337,7 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
         win = app.window(title_re=WORLDSHIP_TITLE_RE)
         if not win.exists(timeout=win_timeout):
             return False
-        if _ribbon_action_available(
-            win, "Batch Import", ("Button", "MenuItem", "SplitButton")
-        ):
-            return True
-        for tab in _matching_controls(
-            win, title="Import-Export", control_types=("TabItem", "Button")
-        ):
-            try:
-                if tab.is_enabled() and tab.is_visible():
-                    return True
-                if _is_tab_selected(tab):
-                    return True
-            except Exception:
-                continue
-        return False
+        return _import_export_ribbon_active(win)
     except Exception:
         return False
 
@@ -601,20 +596,48 @@ def _ribbon_action_available(
 
 
 def _ensure_import_export_tab(main) -> None:
-    """Open Import-Export ribbon; skip click if that tab is already active."""
-    if _ribbon_action_available(
-        main, "Batch Import", ("Button", "MenuItem", "SplitButton")
-    ):
-        _log("Import-Export tab already active — skipping tab click.")
+    """Open Import-Export ribbon and verify Batch Import appears (Home tab is not enough)."""
+    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
+    verify_s = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 30.0)
+    attempts = int((os.environ.get("WORLDSHIP_STEP_RETRY_ATTEMPTS") or "5").strip() or "5")
+
+    if _import_export_ribbon_active(main):
+        _log("Import-Export ribbon already active (Batch Import visible).")
         return
-    for target in _matching_controls(main, title="Import-Export", control_types=("TabItem",)):
-        try:
-            if _is_tab_selected(target):
-                _log("Import-Export tab already selected — skipping tab click.")
+
+    for attempt in range(1, max(1, attempts) + 1):
+        if _import_export_ribbon_active(main):
+            _log("Import-Export ribbon active (Batch Import visible).")
+            return
+
+        _log(f"Clicking Import-Export tab (attempt {attempt}/{attempts})…")
+        _focus_main_window(main)
+        _click_when_ready(
+            main,
+            title="Import-Export",
+            control_types=("TabItem", "Button"),
+            timeout_s=min(30.0, verify_s),
+        )
+
+        deadline = time.monotonic() + verify_s
+        while time.monotonic() < deadline:
+            if _import_export_ribbon_active(main):
+                _log("Verified: Batch Import is on the ribbon.")
+                if after_tab_s > 0:
+                    time.sleep(after_tab_s)
                 return
-        except Exception:
-            continue
-    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
+            time.sleep(0.25)
+
+        _log(
+            f"Batch Import not visible after Import-Export click "
+            f"(attempt {attempt}/{attempts})."
+        )
+        time.sleep(1.0)
+
+    raise RuntimeError(
+        f"Import-Export tab did not show Batch Import after {attempts} attempt(s). "
+        "WorldShip may still be on the Home tab — check for blocking dialogs."
+    )
 
 
 _RIBBON_POLL_S = 0.03
@@ -1565,19 +1588,15 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
 
-    _log("Clicking Import-Export tab…")
     _ensure_import_export_tab(main)
 
-    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
-    if after_tab_s > 0:
-        time.sleep(after_tab_s)
-
     _log("Clicking Batch Import…")
+    _focus_main_window(main)
     _click_when_ready(
         main,
         title="Batch Import",
         control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=4,
+        timeout_s=_step_wait_s("WORLDSHIP_BATCH_IMPORT_CLICK_TIMEOUT_S", 20.0),
     )
 
     _log("Waiting for Batch Import wizard…")
