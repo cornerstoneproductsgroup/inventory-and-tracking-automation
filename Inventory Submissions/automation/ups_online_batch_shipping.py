@@ -352,8 +352,6 @@ def _open_browser(
                     user_data_dir.mkdir(parents=True, exist_ok=True)
                 home = _ups_home_url(cfg)
                 launch_kwargs["args"] = list(args)
-                if home not in launch_kwargs["args"]:
-                    launch_kwargs["args"].append(home)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,

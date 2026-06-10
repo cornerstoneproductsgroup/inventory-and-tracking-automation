@@ -271,13 +271,12 @@ def launch_chrome_persistent_playwright(
     )
 
     chrome_args = list(launch_args)
-    for flag in ("--new-window", "--disable-restore-session-state"):
+    for flag in ("--disable-restore-session-state",):
         if flag not in chrome_args:
             chrome_args.append(flag)
-    if home_url not in chrome_args:
-        chrome_args.append(home_url)
 
-    # Playwright sync API must run on the main thread (no ThreadPoolExecutor).
+    # Playwright forbids a startup URL in args for launch_persistent_context;
+    # navigate with page.goto() after launch instead.
     context = playwright.chromium.launch_persistent_context(
         str(user_data),
         channel="chrome",
