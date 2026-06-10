@@ -36,6 +36,7 @@ from automation.ups_batch_config import (
     use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
+from automation.ups_popup_dismiss import dismiss_ups_startup_popups
 from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
 from automation.windows_open_file import fill_open_file_dialog
 from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
@@ -165,13 +166,14 @@ def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
     current = (page.url or "").strip().lower()
     if "ups.com" in current:
         _log(f"On UPS: {page.url}")
-        return
-    _log(f"Navigating to {home_url}")
-    try:
-        page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-    except Exception as exc:
-        raise UpsBatchError(f"Could not open UPS home page: {exc}") from exc
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+    else:
+        _log(f"Navigating to {home_url}")
+        try:
+            page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
+        except Exception as exc:
+            raise UpsBatchError(f"Could not open UPS home page: {exc}") from exc
+        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+    dismiss_ups_startup_popups(page, cfg, log=_log)
 
 
 def _open_system_chrome_via_cdp(
@@ -202,6 +204,7 @@ def _open_system_chrome_via_cdp(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-session-crashed-bubble",
+        "--disable-notifications",
         home_url,
     ]
     subprocess.Popen(
@@ -458,6 +461,7 @@ def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual
 
 
 def _navigate_batch_shipping(page: Page, cfg: dict[str, Any]) -> None:
+    dismiss_ups_startup_popups(page, cfg, log=_log)
     if not _click_any(page, _sel(cfg, "shipping_tab"), label="Shipping tab"):
         raise UpsBatchError("Could not open Shipping tab")
     page.wait_for_timeout(600)

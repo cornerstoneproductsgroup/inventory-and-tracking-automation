@@ -53,12 +53,18 @@
     "third_party_country": "#nbsPaymentAccountCountryDropdownThirdParty",
     "billing_account": "label:has-text('186Y47'), label[for='billMyAccountSection0']",
     "preview_batch": "button:has-text('Preview Batch')",
-    "process_all": "#nwsCartProcessAll, button:has-text('Process All')"
+    "process_all": "#nwsCartProcessAll, button:has-text('Process All')",
+    "cookie_close": "#onetrust-close-btn-container button, button.onetrust-close-btn-handler, button[aria-label='Close']",
+    "cookie_settings_close": "#onetrust-pc-sdk button.onetrust-close-btn-handler, #onetrust-pc-sdk button[aria-label='Close']",
+    "location_deny": "button:has-text('Never allow'), button:has-text('Block')",
+    "extension_dismiss": "button[aria-label='Close'], button[aria-label='Dismiss']"
   },
   "timing": {
     "verify_wait_ms": 8000,
     "after_login_ms": 2000,
     "after_upload_ms": 3000,
-    "micro_pause_ms": 400
+    "micro_pause_ms": 400,
+    "popup_wait_ms": 1800,
+    "popup_dismiss_rounds": 4
   }
 }
