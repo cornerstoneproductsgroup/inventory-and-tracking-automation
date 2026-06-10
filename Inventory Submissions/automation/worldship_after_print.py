@@ -479,12 +479,9 @@ def _ribbon_action_available(
 
 
 def _click_ribbon(main, title: str, *, timeout_s: float = 8.0) -> None:
-    from automation.worldship_batch_import import _focus_main_window
-
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:
-        _focus_main_window(main)
         for ctrl_type in ("TabItem", "Button", "SplitButton", "MenuItem"):
             try:
                 for target in _matching_controls(

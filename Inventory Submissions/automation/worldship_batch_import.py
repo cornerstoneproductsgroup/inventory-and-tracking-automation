@@ -1,4 +1,4 @@
-"""UPS WorldShip desktop automation — Batch Import wizard (start phase)."""
+﻿"""UPS WorldShip desktop automation — Batch Import wizard (start phase)."""
 
 from __future__ import annotations
 
@@ -350,7 +350,6 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
 def _focus_main_window(win) -> None:
     import win32con
     import win32gui
-    import win32process
 
     hwnd: int | None = None
     try:
@@ -365,25 +364,9 @@ def _focus_main_window(win) -> None:
     if hwnd:
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            fg = win32gui.GetForegroundWindow()
-            if fg and fg != hwnd:
-                fg_thread, _ = win32process.GetWindowThreadProcessId(fg)
-                target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
-                attached = False
-                try:
-                    win32process.AttachThreadInput(fg_thread, target_thread, True)
-                    attached = True
-                    win32gui.SetForegroundWindow(hwnd)
-                finally:
-                    if attached:
-                        win32process.AttachThreadInput(fg_thread, target_thread, False)
-            else:
-                win32gui.SetForegroundWindow(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
         except Exception:
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            pass
     try:
         win.set_focus()
     except Exception:
@@ -425,8 +408,8 @@ def _resolve_main_window(app, *, cold_start: bool):
     """Return the main WorldShip window; skip long waits when already loaded."""
     _dismiss_blocking_dialogs_once()
     _bring_worldship_to_front(app)
-    win = app.window(title_re=WORLDSHIP_TITLE_RE)
     if _import_export_tab_ready(app, fast=True):
+        win = app.window(title_re=WORLDSHIP_TITLE_RE)
         _focus_main_window(win)
         if not cold_start:
             _log("WorldShip already open — proceeding immediately.")
@@ -434,9 +417,7 @@ def _resolve_main_window(app, *, cold_start: bool):
             _log("Import-Export tab is ready (no blocking dialogs).")
         return win
     if not cold_start:
-        _focus_main_window(win)
-        _log("WorldShip already open — proceeding immediately.")
-        return win
+        _log("WorldShip is open but Import-Export is not ready yet — brief wait…")
     return _wait_until_import_export_ready(
         app,
         timeout_s=_ready_timeout_s(cold_start=cold_start),
@@ -620,21 +601,20 @@ def _ribbon_action_available(
 
 
 def _ensure_import_export_tab(main) -> None:
-    """Open Import-Export ribbon; skip click if Batch Import is already visible."""
-    _focus_main_window(main)
+    """Open Import-Export ribbon; skip click if that tab is already active."""
     if _ribbon_action_available(
         main, "Batch Import", ("Button", "MenuItem", "SplitButton")
     ):
         _log("Import-Export tab already active — skipping tab click.")
         return
-    _log("Clicking Import-Export tab…")
-    _focus_main_window(main)
-    _click_when_ready(
-        main,
-        title="Import-Export",
-        control_types=("TabItem", "Button"),
-        timeout_s=8.0,
-    )
+    for target in _matching_controls(main, title="Import-Export", control_types=("TabItem",)):
+        try:
+            if _is_tab_selected(target):
+                _log("Import-Export tab already selected — skipping tab click.")
+                return
+        except Exception:
+            continue
+    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
 
 
 _RIBBON_POLL_S = 0.03
@@ -652,7 +632,6 @@ def _click_when_ready(
     last_err: Exception | None = None
     saw_any = False
     while time.monotonic() < deadline:
-        _focus_main_window(win)
         clicked = False
         for target in _matching_controls(win, title=title, control_types=control_types):
             saw_any = True
@@ -1586,7 +1565,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
 
-    _focus_main_window(main)
+    _log("Clicking Import-Export tab…")
     _ensure_import_export_tab(main)
 
     after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
@@ -1594,12 +1573,11 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         time.sleep(after_tab_s)
 
     _log("Clicking Batch Import…")
-    _focus_main_window(main)
     _click_when_ready(
         main,
         title="Batch Import",
         control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=8.0,
+        timeout_s=4,
     )
 
     _log("Waiting for Batch Import wizard…")
