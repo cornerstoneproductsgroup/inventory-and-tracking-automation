@@ -15,7 +15,7 @@ echo ============================================================
 echo   Full Workflow — main menu
 echo ============================================================
 echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
-echo   W  WorldShip Batch Import
+echo   W  UPS Online Batch ^(Home Depot CSV upload + labels^)
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
@@ -47,7 +47,7 @@ set "EXTRA_ARGS=--fedex-batch-only"
 goto RUN
 
 :OPT_W
-set "EXTRA_ARGS=--worldship-import-only"
+set "EXTRA_ARGS=--ups-online-batch-only"
 goto RUN
 
 :OPT_O

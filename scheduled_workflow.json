@@ -60,12 +60,12 @@
   ],
   "_future_steps_examples": [
     {
-      "id": "worldship_import",
-      "label": "WorldShip Batch Import",
+      "id": "ups_online_batch",
+      "label": "UPS Online Batch — Home Depot CSV upload + labels",
       "enabled": false,
       "continue_on_error": true,
       "type": "workflow",
-      "args": ["--worldship-import-only"]
+      "args": ["--ups-online-batch-only"]
     },
     {
       "id": "tracking_invoicing",

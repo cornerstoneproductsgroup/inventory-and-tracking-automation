@@ -1,0 +1,62 @@
+{
+  "browser": {
+    "headless": false,
+    "slow_mo_ms": 80,
+    "default_timeout_ms": 120000,
+    "channel": "msedge",
+    "use_persistent_profile": true,
+    "user_data_dir": "ups_browser_profile"
+  },
+  "ups": {
+    "home_url": "https://www.ups.com/us/en/home",
+    "batch_landing_url": "https://www.ups.com/us/en/shipping/batch-file-shipping",
+    "username": "${UPS_USERNAME}",
+    "password": "${UPS_PASSWORD}"
+  },
+  "ship_from": {
+    "company": "HomeDepot.com",
+    "contact": "Cornerstone Products Group",
+    "address": "1106 E Turner Rd",
+    "city": "Lodi",
+    "state": "CA",
+    "zip": "95240"
+  },
+  "payment": {
+    "third_party_account": "1YA668",
+    "third_party_zip": "30339",
+    "third_party_country": "United States",
+    "billing_account_label": "186Y47 - Worldship"
+  },
+  "selectors": {
+    "header_login": "a:has(span.text:text-is('Log In')), button:has(span.text:text-is('Log In')), a:has-text('Log In')",
+    "dropdown_login": "a:has(span.text:text-is('Log In')), button:has(span.text:text-is('Log In'))",
+    "username_input": "#username, input[name='username']",
+    "password_input": "#password, input[name='password']",
+    "login_continue": "button:has-text('Continue'), button._button-login-id, button._button-login-password",
+    "verify_success": ".success-circle, circle.success-circle, text=Success!",
+    "shipping_tab": "button[aria-controls='subsection-shipping'], button:has-text('Shipping')",
+    "batch_file_shipping": "a:has-text('Batch File Shipping'), span:has-text('Batch File Shipping')",
+    "ship_now": "a:has-text('Ship Now'), button:has-text('Ship Now')",
+    "browse_file": "#uploadFileButton, button:has-text('Browse for File')",
+    "file_input": "input[type='file']",
+    "company_name": "#origin-cac_companyOrName",
+    "contact_name": "#origin-cac_contactName",
+    "address_line1": "#origin-cac_addressLine1",
+    "city": "#origin-cac_city",
+    "state": "#origin-cac_state",
+    "zip": "#origin-cac_postalCode",
+    "bill_other_account": "label[for='bill-someone-else-tile'], text=Bill Other Account",
+    "third_party_account": "#nbsPaymentAccountThirdPartyAccountNumberInput",
+    "third_party_zip": "#nbsPaymentAccountThirdPartyPostalCodeInput",
+    "third_party_country": "#nbsPaymentAccountCountryDropdownThirdParty",
+    "billing_account": "label:has-text('186Y47'), label[for='billMyAccountSection0']",
+    "preview_batch": "button:has-text('Preview Batch')",
+    "process_all": "#nwsCartProcessAll, button:has-text('Process All')"
+  },
+  "timing": {
+    "verify_wait_ms": 8000,
+    "after_login_ms": 2000,
+    "after_upload_ms": 3000,
+    "micro_pause_ms": 400
+  }
+}

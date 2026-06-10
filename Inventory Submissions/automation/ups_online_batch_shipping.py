@@ -1,0 +1,494 @@
+"""UPS.com batch file shipping — Home Depot lane (up to 250 shipments)."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import time
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    sync_playwright,
+)
+
+from automation.ups_batch_config import (
+    DEFAULT_BATCH_LANDING_URL,
+    DEFAULT_BROWSER_PROFILE_DIR,
+    DEFAULT_HOME_URL,
+    STORAGE_STATE,
+    depot_labels_pdf_path,
+    label_save_timeout_s,
+)
+from automation.ups_credentials import UpsCredentials, load_ups_credentials
+from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
+from automation.windows_open_file import fill_open_file_dialog
+from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
+
+
+def _log(msg: str) -> None:
+    print(f"[ups] {msg}", flush=True)
+
+
+class UpsBatchError(Exception):
+    pass
+
+
+_STEALTH_INIT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+"""
+
+
+@dataclass(frozen=True)
+class UpsBatchResult:
+    csv_path: Path
+    labels_path: Path | None
+    shipment_count: int | None
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _sel(cfg: dict[str, Any], key: str, default: str = "") -> str:
+    return (cfg.get("selectors", {}).get(key) or default).strip()
+
+
+def _timing_ms(cfg: dict[str, Any], key: str, env_key: str, default: int) -> int:
+    timing = cfg.get("timing") or {}
+    raw = str(timing.get(key) or os.environ.get(env_key) or default).strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return raw in ("1", "true", "yes", "on")
+
+
+def _resolve_channel(browser_cfg: dict[str, Any]) -> str | None:
+    explicit = (
+        (os.environ.get("UPS_BROWSER_CHANNEL") or "").strip()
+        or str(browser_cfg.get("channel") or "").strip()
+    )
+    lowered = explicit.lower()
+    if lowered in ("chromium", "bundled", "playwright"):
+        return None
+    if lowered == "auto" or not explicit:
+        return "msedge" if os.name == "nt" else "chrome"
+    return explicit
+
+
+def _resolve_user_data_dir(browser_cfg: dict[str, Any]) -> Path | None:
+    disable = (
+        (os.environ.get("UPS_USE_PERSISTENT_PROFILE") or "").strip().lower()
+        in ("0", "false", "no", "off")
+        or browser_cfg.get("use_persistent_profile") is False
+    )
+    if disable:
+        return None
+    raw = (
+        (os.environ.get("UPS_USER_DATA_DIR") or "").strip()
+        or str(browser_cfg.get("user_data_dir") or "").strip()
+    )
+    if raw.lower() in ("0", "false", "no", "off"):
+        return None
+    path = Path(raw) if raw else DEFAULT_BROWSER_PROFILE_DIR
+    if not path.is_absolute():
+        path = DEFAULT_BROWSER_PROFILE_DIR.parent / path
+    return path
+
+
+def _launch_args(browser_cfg: dict[str, Any]) -> list[str]:
+    extra = browser_cfg.get("args") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    base = ["--disable-blink-features=AutomationControlled"]
+    out: list[str] = []
+    for arg in [*base, *extra]:
+        text = str(arg).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _open_browser(
+    p: Playwright,
+    cfg: dict[str, Any],
+    *,
+    headless: bool,
+    slow_mo: int,
+) -> tuple[Browser | None, BrowserContext, Page, bool]:
+    browser_cfg = cfg.get("browser", {})
+    user_data_dir = _resolve_user_data_dir(browser_cfg)
+    args = _launch_args(browser_cfg)
+    ignore_default_args = ["--enable-automation"]
+    channels: list[str | None] = []
+    primary = _resolve_channel(browser_cfg)
+    if primary:
+        channels.append(primary)
+    for alt in ("msedge", "chrome"):
+        if alt not in channels:
+            channels.append(alt)
+    channels.append(None)
+
+    last_err: Exception | None = None
+    seen_channels: set[str | None] = set()
+    for channel in channels:
+        if channel in seen_channels:
+            continue
+        seen_channels.add(channel)
+        label = channel or "playwright chromium"
+        try:
+            launch_kwargs: dict[str, Any] = {
+                "headless": headless,
+                "slow_mo": slow_mo,
+                "args": args,
+                "ignore_default_args": ignore_default_args,
+            }
+            if channel:
+                launch_kwargs["channel"] = channel
+
+            if user_data_dir is not None:
+                user_data_dir.mkdir(parents=True, exist_ok=True)
+                context = p.chromium.launch_persistent_context(
+                    str(user_data_dir),
+                    accept_downloads=True,
+                    **launch_kwargs,
+                )
+                context.add_init_script(_STEALTH_INIT)
+                page = context.pages[0] if context.pages else context.new_page()
+                _log(f"Browser: {label} (profile {user_data_dir})")
+                return None, context, page, True
+
+            browser = p.chromium.launch(**launch_kwargs)
+            storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
+            context = browser.new_context(
+                accept_downloads=True,
+                storage_state=str(storage) if storage else None,
+                locale="en-US",
+                viewport={"width": 1440, "height": 900},
+            )
+            context.add_init_script(_STEALTH_INIT)
+            page = context.new_page()
+            _log(f"Browser: {label} (ephemeral)")
+            return browser, context, page, False
+        except Exception as exc:
+            last_err = exc
+            _log(f"WARN: launch failed ({label}): {exc}")
+
+    raise UpsBatchError(f"Could not launch browser. Last error: {last_err}")
+
+
+def _save_session(context: BrowserContext, *, persistent: bool) -> None:
+    if persistent:
+        _log(f"Session kept in profile ({DEFAULT_BROWSER_PROFILE_DIR}).")
+        return
+    context.storage_state(path=str(STORAGE_STATE))
+    _log(f"Session saved to {STORAGE_STATE}")
+
+
+def _click_any(page: Page, selectors: str, *, label: str = "", timeout_ms: int = 15_000) -> bool:
+    for sel in [s.strip() for s in selectors.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            loc.scroll_into_view_if_needed(timeout=3000)
+            loc.click(timeout=timeout_ms)
+            if label:
+                _log(f"Clicked {label}.")
+            return True
+        except Exception as exc:
+            _log(f"WARN: {label or sel} — {exc}")
+    return False
+
+
+def _fill_field(page: Page, selector: str, value: str, *, label: str) -> None:
+    for sel in [s.strip() for s in selector.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=12_000)
+            loc.click(timeout=5000)
+            loc.fill("")
+            loc.fill(value)
+            _log(f"Filled {label}: {value!r}")
+            return
+        except Exception:
+            continue
+    raise UpsBatchError(f"Could not fill {label}")
+
+
+def _select_dropdown(page: Page, selector: str, *, value: str | None = None, label_text: str | None = None, field: str) -> None:
+    for sel in [s.strip() for s in selector.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=12_000)
+            if value:
+                loc.select_option(value=value)
+            elif label_text:
+                loc.select_option(label=label_text)
+            _log(f"Selected {field}.")
+            return
+        except Exception:
+            continue
+    raise UpsBatchError(f"Could not select {field}")
+
+
+def _type_login_field(page: Page, selector: str, text: str) -> None:
+    loc = page.locator(selector).first
+    loc.wait_for(state="visible", timeout=20_000)
+    loc.click()
+    loc.fill("")
+    loc.press_sequentially(text, delay=40)
+
+
+def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual: bool) -> None:
+    ups = cfg.get("ups") or {}
+    home_url = str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
+    _log(f"Opening {home_url}")
+    page.goto(home_url, wait_until="domcontentloaded", timeout=90_000)
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+
+    if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
+        _log("Manual login — complete UPS sign-in in the browser, then press Enter here.")
+        input("[ups] Press Enter when logged in and UPS home/shipping is ready… ")
+        return
+
+    if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
+        raise UpsBatchError("Could not click header Log In")
+    page.wait_for_timeout(600)
+    if not _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In"):
+        _log("WARN: dropdown Log In not found — may already be on login page.")
+
+    _type_login_field(page, _sel(cfg, "username_input"), creds.username)
+    verify_ms = _timing_ms(cfg, "verify_wait_ms", "UPS_VERIFY_WAIT_MS", 8000)
+    try:
+        page.locator(_sel(cfg, "verify_success")).first.wait_for(
+            state="visible", timeout=verify_ms
+        )
+        _log("Username verification succeeded.")
+    except Exception:
+        _log("WARN: verification box not detected — continuing after short wait.")
+        page.wait_for_timeout(2000)
+
+    if not _click_any(page, _sel(cfg, "login_continue"), label="Continue (username)"):
+        raise UpsBatchError("Could not click Continue after username")
+
+    page.wait_for_timeout(800)
+    _type_login_field(page, _sel(cfg, "password_input"), creds.password)
+    if not _click_any(page, _sel(cfg, "login_continue"), label="Continue (password)"):
+        raise UpsBatchError("Could not click Continue after password")
+
+    page.wait_for_timeout(_timing_ms(cfg, "after_login_ms", "UPS_AFTER_LOGIN_MS", 2000))
+    _log("Login submitted.")
+
+
+def _navigate_batch_shipping(page: Page, cfg: dict[str, Any]) -> None:
+    if not _click_any(page, _sel(cfg, "shipping_tab"), label="Shipping tab"):
+        raise UpsBatchError("Could not open Shipping tab")
+    page.wait_for_timeout(600)
+    if not _click_any(page, _sel(cfg, "batch_file_shipping"), label="Batch File Shipping"):
+        ups = cfg.get("ups") or {}
+        landing = str(ups.get("batch_landing_url") or DEFAULT_BATCH_LANDING_URL).strip()
+        _log(f"WARN: menu link failed — opening {landing}")
+        page.goto(landing, wait_until="domcontentloaded", timeout=90_000)
+    page.wait_for_timeout(800)
+    if not _click_any(page, _sel(cfg, "ship_now"), label="Ship Now"):
+        raise UpsBatchError("Could not click Ship Now")
+    page.wait_for_timeout(1200)
+    _log("Create a Shipment page loading…")
+
+
+def _upload_csv(page: Page, cfg: dict[str, Any], csv_path: Path) -> None:
+    browse = _sel(cfg, "browse_file")
+    file_input = _sel(cfg, "file_input")
+
+    uploaded = False
+    if file_input:
+        try:
+            loc = page.locator(file_input).first
+            if loc.count() > 0:
+                loc.set_input_files(str(csv_path))
+                uploaded = True
+                _log(f"Uploaded via file input: {csv_path.name}")
+        except Exception as exc:
+            _log(f"WARN: set_input_files failed: {exc}")
+
+    if not uploaded:
+        try:
+            with page.expect_file_chooser(timeout=15_000) as fc_info:
+                _click_any(page, browse, label="Browse for File", timeout_ms=10_000)
+            fc_info.value.set_files(str(csv_path))
+            uploaded = True
+            _log(f"Uploaded via file chooser: {csv_path.name}")
+        except Exception as exc:
+            _log(f"WARN: file chooser failed: {exc}")
+
+    if not uploaded:
+        _click_any(page, browse, label="Browse for File", timeout_ms=10_000)
+        if not fill_open_file_dialog(csv_path, timeout_s=45.0):
+            raise UpsBatchError(f"Could not select CSV via Open dialog: {csv_path}")
+        uploaded = True
+
+    page.wait_for_timeout(_timing_ms(cfg, "after_upload_ms", "UPS_AFTER_UPLOAD_MS", 3000))
+
+
+def _fill_ship_from(page: Page, cfg: dict[str, Any]) -> None:
+    ship = cfg.get("ship_from") or {}
+    _fill_field(page, _sel(cfg, "company_name"), str(ship.get("company") or "HomeDepot.com"), label="Company")
+    _fill_field(page, _sel(cfg, "contact_name"), str(ship.get("contact") or "Cornerstone Products Group"), label="Contact")
+    _fill_field(page, _sel(cfg, "address_line1"), str(ship.get("address") or "1106 E Turner Rd"), label="Address")
+    _fill_field(page, _sel(cfg, "city"), str(ship.get("city") or "Lodi"), label="City")
+    _select_dropdown(page, _sel(cfg, "state"), value=str(ship.get("state") or "CA"), field="State")
+    _fill_field(page, _sel(cfg, "zip"), str(ship.get("zip") or "95240"), label="ZIP")
+
+
+def _fill_payment(page: Page, cfg: dict[str, Any]) -> None:
+    pay = cfg.get("payment") or {}
+    if not _click_any(page, _sel(cfg, "bill_other_account"), label="Bill Other Account"):
+        raise UpsBatchError("Could not select Bill Other Account")
+    page.wait_for_timeout(500)
+    _fill_field(
+        page,
+        _sel(cfg, "third_party_account"),
+        str(pay.get("third_party_account") or "1YA668"),
+        label="Third-party account",
+    )
+    _fill_field(
+        page,
+        _sel(cfg, "third_party_zip"),
+        str(pay.get("third_party_zip") or "30339"),
+        label="Third-party ZIP",
+    )
+    country = str(pay.get("third_party_country") or "United States")
+    try:
+        _select_dropdown(page, _sel(cfg, "third_party_country"), label_text=country, field="Country")
+    except UpsBatchError:
+        _select_dropdown(page, _sel(cfg, "third_party_country"), value="252", field="Country")
+
+    acct_label = str(pay.get("billing_account_label") or "186Y47 - Worldship")
+    if not _click_any(page, _sel(cfg, "billing_account"), label=f"Billing account ({acct_label})"):
+        try:
+            page.get_by_label(acct_label, exact=False).click(timeout=8000)
+        except Exception as exc:
+            raise UpsBatchError(f"Could not select billing account: {exc}") from exc
+
+
+def _preview_and_process(page: Page, cfg: dict[str, Any], context: BrowserContext) -> Page:
+    if not _click_any(page, _sel(cfg, "preview_batch"), label="Preview Batch"):
+        raise UpsBatchError("Could not click Preview Batch")
+    page.wait_for_timeout(3000)
+    _log("Batch Processing page loaded.")
+
+    process_sel = _sel(cfg, "process_all")
+    with context.expect_page(timeout=120_000) as page_info:
+        if not _click_any(page, process_sel, label="Process All", timeout_ms=30_000):
+            raise UpsBatchError("Could not click Process All")
+    labels_page = page_info.value
+    labels_page.wait_for_load_state("domcontentloaded", timeout=60_000)
+    _log("Label print/preview page opened.")
+    return labels_page
+
+
+def _save_labels_pdf(labels_page: Page, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    timeout_s = label_save_timeout_s()
+
+    # CDP printToPDF (works for print-preview tabs)
+    try:
+        cdp = labels_page.context.new_cdp_session(labels_page)
+        result = cdp.send(
+            "Page.printToPDF",
+            {"printBackground": True, "preferCSSPageSize": True},
+        )
+        data = base64.b64decode(result.get("data") or "")
+        if len(data) > 2000:
+            dest.write_bytes(data)
+            _log(f"Saved labels via printToPDF: {dest}")
+            return
+    except Exception as exc:
+        _log(f"WARN: printToPDF failed: {exc}")
+
+    # Download event
+    try:
+        with labels_page.expect_download(timeout=int(timeout_s * 1000)) as dl_info:
+            labels_page.keyboard.press("Control+s")
+        dl_info.value.save_as(str(dest))
+        if dest.is_file() and dest.stat().st_size > 2000:
+            _log(f"Saved labels via download: {dest}")
+            return
+    except Exception as exc:
+        _log(f"WARN: download save failed: {exc}")
+
+    # Native Save As
+    try:
+        labels_page.keyboard.press("Control+s")
+        if wait_for_save_as_dialog(timeout_s=min(30.0, timeout_s)):
+            if fill_save_as_dialog(dest, timeout_s=timeout_s):
+                if dest.is_file():
+                    _log(f"Saved labels via Save As dialog: {dest}")
+                    return
+    except Exception as exc:
+        _log(f"WARN: Save As dialog failed: {exc}")
+
+    raise UpsBatchError(f"Could not save label PDF to {dest}")
+
+
+def run_ups_depot_batch(
+    *,
+    config_path: Path,
+    csv_path: Path | None = None,
+    order_date: date | None = None,
+    manual_login: bool = False,
+    skip_upload: bool = False,
+    headless: bool | None = None,
+) -> UpsBatchResult:
+    cfg = _load_config(config_path)
+    creds = load_ups_credentials(cfg)
+    browser_cfg = cfg.get("browser", {})
+    slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
+    if headless is None:
+        headless = bool(browser_cfg.get("headless", False))
+
+    upload_csv = resolve_upload_csv(order_date=order_date, explicit_path=csv_path) if not skip_upload else None
+    labels_dest = depot_labels_pdf_path(order_date)
+
+    with sync_playwright() as p:
+        browser, context, page, persistent = _open_browser(
+            p, cfg, headless=headless, slow_mo=slow_mo
+        )
+        try:
+            _ups_login(page, cfg, creds, manual=manual_login)
+            _navigate_batch_shipping(page, cfg)
+            if upload_csv is not None:
+                _upload_csv(page, cfg, upload_csv)
+            _fill_ship_from(page, cfg)
+            _fill_payment(page, cfg)
+            labels_page = _preview_and_process(page, cfg, context)
+            _save_labels_pdf(labels_page, labels_dest)
+            _save_session(context, persistent=persistent)
+        finally:
+            if browser is not None:
+                browser.close()
+            else:
+                context.close()
+
+    return UpsBatchResult(
+        csv_path=upload_csv or Path(""),
+        labels_path=labels_dest,
+        shipment_count=None,
+    )
