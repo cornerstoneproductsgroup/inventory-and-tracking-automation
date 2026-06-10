@@ -348,29 +348,9 @@ def _import_export_tab_ready(app, *, timeout_s: float = 2.0, fast: bool = False)
 
 
 def _focus_main_window(win) -> None:
-    import win32con
-    import win32gui
+    from automation.worldship_ribbon_click import focus_main_window
 
-    hwnd: int | None = None
-    try:
-        hwnd = int(win.handle)
-    except Exception:
-        pass
-    try:
-        if win.is_minimized():
-            win.restore()
-    except Exception:
-        pass
-    if hwnd:
-        try:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    try:
-        win.set_focus()
-    except Exception:
-        pass
+    focus_main_window(win, log=_log)
 
 
 def _bring_worldship_to_front(app) -> bool:
@@ -601,20 +581,9 @@ def _ribbon_action_available(
 
 
 def _ensure_import_export_tab(main) -> None:
-    """Open Import-Export ribbon; skip click if that tab is already active."""
-    if _ribbon_action_available(
-        main, "Batch Import", ("Button", "MenuItem", "SplitButton")
-    ):
-        _log("Import-Export tab already active — skipping tab click.")
-        return
-    for target in _matching_controls(main, title="Import-Export", control_types=("TabItem",)):
-        try:
-            if _is_tab_selected(target):
-                _log("Import-Export tab already selected — skipping tab click.")
-                return
-        except Exception:
-            continue
-    _click_when_ready(main, title="Import-Export", control_types=("TabItem", "Button"), timeout_s=3)
+    from automation.worldship_ribbon_click import ensure_import_export_tab
+
+    ensure_import_export_tab(main, log=_log)
 
 
 _RIBBON_POLL_S = 0.03
@@ -1565,20 +1534,13 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     app, cold_start = _connect_or_start(Application, startup_timeout_s=startup_timeout_s)
     main = _resolve_main_window(app, cold_start=cold_start)
 
-    _log("Clicking Import-Export tab…")
+    _focus_main_window(main)
+    time.sleep(0.4)
     _ensure_import_export_tab(main)
 
-    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.35)
-    if after_tab_s > 0:
-        time.sleep(after_tab_s)
+    from automation.worldship_ribbon_click import click_batch_import
 
-    _log("Clicking Batch Import…")
-    _click_when_ready(
-        main,
-        title="Batch Import",
-        control_types=("Button", "MenuItem", "SplitButton"),
-        timeout_s=4,
-    )
+    click_batch_import(main, log=_log)
 
     _log("Waiting for Batch Import wizard…")
     wizard = _wait_for_batch_import_wizard(app, main, timeout_s=8)

@@ -479,21 +479,16 @@ def _ribbon_action_available(
 
 
 def _click_ribbon(main, title: str, *, timeout_s: float = 8.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        for ctrl_type in ("TabItem", "Button", "SplitButton", "MenuItem"):
-            try:
-                for target in _matching_controls(
-                    main, title=title, control_types=(ctrl_type,)
-                ):
-                    if target.is_visible() and target.is_enabled():
-                        target.click_input()
-                        return
-            except Exception as exc:
-                last_err = exc
-        time.sleep(0.08)
-    raise RuntimeError(f"Could not click ribbon {title!r}: {last_err}")
+    from automation.worldship_ribbon_click import click_ribbon, focus_main_window
+
+    focus_main_window(main, log=_log)
+    click_ribbon(
+        main,
+        title=title,
+        control_types=("TabItem", "Button", "SplitButton", "MenuItem"),
+        timeout_s=timeout_s,
+        log=_log,
+    )
 
 
 def _home_tab_active(main) -> bool:
