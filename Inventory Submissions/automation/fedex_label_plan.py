@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from automation.fedex_batch_config import LOWES_LABELS_ROOT, label_filename
+from automation.fedex_batch_config import LOWES_LABELS_ROOT, label_filename, warehouse_label_queue_path
 from automation.fedex_lowes_csv import LowesOrderRow
 from automation.warehouse_print_vendors import is_warehouse_print_vendor
 from automation.worldship_vendor_map import VendorMapRegistry, lookup_vendor_folder, load_vendor_map
@@ -99,7 +99,7 @@ def print_label_plan(groups: list[VendorLabelGroup]) -> None:
     for group in groups:
         skus = ", ".join(t.sku for t in group.targets)
         if is_warehouse_print_vendor(group.vendor_folder):
-            dest = f"Zebra printer (warehouse print — not saved to {group.save_dir})"
+            dest = str(warehouse_label_queue_path(group.vendor_folder))
         else:
             dest = str(group.save_dir)
         _log(f"  [{group.vendor_folder}] {len(group.targets)} label(s) → {dest}")

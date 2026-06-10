@@ -96,6 +96,8 @@ def partner_text_to_key(partner_text: str) -> str | None:
     t = (partner_text or "").strip().lower()
     if not t:
         return None
+    if t in ("thdso", "home depot special order", "home depot special orders"):
+        return "thdso"
     if "special" in t and ("home depot" in t or "thdso" in t):
         return "thdso"
     if t in ("lowe's", "lowes", "lowe s"):

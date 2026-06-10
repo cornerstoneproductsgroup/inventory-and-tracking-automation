@@ -23,6 +23,11 @@ LOWES_LABELS_ROOT = _p(
     str(_PACKING_SLIPS / "3-Lowe's" / "1-Fedex Shipping Labels"),
 )
 
+WAREHOUSE_LABEL_QUEUE_DIR = _p(
+    "FEDEX_WAREHOUSE_LABEL_QUEUE_DIR",
+    str(LOWES_LABELS_ROOT / "z - Warehouse Print Queue"),
+)
+
 LOWES_CSV_OUTPUT_DIR = _p(
     "FEDEX_LOWES_CSV_DIR",
     str(
@@ -86,8 +91,7 @@ def shipment_report_download_timeout_ms() -> int:
         return 180_000
 
 
-def vendor_label_pdf_path(vendor_folder: str, order_date: date | None = None) -> Path:
-    """e.g. ...\\Agra Life\\Lowe's Agra Life 6-1-2026.pdf"""
+def _vendor_label_basename(vendor_folder: str, order_date: date | None = None) -> str:
     d = order_date or date.today()
     stamp = date_stamp(d)
     vendor = (vendor_folder or "Unknown").strip()
@@ -95,7 +99,19 @@ def vendor_label_pdf_path(vendor_folder: str, order_date: date | None = None) ->
     ext = (os.environ.get("FEDEX_LABEL_EXT") or ".pdf").strip()
     if ext and not name.lower().endswith(ext.lower()):
         name = f"{name}{ext}" if ext.startswith(".") else f"{name}.{ext}"
-    return LOWES_LABELS_ROOT / vendor / name
+    return name
+
+
+def vendor_label_pdf_path(vendor_folder: str, order_date: date | None = None) -> Path:
+    """e.g. ...\\Agra Life\\Lowe's Agra Life 6-1-2026.pdf"""
+    vendor = (vendor_folder or "Unknown").strip()
+    return LOWES_LABELS_ROOT / vendor / _vendor_label_basename(vendor_folder, order_date)
+
+
+def warehouse_label_queue_path(vendor_folder: str, order_date: date | None = None) -> Path:
+    """Staging path for warehouse Zebra labels — watcher prints when file lands here."""
+    vendor = (vendor_folder or "Unknown").strip()
+    return WAREHOUSE_LABEL_QUEUE_DIR / vendor / _vendor_label_basename(vendor_folder, order_date)
 
 
 def upload_poll_timeout_s() -> float:

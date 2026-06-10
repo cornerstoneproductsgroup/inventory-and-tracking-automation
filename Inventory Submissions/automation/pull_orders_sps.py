@@ -38,13 +38,14 @@ def _log(msg: str) -> None:
     print(f"[pull-orders/sps] {msg}", flush=True)
 
 
-def ensure_status_new(page: Page) -> None:
-    """Set Advanced Search Status filter to New."""
-    for _ in range(6):
+def _clear_status_filter(page: Page) -> None:
+    """Remove all Status chips (e.g. New + Cancelled) before applying a single status."""
+    for _ in range(10):
         removed = False
         for sel in (
             "xpath=//*[contains(normalize-space(.), 'Status')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
             "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'close') or contains(@class,'sps-icon-close')][1]",
+            "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'tag') or contains(@class,'chip')][1]//*[contains(@class,'close') or self::button][1]",
         ):
             for ctx in _contexts(page):
                 try:
@@ -61,6 +62,11 @@ def ensure_status_new(page: Page) -> None:
                 break
         if not removed:
             break
+
+
+def ensure_status_new(page: Page) -> None:
+    """Set Advanced Search Status filter to New only."""
+    _clear_status_filter(page)
 
     for attempt in range(1, 6):
         clear_click_blockers(page)
@@ -127,6 +133,7 @@ def open_order_new_search(page: Page) -> None:
 
     clear_document_type_filter(page)
     ensure_document_type_order(page)
+    _clear_status_filter(page)
     ensure_status_new(page)
     click_advanced_search_button(page)
     page.wait_for_load_state("domcontentloaded")
@@ -152,12 +159,21 @@ def _result_rows(page: Page):
 
 
 def _row_matches_tractor(text: str) -> bool:
-    return "tractor supply dropship" in text.lower()
+    t = text.lower()
+    if "tractor supply dropship" not in t:
+        return False
+    if "cancelled" in t:
+        return False
+    return True
 
 
 def _row_matches_grainger(text: str) -> bool:
     t = text.lower()
-    return bool(re.search(r"\bgrainger\b", t))
+    if not re.search(r"\bgrainger\b", t):
+        return False
+    if "cancelled" in t:
+        return False
+    return True
 
 
 def _row_checkbox(row) -> object | None:

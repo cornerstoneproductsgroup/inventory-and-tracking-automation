@@ -28,6 +28,7 @@ from automation.fedex_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_LOGIN_URL,
     STORAGE_STATE,
+    WAREHOUSE_LABEL_QUEUE_DIR,
     label_save_timeout_s,
     lowes_fedex_master_path,
     pdf_page_wait_ms,
@@ -36,7 +37,13 @@ from automation.fedex_batch_config import (
     upload_poll_timeout_s,
     vendor_label_pdf_path,
     warehouse_after_print_ms,
+    warehouse_label_queue_path,
     warehouse_print_pause_ms,
+)
+from automation.fedex_warehouse_label_watcher import (
+    FedexWarehouseLabelWatcher,
+    drain_timeout_s,
+    warehouse_label_print_mode,
 )
 from automation.fedex_credentials import FedexCredentials, env_file_path, load_fedex_credentials
 from automation.fedex_lowes_csv import LowesCsvSkip, resolve_upload_csv
@@ -2649,6 +2656,26 @@ def _zebra_label_printer() -> str:
     )
 
 
+def _warehouse_labels_use_queue() -> bool:
+    return warehouse_label_print_mode() == "queue"
+
+
+def _save_warehouse_label_to_queue(
+    label_tab: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    *,
+    vendor: str,
+    order_date: date | None,
+) -> bool:
+    """Save label PDF to the print queue; background watcher sends it to the Zebra."""
+    dest = warehouse_label_queue_path(vendor, order_date)
+    if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
+        return False
+    _log(f"Warehouse label saved to print queue: {dest}")
+    return True
+
+
 def _capture_label_from_finalize(
     list_page: Page,
     context: BrowserContext,
@@ -2690,6 +2717,19 @@ def _finalize_and_save_vendor_group(
         label_tab = _capture_label_from_finalize(page, context, cfg, orders=group)
         try:
             if warehouse:
+                if _warehouse_labels_use_queue():
+                    ok = _save_warehouse_label_to_queue(
+                        label_tab,
+                        context,
+                        cfg,
+                        vendor=vendor,
+                        order_date=order_date,
+                    )
+                    if not ok:
+                        return False, 0
+                    dest = warehouse_label_queue_path(vendor, order_date)
+                    pages = _count_pdf_pages(dest)
+                    return True, pages or len(group)
                 printer = _zebra_label_printer()
                 ok = _print_warehouse_label_with_fallback(
                     label_tab,
@@ -2712,7 +2752,10 @@ def _finalize_and_save_vendor_group(
             return True, pages
         finally:
             _close_label_tabs(page, context, pages_before)
-            settle_ms = warehouse_after_print_ms() if warehouse else 1200
+            if warehouse and not _warehouse_labels_use_queue():
+                settle_ms = warehouse_after_print_ms()
+            else:
+                settle_ms = 1200
             page.wait_for_timeout(settle_ms)
             try:
                 page.wait_for_load_state("domcontentloaded")
@@ -2748,7 +2791,20 @@ def _process_vendor_group_labels_sequential(
             )
             try:
                 if warehouse:
-                    if _print_warehouse_label_with_fallback(
+                    if _warehouse_labels_use_queue():
+                        fd, tmp_name = tempfile.mkstemp(
+                            suffix=".pdf", prefix=f"fedex_wh_label_{idx}_"
+                        )
+                        os.close(fd)
+                        part = Path(tmp_name)
+                        try:
+                            if _save_pdf_from_label_tab(label_tab, context, part, cfg):
+                                label_parts.append(part)
+                                part = None
+                        finally:
+                            if part is not None:
+                                part.unlink(missing_ok=True)
+                    elif _print_warehouse_label_with_fallback(
                         label_tab,
                         context,
                         cfg,
@@ -2776,6 +2832,22 @@ def _process_vendor_group_labels_sequential(
             _log(f"WARN: sequential save failed for {order.reference!r}: {exc}")
 
     if warehouse:
+        if _warehouse_labels_use_queue():
+            if not label_parts:
+                return False, 0
+            dest = warehouse_label_queue_path(vendor, order_date)
+            if len(label_parts) == 1:
+                if not _persist_label_pdf_to_disk(dest, label_parts[0].read_bytes()):
+                    return False, 0
+            else:
+                _merge_pdf_files(label_parts, dest)
+                if not _wait_label_pdf_on_disk(dest):
+                    return False, 0
+            for part in label_parts:
+                part.unlink(missing_ok=True)
+            pages = _count_pdf_pages(dest)
+            _log(f"Warehouse label saved to print queue: {dest}")
+            return True, pages or len(label_parts)
         return printed_jobs > 0, printed_jobs
 
     if not label_parts:
@@ -2914,10 +2986,17 @@ def _process_vendor_groups(
         skus = ", ".join(o.sku for o in group)
         _log(f"Vendor group {vendor!r}: {len(group)} shipment(s) — SKU(s): {skus}")
         if is_warehouse_print_vendor(vendor):
-            _log(
-                f"  → Zebra ({_zebra_label_printer()!r}): warehouse-print vendor — "
-                "labels will NOT be saved to the share"
-            )
+            if _warehouse_labels_use_queue():
+                dest = warehouse_label_queue_path(vendor, order_date)
+                _log(
+                    f"  → Warehouse print queue ({_zebra_label_printer()!r}): "
+                    f"save label PDF, watcher prints — {dest}"
+                )
+            else:
+                _log(
+                    f"  → Zebra ({_zebra_label_printer()!r}): warehouse-print vendor — "
+                    "Edge print UI (legacy mode)"
+                )
         else:
             dest = vendor_label_pdf_path(vendor, order_date)
             _log(f"  → Save PDF: {dest}")
@@ -2933,6 +3012,8 @@ def _process_vendor_groups(
         if is_warehouse_print_vendor(vendor):
             if ok:
                 printed_groups += 1
+            elif _warehouse_labels_use_queue():
+                _log(f"WARN: could not save warehouse label PDF to print queue for {vendor!r}")
             else:
                 _log(f"WARN: could not print all labels on Zebra for {vendor!r}")
         elif ok:
@@ -3200,6 +3281,7 @@ def run_fedex_batch(
             f"{order_splitter_watcher_path()}"
         )
 
+    warehouse_watcher: FedexWarehouseLabelWatcher | None = None
     if warehouse_vendors:
         try:
             zebra = _zebra_label_printer()
@@ -3208,6 +3290,12 @@ def run_fedex_batch(
             raise FedexBatchError(
                 f"Cannot resolve Zebra printer for warehouse labels: {exc}"
             ) from exc
+        if _warehouse_labels_use_queue():
+            _log(f"Warehouse labels: save to queue at {WAREHOUSE_LABEL_QUEUE_DIR}")
+            warehouse_watcher = FedexWarehouseLabelWatcher(WAREHOUSE_LABEL_QUEUE_DIR, zebra)
+            warehouse_watcher.start()
+        else:
+            _log("Warehouse labels: legacy Edge print UI (FEDEX_WAREHOUSE_LABEL_PRINT_MODE=edge)")
 
     if manual_login:
         _log("Login mode: manual (browser sign-in, no auto-fill).")
@@ -3222,56 +3310,67 @@ def run_fedex_batch(
     slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
     default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
 
-    with sync_playwright() as p:
-        browser, context, page, persistent = _open_fedex_browser(
-            p, cfg, headless=headless, slow_mo=slow_mo
-        )
-        page.set_default_timeout(default_timeout)
-        try:
-            _login_if_needed(
-                page,
-                cfg,
-                creds,
-                manual_login=manual_login,
-                skip_auto_login=skip_auto_login,
+    saved_pdfs = 0
+    queued_groups = 0
+    try:
+        with sync_playwright() as p:
+            browser, context, page, persistent = _open_fedex_browser(
+                p, cfg, headless=headless, slow_mo=slow_mo
             )
-
-            ready_count = 0
-            if not skip_upload:
-                _upload_lowes_csv(page, cfg, upload_csv)
-                ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
-                mark_file_used(csv_basename, note="uploaded to FedEx batch")
-            else:
-                _log("skip_upload: opening existing batch from uploads table…")
-                _ensure_batch_uploads_list(page, cfg)
-                ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
-
-            _open_batch_shipments(
-                page, cfg, csv_basename, expected_ready=ready_count
-            )
-            saved, printed = _process_vendor_groups(
-                page,
-                context,
-                cfg,
-                order_date=d,
-                expected_row_count=ready_count,
-            )
-            _log(f"Saved {saved} vendor label PDF(s) to share.")
-            if printed:
-                _log(f"Printed {printed} warehouse vendor group(s) on Zebra.")
-
-            if ready_count > 0 and saved == 0 and printed == 0:
-                raise FedexBatchError(
-                    f"Batch had {ready_count} shipment(s) ready to finalize but no labels were "
-                    "saved or printed. Skipping shipment report export."
+            page.set_default_timeout(default_timeout)
+            try:
+                _login_if_needed(
+                    page,
+                    cfg,
+                    creds,
+                    manual_login=manual_login,
+                    skip_auto_login=skip_auto_login,
                 )
 
-            _export_shipment_report_for_tracking(page, cfg)
+                ready_count = 0
+                if not skip_upload:
+                    _upload_lowes_csv(page, cfg, upload_csv)
+                    ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
+                    mark_file_used(csv_basename, note="uploaded to FedEx batch")
+                else:
+                    _log("skip_upload: opening existing batch from uploads table…")
+                    _ensure_batch_uploads_list(page, cfg)
+                    ready_count = _wait_for_batch_ready(page, cfg, csv_basename)
 
-            _save_fedex_session(context, uses_persistent_profile=persistent)
-        finally:
-            context.close()
-            if browser is not None:
-                browser.close()
+                _open_batch_shipments(
+                    page, cfg, csv_basename, expected_ready=ready_count
+                )
+                saved_pdfs, queued_groups = _process_vendor_groups(
+                    page,
+                    context,
+                    cfg,
+                    order_date=d,
+                    expected_row_count=ready_count,
+                )
+                _log(f"Saved {saved_pdfs} vendor label PDF(s) to share.")
+                if warehouse_watcher is None and queued_groups:
+                    _log(f"Printed {queued_groups} warehouse vendor group(s) on Zebra.")
+
+                if ready_count > 0 and saved_pdfs == 0 and queued_groups == 0:
+                    raise FedexBatchError(
+                        f"Batch had {ready_count} shipment(s) ready to finalize but no labels were "
+                        "saved or printed. Skipping shipment report export."
+                    )
+
+                _export_shipment_report_for_tracking(page, cfg)
+
+                _save_fedex_session(context, uses_persistent_profile=persistent)
+            finally:
+                context.close()
+                if browser is not None:
+                    browser.close()
+    finally:
+        if warehouse_watcher is not None:
+            watcher_printed = warehouse_watcher.stop_and_drain(timeout_s=drain_timeout_s())
+            if queued_groups:
+                _log(
+                    f"Queued {queued_groups} warehouse vendor group(s); "
+                    f"watcher printed {watcher_printed} label PDF(s) on Zebra."
+                )
 
     return 0

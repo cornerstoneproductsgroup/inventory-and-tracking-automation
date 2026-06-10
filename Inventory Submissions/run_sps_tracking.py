@@ -1170,9 +1170,9 @@ def ensure_document_type_order(page: Page) -> None:
         picked = click_first_visible(
             page,
             [
-                "li[role='option']:has-text('Order')",
-                "[role='option']:has-text('Order')",
-                "xpath=//*[@role='option' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
+                "xpath=//*[@role='option' and normalize-space(.)='Order']",
+                "li[role='option']:has-text('Order'):not(:has-text('Forwarded'))",
+                "[role='option']:has-text('Order'):not(:has-text('Forwarded'))",
             ],
             timeout_ms=1_400,
         )
@@ -1183,20 +1183,36 @@ def ensure_document_type_order(page: Page) -> None:
             except Exception:
                 pass
         page.wait_for_timeout(150)
-        for sel in (
-            "xpath=//*[contains(@class,'tag') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
-            "xpath=//*[contains(@class,'chip') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')]",
-            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'order')][1]",
-        ):
-            for ctx in _contexts(page):
-                try:
-                    loc = ctx.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        print(f"Document Type filter confirmed as 'Order' on attempt {attempt}.")
-                        return
-                except Exception:
-                    continue
+        if _document_type_filter_is_order(page):
+            print(f"Document Type filter confirmed as 'Order' on attempt {attempt}.")
+            return
     raise RuntimeError("Could not set Document Type filter to 'Order'.")
+
+
+def _document_type_filter_is_order(page: Page) -> bool:
+    """True when the Document Type chip is exactly Order (not Forwarded Order)."""
+    for ctx in _contexts(page):
+        for sel in (
+            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::*[contains(@class,'tag') or contains(@class,'chip')][1]",
+            "xpath=//*[contains(@class,'tag') or contains(@class,'chip')]",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                for i in range(min(loc.count(), 12)):
+                    node = loc.nth(i)
+                    if not node.is_visible():
+                        continue
+                    text = (node.inner_text(timeout=500) or "").strip()
+                    if not text:
+                        continue
+                    low = text.lower()
+                    if "forwarded" in low:
+                        continue
+                    if low == "order" or text == "Order":
+                        return True
+            except Exception:
+                continue
+    return False
 
 
 def set_workflow_ready_for_shipment(page: Page, workflow_selector: str) -> None:

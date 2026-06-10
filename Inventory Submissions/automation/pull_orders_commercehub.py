@@ -47,8 +47,9 @@ FORM_EXPORT_BUTTON = 'input[data-test="form-export-button"], button[data-test="f
 
 _READY_TO_DOWNLOAD = re.compile(r"ready\s+to\s+download", re.I)
 
-# thdso before depot so "Home Depot Special Order" is not matched as depot.
-RETAILER_PULL_ORDER = ("thdso", "depot", "lowes")
+# Regular Home Depot before Special Orders — CSV master sheet order matters (depot then thdso).
+# Row matching still excludes "special" from the depot row locator.
+RETAILER_PULL_ORDER = ("depot", "thdso", "lowes")
 
 DOWNLOAD_TIMEOUT_MS = 120_000
 FILE_RESPONSE_TIMEOUT_MS = 90_000
@@ -227,6 +228,52 @@ def _partner_key_from_row(row) -> str | None:
         return partner_text_to_key(row.inner_text(timeout=3_000))
     except Exception:
         return None
+
+
+def _partner_label_from_row(row) -> str:
+    """Human-readable partner name from td.characterdata (for logs and verification)."""
+    try:
+        cells = row.locator("td.characterdata")
+        for i in range(cells.count()):
+            text = (cells.nth(i).inner_text(timeout=2_000) or "").strip()
+            if partner_text_to_key(text):
+                return text
+    except Exception:
+        pass
+    return ""
+
+
+def _find_retailer_row_for_key(
+    frame: Frame | Page, key: str
+) -> tuple[object, object, str] | None:
+    """
+    Locate exactly one table row for ``key`` and verify partner text maps to that key.
+    Returns (row, click_target, partner_label) or None.
+    """
+    label = RETAILERS[key].label
+    rows = _retailer_row_locator(frame, key)
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        try:
+            if not row.is_visible():
+                continue
+        except Exception:
+            continue
+        row_key = _partner_key_from_row(row)
+        partner_label = _partner_label_from_row(row)
+        if row_key != key:
+            _log(
+                f"WARN: skipping row for {label}: partner cell {partner_label!r} "
+                f"maps to {row_key!r}, expected {key!r}."
+            )
+            continue
+        target = _row_click_target(row, partner_key=key)
+        if target is None:
+            _log(f"WARN: {label} row ({partner_label!r}) has no download control.")
+            continue
+        _log(f"Matched {label} row: partner={partner_label!r}")
+        return row, target, partner_label
+    return None
 
 
 def _clickable_in_cell(cell):
@@ -534,48 +581,37 @@ def _try_native_save_as(dest: Path) -> bool:
     return False
 
 
-def _import_recent_browser_download(dest: Path, *, since: float) -> Path | None:
-    """If the browser saved to Downloads silently, copy the newest matching file to dest."""
-    home = Path(os.environ.get("USERPROFILE") or Path.home())
-    watch_dirs = [
-        home / "Downloads",
-        dest.parent,
-    ]
-    want_ext = dest.suffix.lower()
-    extra_ext = {".pdf", ".csv", ".neworders", ".zip"}
-    if want_ext:
-        extra_ext.add(want_ext)
-
-    best: Path | None = None
-    best_mtime = since - 1.0
-    for folder in watch_dirs:
-        if not folder.is_dir():
-            continue
+def _dismiss_commercehub_overlays(page: Page) -> None:
+    """Close export modals / dialogs so the next retailer row click starts clean."""
+    for _ in range(3):
         try:
-            entries = list(folder.iterdir())
-        except OSError:
-            continue
-        for path in entries:
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in extra_ext:
-                continue
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+    for sel in (
+        'button[data-test="form-cancel-button"]',
+        "button:has-text('Cancel')",
+        "button:has-text('Close')",
+        ".modal button.close",
+        "[role='dialog'] button:has-text('Close')",
+    ):
+        for fr in _all_frames(page):
             try:
-                st = path.stat()
-            except OSError:
+                loc = fr.locator(sel)
+                for i in range(min(loc.count(), 3)):
+                    btn = loc.nth(i)
+                    if btn.is_visible():
+                        btn.click(timeout=2_000)
+                        page.wait_for_timeout(300)
+            except Exception:
                 continue
-            if st.st_size < 100 or st.st_mtime < since - 3:
-                continue
-            if st.st_mtime > best_mtime:
-                best_mtime = st.st_mtime
-                best = path
-
-    if best is None:
-        return None
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(best, dest)
-    _log(f"Copied recent file from {best.parent} → {dest.name} ({dest.stat().st_size:,} bytes)")
-    return dest
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if _find_form_export_button(page, timeout_ms=400) is None and _visible_dialog_download(page) is None:
+            break
+        page.wait_for_timeout(300)
+    page.wait_for_timeout(400)
 
 
 def _perform_click(target) -> None:
@@ -668,9 +704,6 @@ def _click_row_and_capture(
                 return dest
         else:
             _log(f"{label}: no export dialog yet (attempt {attempt}); re-clicking row…")
-            if attempt == 2 and _try_native_save_as(dest):
-                _log(f"{label}: saved via Save As (no modal).")
-                return dest
         _click_target()
         page.wait_for_timeout(700)
 
@@ -682,10 +715,8 @@ def _click_row_and_capture(
             page.wait_for_timeout(800)
             _click_dialog_if_open()
         resp = resp_info.value
-        suggested = _filename_from_response(resp)
-        out = dest.with_name(suggested) if suggested and "." in suggested else dest
-        _log(f"Saved from HTTP response ({resp.status}): {out.name}")
-        return _save_response_body(resp, out)
+        _log(f"Saved from HTTP response ({resp.status}): {dest.name}")
+        return _save_response_body(resp, dest)
     except PlaywrightTimeout:
         pass
 
@@ -730,11 +761,6 @@ def _click_row_and_capture(
         _log(f"{label}: saved via Save As dialog.")
         return dest
 
-    # 6) File may have landed in user Downloads
-    copied = _import_recent_browser_download(dest, since=started)
-    if copied is not None:
-        return copied
-
     _failure_screenshot(page, label)
     raise PlaywrightTimeout(
         f"{label}: file was not saved to {dest}. "
@@ -763,34 +789,69 @@ def _log_missing_retailers(found_keys: set[str], *, kind: str) -> None:
             _log(f"No {RETAILERS[key].label} {kind} on CommerceHub today; skipping.")
 
 
+def _download_one_retailer_from_table(
+    page: Page,
+    *,
+    key: str,
+    goto_table,
+    dest: Path,
+    retailer_label: str,
+) -> Path | None:
+    """Re-open the CommerceHub table page and download one retailer (fresh frame each time)."""
+    _dismiss_commercehub_overlays(page)
+    frame = goto_table(page)
+    match = _find_retailer_row_for_key(frame, key)
+    if match is None:
+        return None
+    row, click_target, partner_label = match
+    _log(f"Downloading for {retailer_label} (partner {partner_label!r}) → {dest}")
+    path = _download_retailer_file(
+        page,
+        frame,
+        row,
+        click_target,
+        dest,
+        retailer_label=retailer_label,
+    )
+    if not path.is_file() or path.stat().st_size < 100:
+        raise RuntimeError(f"Download did not produce a valid file at {path}")
+    if path.resolve() != dest.resolve() and dest.exists():
+        _log(f"WARN: saved to {path} but expected {dest}; copying to intended path.")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+        path = dest
+    return path
+
+
 def pull_commercehub_packing_slips(page: Page, *, order_date: date | None = None) -> list[Path]:
     """Download Depot / Lowe's / Special Order packing slip PDFs."""
     _log("Opening packing slips page…")
-    frame = _goto_packslips(page)
     saved: list[Path] = []
     found_keys: set[str] = set()
 
-    for key, row, click_target in _iter_retailer_downloads(frame):
-        found_keys.add(key)
+    for key in RETAILER_PULL_ORDER:
         cfg = RETAILERS[key]
         dest = cfg.pdf_dir / pdf_filename(cfg.label, order_date)
-        _log(f"Downloading packing slip for {cfg.label} → {dest}")
         try:
-            path = _download_retailer_file(
+            path = _download_one_retailer_from_table(
                 page,
-                frame,
-                row,
-                click_target,
-                dest,
+                key=key,
+                goto_table=_goto_packslips,
+                dest=dest,
                 retailer_label=cfg.label,
             )
+            if path is None:
+                _log(f"No row with td.characterdata for {cfg.label}.")
+                continue
+            found_keys.add(key)
             saved.append(path)
             _log(f"Saved {path.name} ({path.stat().st_size:,} bytes)")
         except PlaywrightTimeout:
             _log(f"WARN: download did not complete for {cfg.label}; skipping.")
         except Exception as exc:
             _log(f"WARN: {cfg.label} packing slip failed: {exc}")
-        page.wait_for_timeout(800)
+        finally:
+            _dismiss_commercehub_overlays(page)
 
     _log_missing_retailers(found_keys, kind="packing slip")
     if not saved:
@@ -835,25 +896,26 @@ def _read_csv_merchant_key(path: Path) -> str | None:
 def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -> list[Path]:
     """Download Depot / Lowe's / Special Order CSV order files (.neworders → .csv)."""
     _log("Opening order files page…")
-    frame = _goto_order_files(page)
     saved: list[Path] = []
     found_keys: set[str] = set()
 
-    for key, row, click_target in _iter_retailer_downloads(frame):
-        found_keys.add(key)
+    for key in RETAILER_PULL_ORDER:
         cfg = RETAILERS[key]
         _log(f"Downloading order CSV for {cfg.label}")
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 raw_path = Path(tmp) / "order.neworders"
-                saved_path = _download_retailer_file(
+                saved_path = _download_one_retailer_from_table(
                     page,
-                    frame,
-                    row,
-                    click_target,
-                    raw_path,
+                    key=key,
+                    goto_table=_goto_order_files,
+                    dest=raw_path,
                     retailer_label=cfg.label,
                 )
+                if saved_path is None:
+                    _log(f"No row with td.characterdata for {cfg.label}.")
+                    continue
+                found_keys.add(key)
                 raw_path = saved_path
                 csv_path = _neworders_to_csv(raw_path)
                 detected = _read_csv_merchant_key(csv_path)
@@ -879,7 +941,8 @@ def pull_commercehub_order_csvs(page: Page, *, order_date: date | None = None) -
             _log(f"WARN: no download started for {cfg.label} CSV; skipping.")
         except Exception as exc:
             _log(f"WARN: {cfg.label} CSV failed: {exc}")
-        page.wait_for_timeout(800)
+        finally:
+            _dismiss_commercehub_overlays(page)
 
     _log_missing_retailers(found_keys, kind="order file")
     if not saved:
