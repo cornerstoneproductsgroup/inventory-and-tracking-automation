@@ -84,6 +84,44 @@ def chrome_profile_directory() -> str:
     return (os.environ.get("UPS_CHROME_PROFILE") or "Default").strip() or "Default"
 
 
+def chrome_cdp_port() -> int:
+    raw = (os.environ.get("UPS_CHROME_CDP_PORT") or "9344").strip()
+    try:
+        return max(1024, int(raw))
+    except ValueError:
+        return 9344
+
+
+def chrome_executable() -> Path | None:
+    override = (os.environ.get("UPS_CHROME_EXE") or "").strip()
+    if override:
+        path = Path(override)
+        return path if path.is_file() else None
+    roots = [
+        os.environ.get("PROGRAMFILES", ""),
+        os.environ.get("PROGRAMFILES(X86)", ""),
+        os.environ.get("LOCALAPPDATA", ""),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        cand = Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
+    """Launch installed Chrome with --remote-debugging-port (opens URL, keeps profile cookies)."""
+    browser_cfg = browser_cfg or {}
+    env_raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip()
+    if env_raw:
+        return _env_bool("UPS_USE_CHROME_CDP", default=True)
+    if browser_cfg.get("use_chrome_cdp") is False:
+        return False
+    return use_system_chrome_profile(browser_cfg)
+
+
 def use_system_chrome_profile(browser_cfg: dict | None = None) -> bool:
     browser_cfg = browser_cfg or {}
     env_raw = (os.environ.get("UPS_USE_SYSTEM_CHROME") or "").strip()

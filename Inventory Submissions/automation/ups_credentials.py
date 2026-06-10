@@ -33,7 +33,11 @@ class UpsCredentials:
     password: str
 
 
-def load_ups_credentials(cfg: dict[str, Any] | None = None) -> UpsCredentials:
+def load_ups_credentials(
+    cfg: dict[str, Any] | None = None,
+    *,
+    optional: bool = False,
+) -> UpsCredentials:
     _load_env()
 
     username = (os.environ.get("UPS_USERNAME") or "").strip()
@@ -48,13 +52,13 @@ def load_ups_credentials(cfg: dict[str, Any] | None = None) -> UpsCredentials:
         if cfg_pass:
             password = cfg_pass
 
-    if not username:
+    if not username and not optional:
         raise ValueError(
             f"Missing UPS username. Add to {_ENV_FILE}:\n"
             "  UPS_USERNAME=your-ups-login\n"
             "Or set ups.username in ups_batch.json."
         )
-    if not password:
+    if not password and not optional:
         raise ValueError(
             f"Missing UPS password. Add to {_ENV_FILE}:\n"
             "  UPS_PASSWORD=your-ups-password\n"

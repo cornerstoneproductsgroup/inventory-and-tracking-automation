@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -24,11 +25,14 @@ from automation.ups_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_HOME_URL,
     STORAGE_STATE,
+    chrome_cdp_port,
+    chrome_executable,
     chrome_profile_directory,
     depot_labels_pdf_path,
     label_save_timeout_s,
     resolve_browser_user_data_dir,
     system_chrome_user_data_dir,
+    use_chrome_cdp_launch,
     use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
@@ -128,6 +132,108 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
     return out
 
 
+def _ups_home_url(cfg: dict[str, Any]) -> str:
+    ups = cfg.get("ups") or {}
+    return str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
+
+
+def _pick_ups_page(context: BrowserContext, *, home_url: str) -> Page:
+    for pg in context.pages:
+        try:
+            if "ups.com" in (pg.url or "").lower():
+                pg.bring_to_front()
+                return pg
+        except Exception:
+            continue
+    for pg in context.pages:
+        try:
+            url = (pg.url or "").strip()
+            if url and url not in ("about:blank", "chrome://newtab/", ""):
+                pg.bring_to_front()
+                return pg
+        except Exception:
+            continue
+    if context.pages:
+        pg = context.pages[0]
+        pg.bring_to_front()
+        return pg
+    return context.new_page()
+
+
+def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
+    home_url = _ups_home_url(cfg)
+    current = (page.url or "").strip().lower()
+    if "ups.com" in current:
+        _log(f"On UPS: {page.url}")
+        return
+    _log(f"Navigating to {home_url}")
+    try:
+        page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
+    except Exception as exc:
+        raise UpsBatchError(f"Could not open UPS home page: {exc}") from exc
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+
+
+def _open_system_chrome_via_cdp(
+    p: Playwright,
+    cfg: dict[str, Any],
+) -> tuple[Browser, BrowserContext, Page]:
+    exe = chrome_executable()
+    user_data = system_chrome_user_data_dir()
+    if exe is None or user_data is None:
+        raise UpsBatchError(
+            "Google Chrome or Chrome User Data folder not found. "
+            "Install Chrome or set UPS_CHROME_EXE / UPS_CHROME_USER_DATA_DIR."
+        )
+
+    home_url = _ups_home_url(cfg)
+    port = chrome_cdp_port()
+    profile = chrome_profile_directory()
+    _log(
+        f"Launching Chrome with your profile ({profile}) and opening UPS… "
+        "Close all Chrome windows first."
+    )
+
+    cmd = [
+        str(exe),
+        f"--user-data-dir={user_data}",
+        f"--profile-directory={profile}",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+        home_url,
+    ]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+    )
+
+    deadline = time.monotonic() + 60.0
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            if not browser.contexts:
+                time.sleep(0.5)
+                continue
+            context = browser.contexts[0]
+            page = _pick_ups_page(context, home_url=home_url)
+            _ensure_ups_home_page(page, cfg)
+            _log(f"Connected to Chrome — {page.url}")
+            return browser, context, page
+        except Exception as exc:
+            last_err = exc
+            time.sleep(0.8)
+
+    raise UpsBatchError(
+        f"Chrome opened but automation could not connect (port {port}). "
+        f"Close all Chrome windows and retry. {last_err}"
+    )
+
+
 def _open_browser(
     p: Playwright,
     cfg: dict[str, Any],
@@ -147,6 +253,12 @@ def _open_browser(
         if alt not in channels:
             channels.append(alt)
     channels.append(None)
+
+    if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
+        browser_cfg
+    ):
+        browser, context, page = _open_system_chrome_via_cdp(p, cfg)
+        return browser, context, page, True
 
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
         _log(
@@ -173,15 +285,17 @@ def _open_browser(
                 launch_kwargs["channel"] = channel
 
             if user_data_dir is not None:
-                user_data_dir.mkdir(parents=True, exist_ok=True)
+                if not _using_system_chrome_profile(user_data_dir, browser_cfg):
+                    user_data_dir.mkdir(parents=True, exist_ok=True)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,
                     **launch_kwargs,
                 )
                 context.add_init_script(_STEALTH_INIT)
-                page = context.pages[0] if context.pages else context.new_page()
-                _log(f"Browser: {label} (profile {user_data_dir})")
+                page = _pick_ups_page(context, home_url=_ups_home_url(cfg))
+                _ensure_ups_home_page(page, cfg)
+                _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
                 return None, context, page, True
 
             browser = p.chromium.launch(**launch_kwargs)
@@ -296,11 +410,7 @@ def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
 
 
 def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual: bool) -> None:
-    ups = cfg.get("ups") or {}
-    home_url = str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
-    _log(f"Opening {home_url}")
-    page.goto(home_url, wait_until="domcontentloaded", timeout=90_000)
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+    _ensure_ups_home_page(page, cfg)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
         _log("Manual login — complete UPS sign-in in the browser, then press Enter here.")
@@ -508,8 +618,12 @@ def run_ups_depot_batch(
     headless: bool | None = None,
 ) -> UpsBatchResult:
     cfg = _load_config(config_path)
-    creds = load_ups_credentials(cfg)
     browser_cfg = cfg.get("browser", {})
+    creds_optional = _env_bool(
+        "UPS_SKIP_AUTO_LOGIN",
+        default=use_system_chrome_profile(browser_cfg),
+    )
+    creds = load_ups_credentials(cfg, optional=creds_optional)
     slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
     if headless is None:
         headless = bool(browser_cfg.get("headless", False))
