@@ -16,7 +16,7 @@ echo   Full Workflow — main menu
 echo ============================================================
 echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
 echo   W  WorldShip Batch Import
-echo   O  Vendor Emails ^(Outlook — z- Daily Vendor Orders^)
+echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
 echo   1  All Steps ^(invoice reports, inventories, tracking/invoicing^)

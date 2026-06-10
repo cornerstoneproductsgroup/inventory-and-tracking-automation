@@ -10,7 +10,7 @@ echo.
 echo Vendor Emails (Outlook)
 echo   1  Dry run log only ^(no Outlook^)
 echo   2  Preview in Outlook ^(opens each draft, no send^)
-echo   3  Send emails now
+echo   3  Send emails ^(ALL or pick one vendor^)
 echo.
 choice /C 123 /N /M "Choose 1, 2, or 3: "
 if errorlevel 3 goto SEND
