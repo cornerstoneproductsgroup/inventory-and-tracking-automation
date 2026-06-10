@@ -381,42 +381,67 @@ def _bring_worldship_to_front(app) -> bool:
         return False
 
 
-def _wait_until_import_export_ready(app, *, timeout_s: float, poll_interval_s: float = 2.0):
-    _log(f"Waiting up to {timeout_s:.0f}s for Import-Export tab to be ready…")
+def _worldship_ui_loaded(app, *, fast: bool = False) -> bool:
+    """True when the main ribbon is usable (Home or Import-Export tab visible)."""
+    if _blocking_dialog_visible():
+        return False
+    win_timeout = 0.4 if fast else 3.0
+    try:
+        win = app.window(title_re=WORLDSHIP_TITLE_RE)
+        if not win.exists(timeout=win_timeout):
+            return False
+        for tab_title in ("Home", "Import-Export"):
+            for tab in _matching_controls(
+                win, title=tab_title, control_types=("TabItem", "Button")
+            ):
+                try:
+                    if tab.is_visible() and tab.is_enabled():
+                        return True
+                except Exception:
+                    continue
+        return _import_export_ribbon_active(win)
+    except Exception:
+        return False
+
+
+def _wait_until_worldship_usable(app, *, timeout_s: float, poll_interval_s: float = 2.0):
+    _log(f"Waiting up to {timeout_s:.0f}s for WorldShip to finish loading…")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         _dismiss_blocking_dialogs_once()
-        if not _blocking_dialog_visible() and _import_export_tab_ready(app, fast=False):
+        if not _blocking_dialog_visible() and _worldship_ui_loaded(app, fast=False):
             win = app.window(title_re=WORLDSHIP_TITLE_RE)
             _focus_main_window(win)
-            _log("Import-Export tab is ready (no blocking dialogs).")
+            _log("WorldShip main window is ready (no blocking dialogs).")
             return win
         time.sleep(poll_interval_s)
     raise TimeoutError(
-        f"WorldShip Import-Export tab did not become ready within {timeout_s:.0f}s. "
+        f"WorldShip did not become usable within {timeout_s:.0f}s. "
         "A dialog (Software Update, database check, etc.) may still be open, or the app "
-        "is still loading — increase WORLDSHIP_READY_TIMEOUT_S."
+        "is still loading — increase WORLDSHIP_READY_TIMEOUT_S or WORLDSHIP_WARM_READY_TIMEOUT_S."
     )
 
 
 def _resolve_main_window(app, *, cold_start: bool):
-    """Return the main WorldShip window; skip long waits when already loaded."""
+    """Return the main WorldShip window; Import-Export ribbon is opened in the next step."""
     _dismiss_blocking_dialogs_once()
     _bring_worldship_to_front(app)
+    win = app.window(title_re=WORLDSHIP_TITLE_RE)
+
     if _import_export_tab_ready(app, fast=True):
-        win = app.window(title_re=WORLDSHIP_TITLE_RE)
         _focus_main_window(win)
-        if not cold_start:
-            _log("WorldShip already open — proceeding immediately.")
-        else:
-            _log("Import-Export tab is ready (no blocking dialogs).")
+        _log("WorldShip ready — Import-Export ribbon already active.")
         return win
-    if not cold_start:
-        _log("WorldShip is open but Import-Export is not ready yet — brief wait…")
-    return _wait_until_import_export_ready(
+
+    if not cold_start and _worldship_ui_loaded(app, fast=True):
+        _focus_main_window(win)
+        _log("WorldShip already open on Home — will switch to Import-Export next.")
+        return win
+
+    return _wait_until_worldship_usable(
         app,
         timeout_s=_ready_timeout_s(cold_start=cold_start),
-        poll_interval_s=2.0 if cold_start else 0.15,
+        poll_interval_s=2.0 if cold_start else 0.5,
     )
 
 
