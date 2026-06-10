@@ -24,8 +24,12 @@ from automation.ups_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_HOME_URL,
     STORAGE_STATE,
+    chrome_profile_directory,
     depot_labels_pdf_path,
     label_save_timeout_s,
+    resolve_browser_user_data_dir,
+    system_chrome_user_data_dir,
+    use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
 from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
@@ -89,35 +93,33 @@ def _resolve_channel(browser_cfg: dict[str, Any]) -> str | None:
     if lowered in ("chromium", "bundled", "playwright"):
         return None
     if lowered == "auto" or not explicit:
-        return "msedge" if os.name == "nt" else "chrome"
+        return "chrome"
     return explicit
 
 
-def _resolve_user_data_dir(browser_cfg: dict[str, Any]) -> Path | None:
-    disable = (
-        (os.environ.get("UPS_USE_PERSISTENT_PROFILE") or "").strip().lower()
-        in ("0", "false", "no", "off")
-        or browser_cfg.get("use_persistent_profile") is False
-    )
-    if disable:
-        return None
-    raw = (
-        (os.environ.get("UPS_USER_DATA_DIR") or "").strip()
-        or str(browser_cfg.get("user_data_dir") or "").strip()
-    )
-    if raw.lower() in ("0", "false", "no", "off"):
-        return None
-    path = Path(raw) if raw else DEFAULT_BROWSER_PROFILE_DIR
-    if not path.is_absolute():
-        path = DEFAULT_BROWSER_PROFILE_DIR.parent / path
-    return path
+def _using_system_chrome_profile(
+    user_data_dir: Path | None,
+    browser_cfg: dict[str, Any] | None = None,
+) -> bool:
+    if user_data_dir is None or not use_system_chrome_profile(browser_cfg):
+        return False
+    chrome_root = system_chrome_user_data_dir()
+    if chrome_root is None:
+        return False
+    try:
+        return user_data_dir.resolve() == chrome_root.resolve()
+    except OSError:
+        return str(user_data_dir).lower() == str(chrome_root).lower()
 
 
-def _launch_args(browser_cfg: dict[str, Any]) -> list[str]:
+def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> list[str]:
     extra = browser_cfg.get("args") or []
     if isinstance(extra, str):
         extra = [extra]
     base = ["--disable-blink-features=AutomationControlled"]
+    if _using_system_chrome_profile(user_data_dir, browser_cfg):
+        profile = chrome_profile_directory()
+        base.append(f"--profile-directory={profile}")
     out: list[str] = []
     for arg in [*base, *extra]:
         text = str(arg).strip()
@@ -134,17 +136,24 @@ def _open_browser(
     slow_mo: int,
 ) -> tuple[Browser | None, BrowserContext, Page, bool]:
     browser_cfg = cfg.get("browser", {})
-    user_data_dir = _resolve_user_data_dir(browser_cfg)
-    args = _launch_args(browser_cfg)
+    user_data_dir = resolve_browser_user_data_dir(browser_cfg)
+    args = _launch_args(browser_cfg, user_data_dir=user_data_dir)
     ignore_default_args = ["--enable-automation"]
     channels: list[str | None] = []
     primary = _resolve_channel(browser_cfg)
     if primary:
         channels.append(primary)
-    for alt in ("msedge", "chrome"):
+    for alt in ("chrome", "msedge"):
         if alt not in channels:
             channels.append(alt)
     channels.append(None)
+
+    if _using_system_chrome_profile(user_data_dir, browser_cfg):
+        _log(
+            "Using installed Google Chrome profile "
+            f"({user_data_dir} / {chrome_profile_directory()}). "
+            "Close all Chrome windows before the script runs."
+        )
 
     last_err: Exception | None = None
     seen_channels: set[str | None] = set()
@@ -256,6 +265,36 @@ def _type_login_field(page: Page, selector: str, text: str) -> None:
     loc.press_sequentially(text, delay=40)
 
 
+def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
+    try:
+        if page.locator("#username").first.is_visible(timeout=1500):
+            return False
+    except Exception:
+        pass
+    for sel in (
+        "a:has-text('Log Out')",
+        "button:has-text('Log Out')",
+        "[data-test-id='user-menu']",
+        ".ups-userProfile",
+        "a:has-text('My Profile')",
+    ):
+        try:
+            if page.locator(sel).first.is_visible(timeout=1500):
+                return True
+        except Exception:
+            continue
+    try:
+        login = page.locator(_sel(cfg, "header_login")).first
+        if not login.is_visible(timeout=2500):
+            return True
+        text = (login.inner_text(timeout=2000) or "").lower()
+        if "log in" not in text:
+            return True
+    except Exception:
+        return True
+    return False
+
+
 def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual: bool) -> None:
     ups = cfg.get("ups") or {}
     home_url = str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
@@ -267,6 +306,17 @@ def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual
         _log("Manual login — complete UPS sign-in in the browser, then press Enter here.")
         input("[ups] Press Enter when logged in and UPS home/shipping is ready… ")
         return
+
+    if _is_ups_logged_in(page, cfg):
+        _log("Already logged in (Chrome profile session) — skipping login.")
+        return
+
+    if _env_bool("UPS_SKIP_AUTO_LOGIN", default=use_system_chrome_profile(cfg.get("browser"))):
+        raise UpsBatchError(
+            "UPS login required but UPS_SKIP_AUTO_LOGIN is enabled. "
+            "Log into UPS in Chrome first, close Chrome, then re-run — "
+            "or set UPS_SKIP_AUTO_LOGIN=0 and UPS_USERNAME/UPS_PASSWORD in .env."
+        )
 
     if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
         raise UpsBatchError("Could not click header Log In")

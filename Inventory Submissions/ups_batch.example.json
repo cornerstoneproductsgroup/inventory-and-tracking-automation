@@ -3,8 +3,9 @@
     "headless": false,
     "slow_mo_ms": 80,
     "default_timeout_ms": 120000,
-    "channel": "msedge",
+    "channel": "chrome",
     "use_persistent_profile": true,
+    "use_system_chrome": true,
     "user_data_dir": "ups_browser_profile"
   },
   "ups": {

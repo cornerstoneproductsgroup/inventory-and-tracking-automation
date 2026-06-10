@@ -57,6 +57,75 @@ STORAGE_STATE = _INVENTORY_ROOT / (
 DEFAULT_BROWSER_PROFILE_DIR = _INVENTORY_ROOT / "ups_browser_profile"
 
 
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return raw in ("1", "true", "yes", "on")
+
+
+def system_chrome_user_data_dir() -> Path | None:
+    """Installed Google Chrome profile root (cookies / UPS login live here)."""
+    override = (os.environ.get("UPS_CHROME_USER_DATA_DIR") or "").strip()
+    if override:
+        path = Path(override)
+        return path if path.is_dir() else None
+    local = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if not local:
+        return None
+    path = Path(local) / "Google" / "Chrome" / "User Data"
+    return path if path.is_dir() else None
+
+
+def chrome_profile_directory() -> str:
+    """Chrome profile folder name under User Data (usually Default or Profile 1)."""
+    return (os.environ.get("UPS_CHROME_PROFILE") or "Default").strip() or "Default"
+
+
+def use_system_chrome_profile(browser_cfg: dict | None = None) -> bool:
+    browser_cfg = browser_cfg or {}
+    env_raw = (os.environ.get("UPS_USE_SYSTEM_CHROME") or "").strip()
+    if env_raw:
+        return _env_bool("UPS_USE_SYSTEM_CHROME", default=True)
+    if browser_cfg.get("use_system_chrome") is False:
+        return False
+    return True
+
+
+def resolve_browser_user_data_dir(browser_cfg: dict | None = None) -> Path | None:
+    """
+    Profile directory for launch_persistent_context.
+
+    Priority: explicit UPS_USER_DATA_DIR → system Chrome (default) →
+    ups_batch.json user_data_dir → ups_browser_profile.
+    """
+    browser_cfg = browser_cfg or {}
+    env_persistent = (os.environ.get("UPS_USE_PERSISTENT_PROFILE") or "").strip()
+    if env_persistent and not _env_bool("UPS_USE_PERSISTENT_PROFILE", default=True):
+        return None
+    if browser_cfg.get("use_persistent_profile") is False:
+        return None
+
+    explicit = (os.environ.get("UPS_USER_DATA_DIR") or "").strip()
+    if explicit and explicit.lower() not in ("0", "false", "no", "off"):
+        path = Path(explicit)
+        return path if path.is_absolute() else DEFAULT_BROWSER_PROFILE_DIR.parent / path
+
+    if use_system_chrome_profile(browser_cfg):
+        chrome_data = system_chrome_user_data_dir()
+        if chrome_data is not None:
+            return chrome_data
+
+    raw = str(browser_cfg.get("user_data_dir") or "").strip()
+    if raw and raw.lower() not in ("0", "false", "no", "off"):
+        path = Path(raw)
+        return path if path.is_absolute() else DEFAULT_BROWSER_PROFILE_DIR.parent / path
+
+    return DEFAULT_BROWSER_PROFILE_DIR
+
+
 def depot_output_basename(order_date: date | None = None) -> str:
     """e.g. Depot 6-10-2026 Output.csv"""
     d = order_date or date.today()
