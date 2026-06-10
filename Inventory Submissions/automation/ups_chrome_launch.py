@@ -129,13 +129,27 @@ def discover_cdp_port(
     preferred: int,
     user_data: Path,
     profile: str,
-    timeout_s: float = 90.0,
+    timeout_s: float = 120.0,
 ) -> int | None:
     deadline = time.monotonic() + timeout_s
+    last_status_s = 0.0
     while time.monotonic() < deadline:
-        for port in (preferred, read_devtools_port(user_data, profile)):
-            if port and cdp_endpoint_ready(port, timeout_s=1.0):
+        candidates: list[int] = []
+        for port in (preferred, read_devtools_port(user_data, profile), 9222):
+            if port and port not in candidates:
+                candidates.append(port)
+        for port in candidates:
+            if cdp_endpoint_ready(port, timeout_s=1.0):
                 return port
+
+        elapsed = timeout_s - (deadline - time.monotonic())
+        if elapsed - last_status_s >= 15.0:
+            last_status_s = elapsed
+            dt_port = read_devtools_port(user_data, profile)
+            _log(
+                f"Waiting for Chrome debug port… {int(elapsed)}s "
+                f"(chrome.exe={chrome_process_count()}, DevToolsActivePort={dt_port})"
+            )
         time.sleep(0.5)
     return None
 
@@ -174,13 +188,13 @@ def _build_chrome_cmd(
     profile: str,
     port: int,
     home_url: str,
+    bind_localhost: bool = True,
 ) -> list[str]:
-    return [
+    cmd = [
         str(exe),
         f"--user-data-dir={user_data}",
         f"--profile-directory={profile}",
         f"--remote-debugging-port={port}",
-        "--remote-debugging-address=127.0.0.1",
         "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
@@ -190,32 +204,34 @@ def _build_chrome_cmd(
         "--new-window",
         home_url,
     ]
+    if bind_localhost:
+        cmd.insert(5, "--remote-debugging-address=127.0.0.1")
+    return cmd
 
 
 def _launch_chrome_process(cmd: list[str], *, log_dir: Path | None = None) -> None:
-    """Start real Chrome (not Playwright) — same as double-clicking Chrome with flags."""
+    """Start real Chrome (not Playwright) — matches Run UPS Chrome Debug.bat on Windows."""
     _log("Chrome command: " + " ".join(cmd))
-    stderr_log: int | None = None
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        stderr_path = log_dir / "chrome_launch_stderr.log"
-        stderr_log = os.open(str(stderr_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-
-    popen_kwargs: dict[str, Any] = {
-        "stdout": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if stderr_log is not None:
-        popen_kwargs["stderr"] = stderr_log
-    else:
-        popen_kwargs["stderr"] = subprocess.DEVNULL
+        (log_dir / "chrome_launch_cmd.txt").write_text(" ".join(cmd), encoding="utf-8")
 
     if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        # `start` fully detaches Chrome — more reliable on RDP than Popen alone.
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", cmd[0], *cmd[1:]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return
 
-    subprocess.Popen(cmd, **popen_kwargs)
-    if stderr_log is not None:
-        os.close(stderr_log)
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
 
 
 def launch_chrome_for_cdp(
@@ -251,28 +267,50 @@ def launch_chrome_for_cdp(
         _log(f"CDP port {port} already listening — connecting to existing Chrome.")
         return port
 
-    cmd = _build_chrome_cmd(
-        exe=exe,
-        user_data=user_data,
-        profile=profile,
-        port=port,
-        home_url=home_url,
+    launch_attempts = (
+        ("localhost bind", True),
+        ("no localhost bind", False),
     )
-    _log(f"Starting real Chrome (profile {profile!r}, debug port {port})…")
-    _launch_chrome_process(cmd, log_dir=log_dir)
+    discovered: int | None = None
+    for attempt_label, bind_localhost in launch_attempts:
+        cmd = _build_chrome_cmd(
+            exe=exe,
+            user_data=user_data,
+            profile=profile,
+            port=port,
+            home_url=home_url,
+            bind_localhost=bind_localhost,
+        )
+        _log(
+            f"Starting real Chrome ({attempt_label}, profile {profile!r}, "
+            f"debug port {port})…"
+        )
+        _launch_chrome_process(cmd, log_dir=log_dir)
 
-    discovered = discover_cdp_port(
-        preferred=port,
-        user_data=user_data,
-        profile=profile,
-        timeout_s=90.0,
-    )
+        for _ in range(20):
+            if chrome_process_count() > 0:
+                break
+            time.sleep(0.5)
+
+        discovered = discover_cdp_port(
+            preferred=port,
+            user_data=user_data,
+            profile=profile,
+            timeout_s=60.0,
+        )
+        if discovered is not None:
+            break
+
+        _log(f"WARN: Chrome debug port not ready ({attempt_label}) — retrying…")
+        close_chrome_processes(force=True)
+        time.sleep(2.0)
+
     if discovered is None:
         hint = (
-            f"Chrome did not open debug port {port} within 90s. "
-            "Close all Chrome windows and retry. "
-            "You can also run 'Run UPS Chrome Debug.bat' manually, then re-run the batch. "
-            "Check logs/chrome_launch_stderr.log if present."
+            f"Chrome did not open debug port {port}. "
+            "Close all Chrome windows and retry, or run 'Run UPS Chrome Debug.bat' "
+            "then set UPS_BROWSER_MODE=manual in .env. "
+            "See logs/chrome_launch_cmd.txt for the command used."
         )
         raise RuntimeError(hint)
 

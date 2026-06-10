@@ -316,7 +316,7 @@ def _open_browser(
     *,
     headless: bool,
     slow_mo: int,
-) -> tuple[Browser | None, BrowserContext, Page, bool]:
+) -> tuple[Browser | None, BrowserContext, Page, bool, str]:
     browser_cfg = cfg.get("browser", {})
     user_data_dir = resolve_browser_user_data_dir(browser_cfg)
     args = _launch_args(browser_cfg, user_data_dir=user_data_dir)
@@ -334,12 +334,13 @@ def _open_browser(
 
     if mode == "manual":
         browser, context, page = _open_manual_cdp_attach(p, cfg)
-        return browser, context, page, True
+        return browser, context, page, True, "manual"
 
     if mode == "dedicated":
-        return _open_dedicated_profile_browser(
+        none_ctx, context, page, persistent = _open_dedicated_profile_browser(
             p, cfg, headless=headless, slow_mo=slow_mo
         )
+        return none_ctx, context, page, persistent, "dedicated"
 
     if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
         browser_cfg
@@ -352,18 +353,19 @@ def _open_browser(
         close_chrome_processes()
         try:
             browser, context, page = _open_system_chrome_via_cdp(p, cfg)
-            return browser, context, page, True
+            return browser, context, page, True, "cdp"
         except UpsBatchError as exc:
             _log(f"WARN: CDP attach failed: {exc}")
             _log(
                 "Falling back to dedicated UPS profile "
                 f"({dedicated_ups_profile_dir()}). "
-                "Run with --setup-login once if not logged in."
+                "You will be prompted to log in if needed."
             )
             close_chrome_processes(force=True)
-            return _open_dedicated_profile_browser(
+            none_ctx, context, page, persistent = _open_dedicated_profile_browser(
                 p, cfg, headless=headless, slow_mo=slow_mo
             )
+            return none_ctx, context, page, persistent, "dedicated"
 
     last_err: Exception | None = None
     seen_channels: set[str | None] = set()
@@ -397,7 +399,7 @@ def _open_browser(
                 page.bring_to_front()
                 _ensure_ups_home_page(page, cfg)
                 _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
-                return None, context, page, True
+                return None, context, page, True, "persistent"
 
             browser = p.chromium.launch(**launch_kwargs)
             storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
@@ -410,7 +412,7 @@ def _open_browser(
             context.add_init_script(_STEALTH_INIT)
             page = context.new_page()
             _log(f"Browser: {label} (ephemeral)")
-            return browser, context, page, False
+            return browser, context, page, False, "ephemeral"
         except Exception as exc:
             last_err = exc
             _log(f"WARN: launch failed ({label}): {exc}")
@@ -510,24 +512,55 @@ def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
     return False
 
 
-def _ups_login(page: Page, cfg: dict[str, Any], creds: UpsCredentials, *, manual: bool) -> None:
+def _wait_for_manual_ups_login(page: Page, cfg: dict[str, Any]) -> None:
+    _log(
+        "Log into UPS in the Chrome window (dismiss cookie/location popups if shown), "
+        "then press Enter here to continue."
+    )
+    try:
+        input("[ups] Press Enter when logged in… ")
+    except EOFError:
+        pass
+    clear_blocking_overlays(page, cfg, log=_log)
+    if not _is_ups_logged_in(page, cfg):
+        raise UpsBatchError(
+            "Still not logged into UPS. Dismiss any popups blocking the page and retry."
+        )
+
+
+def _ups_login(
+    page: Page,
+    cfg: dict[str, Any],
+    creds: UpsCredentials,
+    *,
+    manual: bool,
+    launch_source: str,
+) -> None:
     _log("Step 1/6: Open UPS home and clear popups…")
     _ensure_ups_home_page(page, cfg)
     clear_blocking_overlays(page, cfg, log=_log)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
-        _log("Manual login — complete UPS sign-in in the browser, then press Enter here.")
-        input("[ups] Press Enter when logged in and UPS home/shipping is ready… ")
+        _wait_for_manual_ups_login(page, cfg)
         return
 
     if _is_ups_logged_in(page, cfg):
         _log("Already logged in (Chrome profile session) — skipping login.")
         return
 
-    if _env_bool("UPS_SKIP_AUTO_LOGIN", default=use_system_chrome_profile(cfg.get("browser"))):
+    skip_auto = _env_bool(
+        "UPS_SKIP_AUTO_LOGIN",
+        default=launch_source in ("cdp", "manual") and use_system_chrome_profile(
+            cfg.get("browser")
+        ),
+    )
+    if skip_auto:
         clear_blocking_overlays(page, cfg, log=_log)
         if _is_ups_logged_in(page, cfg):
             _log("Logged in after clearing popups — continuing.")
+            return
+        if launch_source == "dedicated":
+            _wait_for_manual_ups_login(page, cfg)
             return
         raise UpsBatchError(
             "Not logged into UPS (Log In still visible). Popups may be blocking the page. "
@@ -781,11 +814,13 @@ def run_ups_depot_batch(
 
     leave_browser_open = False
     with sync_playwright() as p:
-        browser, context, page, persistent = _open_browser(
+        browser, context, page, persistent, launch_source = _open_browser(
             p, cfg, headless=headless, slow_mo=slow_mo
         )
         try:
-            _ups_login(page, cfg, creds, manual=manual_login)
+            _ups_login(
+                page, cfg, creds, manual=manual_login, launch_source=launch_source
+            )
             _navigate_batch_shipping(page, cfg)
             if upload_csv is not None:
                 _upload_csv(page, cfg, upload_csv)
