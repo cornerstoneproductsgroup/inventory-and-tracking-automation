@@ -66,6 +66,23 @@ def _env_bool(name: str, *, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def ups_browser_channel(browser_cfg: dict | None = None) -> str:
+    """Installed browser for UPS: msedge or chrome."""
+    browser_cfg = browser_cfg or {}
+    raw = (
+        (os.environ.get("UPS_BROWSER_CHANNEL") or "").strip().lower()
+        or str(browser_cfg.get("channel") or "").strip().lower()
+        or "chrome"
+    )
+    if raw in ("edge", "msedge", "microsoft-edge"):
+        return "msedge"
+    return "chrome"
+
+
+def browser_display_name(channel: str | None = None) -> str:
+    return "Edge" if (channel or ups_browser_channel()) == "msedge" else "Chrome"
+
+
 def system_chrome_user_data_dir() -> Path | None:
     """Installed Google Chrome profile root (cookies / UPS login live here)."""
     override = (os.environ.get("UPS_CHROME_USER_DATA_DIR") or "").strip()
@@ -79,17 +96,53 @@ def system_chrome_user_data_dir() -> Path | None:
     return path if path.is_dir() else None
 
 
+def system_edge_user_data_dir() -> Path | None:
+    """Installed Microsoft Edge profile root."""
+    override = (os.environ.get("UPS_EDGE_USER_DATA_DIR") or "").strip()
+    if override:
+        path = Path(override)
+        return path if path.is_dir() else None
+    local = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if not local:
+        return None
+    path = Path(local) / "Microsoft" / "Edge" / "User Data"
+    return path if path.is_dir() else None
+
+
+def system_browser_user_data_dir(browser_cfg: dict | None = None) -> Path | None:
+    if ups_browser_channel(browser_cfg) == "msedge":
+        return system_edge_user_data_dir()
+    return system_chrome_user_data_dir()
+
+
 def chrome_profile_directory() -> str:
-    """Chrome profile folder name under User Data (usually Default or Profile 1)."""
-    return (os.environ.get("UPS_CHROME_PROFILE") or "Default").strip() or "Default"
+    """Profile folder name under User Data (usually Default or Profile 1)."""
+    return (
+        (os.environ.get("UPS_BROWSER_PROFILE") or "").strip()
+        or (os.environ.get("UPS_CHROME_PROFILE") or "").strip()
+        or (os.environ.get("UPS_EDGE_PROFILE") or "").strip()
+        or "Default"
+    )
+
+
+def browser_profile_directory() -> str:
+    return chrome_profile_directory()
 
 
 def chrome_cdp_port() -> int:
-    raw = (os.environ.get("UPS_CHROME_CDP_PORT") or "9344").strip()
+    return browser_cdp_port()
+
+
+def browser_cdp_port(browser_cfg: dict | None = None) -> int:
+    raw = (
+        (os.environ.get("UPS_BROWSER_CDP_PORT") or "").strip()
+        or (os.environ.get("UPS_CHROME_CDP_PORT") or "").strip()
+        or ("9345" if ups_browser_channel(browser_cfg) == "msedge" else "9344")
+    )
     try:
         return max(1024, int(raw))
     except ValueError:
-        return 9344
+        return 9345 if ups_browser_channel(browser_cfg) == "msedge" else 9344
 
 
 def chrome_executable() -> Path | None:
@@ -111,40 +164,79 @@ def chrome_executable() -> Path | None:
     return None
 
 
+def edge_executable() -> Path | None:
+    override = (os.environ.get("UPS_EDGE_EXE") or "").strip()
+    if override:
+        path = Path(override)
+        return path if path.is_file() else None
+    roots = [
+        os.environ.get("PROGRAMFILES", ""),
+        os.environ.get("PROGRAMFILES(X86)", ""),
+        os.environ.get("LOCALAPPDATA", ""),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        cand = Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def browser_executable(browser_cfg: dict | None = None) -> Path | None:
+    if ups_browser_channel(browser_cfg) == "msedge":
+        return edge_executable()
+    return chrome_executable()
+
+
+def browser_process_image(browser_cfg: dict | None = None) -> str:
+    return "msedge.exe" if ups_browser_channel(browser_cfg) == "msedge" else "chrome.exe"
+
+
+def allow_unsafe_cdp() -> bool:
+    """
+    CDP against a real browser profile matches infostealer behavior (Huntress flags it).
+    Only enable when IT has explicitly approved: UPS_ALLOW_UNSAFE_CDP=1
+    """
+    return _env_bool("UPS_ALLOW_UNSAFE_CDP", default=False)
+
+
 def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
-    """System Chrome always attaches via CDP. UPS_USE_CHROME_CDP is deprecated/ignored."""
-    _ = browser_cfg
-    return True
+    """CDP is off unless UPS_BROWSER_MODE=cdp|manual AND UPS_ALLOW_UNSAFE_CDP=1."""
+    mode = ups_browser_mode(browser_cfg)
+    return mode in ("cdp", "manual") and allow_unsafe_cdp()
 
 
 def chrome_cdp_env_disabled() -> bool:
-    """True when .env still has UPS_USE_CHROME_CDP=0 (ignored; logged once at launch)."""
-    raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip().lower()
-    return raw in ("0", "false", "no", "off")
+    return not allow_unsafe_cdp()
 
 
 def ups_browser_mode(browser_cfg: dict | None = None) -> str:
     """
     How to open UPS in a browser.
 
-    - cdp (default): start real Chrome + attach Playwright (best for RDP + logged-in profile)
-    - dedicated: project-local ups_browser_profile (FedEx-style; run --setup-login once)
-    - manual: connect to Chrome you start via Run UPS Chrome Debug.bat
+    - dedicated (default): isolated ups_browser_profile — safe for Huntress/IT
+    - cdp: attach to real Chrome/Edge profile (requires UPS_ALLOW_UNSAFE_CDP=1)
+    - manual: connect to debug browser you start (requires UPS_ALLOW_UNSAFE_CDP=1)
     """
     browser_cfg = browser_cfg or {}
     raw = (
         (os.environ.get("UPS_BROWSER_MODE") or "").strip().lower()
         or str(browser_cfg.get("browser_mode") or "").strip().lower()
-        or "cdp"
+        or "dedicated"
     )
     if raw in ("dedicated", "profile", "local"):
         return "dedicated"
     if raw in ("manual", "attach"):
         return "manual"
-    return "cdp"
+    if raw in ("cdp", "system", "chrome"):
+        return "cdp"
+    return "dedicated"
 
 
-def dedicated_ups_profile_dir() -> Path:
+def dedicated_ups_profile_dir(browser_cfg: dict | None = None) -> Path:
+    if ups_browser_channel(browser_cfg) == "msedge":
+        return _INVENTORY_ROOT / "ups_edge_browser_profile"
     return DEFAULT_BROWSER_PROFILE_DIR
 
 
@@ -153,7 +245,10 @@ def kill_chrome_before_launch() -> bool:
 
 
 def use_system_chrome_profile(browser_cfg: dict | None = None) -> bool:
+    """Only when explicitly using unsafe CDP against the installed browser profile."""
     browser_cfg = browser_cfg or {}
+    if ups_browser_mode(browser_cfg) != "cdp" or not allow_unsafe_cdp():
+        return False
     env_raw = (os.environ.get("UPS_USE_SYSTEM_CHROME") or "").strip()
     if env_raw:
         return _env_bool("UPS_USE_SYSTEM_CHROME", default=True)
@@ -166,8 +261,7 @@ def resolve_browser_user_data_dir(browser_cfg: dict | None = None) -> Path | Non
     """
     Profile directory for launch_persistent_context.
 
-    Priority: explicit UPS_USER_DATA_DIR → system Chrome (default) →
-    ups_batch.json user_data_dir → ups_browser_profile.
+    Default: isolated ups_browser_profile (never the user's real Chrome/Edge folder).
     """
     browser_cfg = browser_cfg or {}
     env_persistent = (os.environ.get("UPS_USE_PERSISTENT_PROFILE") or "").strip()
@@ -179,19 +273,19 @@ def resolve_browser_user_data_dir(browser_cfg: dict | None = None) -> Path | Non
     explicit = (os.environ.get("UPS_USER_DATA_DIR") or "").strip()
     if explicit and explicit.lower() not in ("0", "false", "no", "off"):
         path = Path(explicit)
-        return path if path.is_absolute() else DEFAULT_BROWSER_PROFILE_DIR.parent / path
+        return path if path.is_absolute() else dedicated_ups_profile_dir(browser_cfg).parent / path
 
     if use_system_chrome_profile(browser_cfg):
-        chrome_data = system_chrome_user_data_dir()
-        if chrome_data is not None:
-            return chrome_data
+        system_data = system_browser_user_data_dir(browser_cfg)
+        if system_data is not None:
+            return system_data
 
     raw = str(browser_cfg.get("user_data_dir") or "").strip()
     if raw and raw.lower() not in ("0", "false", "no", "off"):
         path = Path(raw)
-        return path if path.is_absolute() else DEFAULT_BROWSER_PROFILE_DIR.parent / path
+        return path if path.is_absolute() else dedicated_ups_profile_dir(browser_cfg).parent / path
 
-    return DEFAULT_BROWSER_PROFILE_DIR
+    return dedicated_ups_profile_dir(browser_cfg)
 
 
 def depot_output_basename(order_date: date | None = None) -> str:

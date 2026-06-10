@@ -1,4 +1,4 @@
-"""Launch installed Google Chrome for UPS automation — CDP attach only."""
+"""Launch installed Chrome or Edge for UPS automation — CDP attach only."""
 
 from __future__ import annotations
 
@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from automation.ups_batch_config import (
-    chrome_cdp_port,
-    chrome_executable,
-    chrome_profile_directory,
+    browser_cdp_port,
+    browser_display_name,
+    browser_executable,
+    browser_process_image,
+    browser_profile_directory,
     kill_chrome_before_launch,
-    system_chrome_user_data_dir,
+    system_browser_user_data_dir,
+    ups_browser_channel,
 )
 
 
@@ -24,65 +27,78 @@ def _log(msg: str) -> None:
     print(f"[ups] {msg}", flush=True)
 
 
-def chrome_process_count() -> int:
+def browser_process_count(browser_cfg: dict | None = None) -> int:
+    image = browser_process_image(browser_cfg)
     if os.name != "nt":
         return 0
     try:
         result = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
         )
-        return result.stdout.lower().count("chrome.exe")
+        return result.stdout.lower().count(image.lower())
     except Exception:
         return 0
 
 
-def close_chrome_processes(*, force: bool | None = None) -> int:
-    """End chrome.exe so automation can open the profile with a debug session."""
-    remaining = chrome_process_count()
+def close_browser_processes(*, force: bool | None = None, browser_cfg: dict | None = None) -> int:
+    """End browser processes so automation can open the profile with a debug session."""
+    image = browser_process_image(browser_cfg)
+    name = browser_display_name(ups_browser_channel(browser_cfg))
+    remaining = browser_process_count(browser_cfg)
     if remaining == 0:
         return 0
 
     should_kill = kill_chrome_before_launch() if force is None else force
     if not should_kill:
         _log(
-            f"WARN: {remaining} chrome.exe process(es) still running. "
-            "Set UPS_KILL_CHROME=1 or close Chrome manually."
+            f"WARN: {remaining} {image} process(es) still running. "
+            "Set UPS_KILL_CHROME=1 or close the browser manually."
         )
         return remaining
 
-    _log(f"Ending {remaining} chrome.exe process(es) before UPS automation…")
+    _log(f"Ending {remaining} {image} process(es) before UPS automation…")
     try:
         subprocess.run(
-            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            ["taskkill", "/F", "/IM", image, "/T"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
     except Exception as exc:
-        _log(f"WARN: taskkill chrome failed: {exc}")
+        _log(f"WARN: taskkill {image} failed: {exc}")
 
     for _ in range(20):
         time.sleep(0.5)
-        remaining = chrome_process_count()
+        remaining = browser_process_count(browser_cfg)
         if remaining == 0:
-            _log("Chrome closed.")
+            _log(f"{name} closed.")
             return 0
-    _log(f"WARN: {remaining} chrome.exe process(es) still running after taskkill.")
+    _log(f"WARN: {remaining} {image} process(es) still running after taskkill.")
     return remaining
 
 
-def ensure_chrome_closed() -> None:
-    remaining = close_chrome_processes()
+def close_chrome_processes(*, force: bool | None = None) -> int:
+    return close_browser_processes(force=force)
+
+
+def ensure_browser_closed(browser_cfg: dict | None = None) -> None:
+    image = browser_process_image(browser_cfg)
+    name = browser_display_name(ups_browser_channel(browser_cfg))
+    remaining = close_browser_processes(browser_cfg=browser_cfg)
     if remaining > 0:
         raise RuntimeError(
-            f"{remaining} chrome.exe process(es) still running. "
-            "Close Chrome manually or set UPS_KILL_CHROME=1 in .env."
+            f"{remaining} {image} process(es) still running. "
+            f"Close {name} manually or set UPS_KILL_CHROME=1 in .env."
         )
+
+
+def ensure_chrome_closed() -> None:
+    ensure_browser_closed()
 
 
 def cdp_endpoint_ready(port: int, *, timeout_s: float = 2.0) -> bool:
@@ -112,7 +128,6 @@ def _devtools_active_port_file(user_data: Path, profile: str) -> Path | None:
 
 
 def read_devtools_port(user_data: Path, profile: str) -> int | None:
-    """Chrome writes the real debug port here when --remote-debugging-port is used."""
     path = _devtools_active_port_file(user_data, profile)
     if path is None:
         return None
@@ -129,8 +144,10 @@ def discover_cdp_port(
     preferred: int,
     user_data: Path,
     profile: str,
+    browser_cfg: dict | None = None,
     timeout_s: float = 120.0,
 ) -> int | None:
+    image = browser_process_image(browser_cfg)
     deadline = time.monotonic() + timeout_s
     last_status_s = 0.0
     while time.monotonic() < deadline:
@@ -147,8 +164,9 @@ def discover_cdp_port(
             last_status_s = elapsed
             dt_port = read_devtools_port(user_data, profile)
             _log(
-                f"Waiting for Chrome debug port… {int(elapsed)}s "
-                f"(chrome.exe={chrome_process_count()}, DevToolsActivePort={dt_port})"
+                f"Waiting for debug port… {int(elapsed)}s "
+                f"({image}={browser_process_count(browser_cfg)}, "
+                f"DevToolsActivePort={dt_port})"
             )
         time.sleep(0.5)
     return None
@@ -167,21 +185,22 @@ def wait_for_ups_tab(
     port: int,
     *,
     home_url: str,
+    browser_cfg: dict | None = None,
     timeout_s: float = 120.0,
 ) -> bool:
-    """Wait until Chrome has a tab on ups.com (opened by real Chrome, not Playwright)."""
+    name = browser_display_name(ups_browser_channel(browser_cfg))
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         for tab in list_cdp_tabs(port):
             target_url = str(tab.get("url") or "").lower()
             if "ups.com" in target_url:
-                _log(f"UPS tab visible in Chrome: {tab.get('url')}")
+                _log(f"UPS tab visible in {name}: {tab.get('url')}")
                 return True
         time.sleep(0.75)
     return False
 
 
-def _build_chrome_cmd(
+def _build_browser_cmd(
     *,
     exe: Path,
     user_data: Path,
@@ -209,15 +228,20 @@ def _build_chrome_cmd(
     return cmd
 
 
-def _launch_chrome_process(cmd: list[str], *, log_dir: Path | None = None) -> None:
-    """Start real Chrome (not Playwright) — matches Run UPS Chrome Debug.bat on Windows."""
-    _log("Chrome command: " + " ".join(cmd))
+def _launch_browser_process(
+    cmd: list[str],
+    *,
+    log_dir: Path | None = None,
+    browser_cfg: dict | None = None,
+) -> None:
+    name = browser_display_name(ups_browser_channel(browser_cfg))
+    _log(f"{name} command: " + " ".join(cmd))
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "chrome_launch_cmd.txt").write_text(" ".join(cmd), encoding="utf-8")
+        label = "edge" if ups_browser_channel(browser_cfg) == "msedge" else "chrome"
+        (log_dir / f"{label}_launch_cmd.txt").write_text(" ".join(cmd), encoding="utf-8")
 
     if os.name == "nt":
-        # `start` fully detaches Chrome — more reliable on RDP than Popen alone.
         subprocess.Popen(
             ["cmd", "/c", "start", "", cmd[0], *cmd[1:]],
             stdout=subprocess.DEVNULL,
@@ -234,37 +258,41 @@ def _launch_chrome_process(cmd: list[str], *, log_dir: Path | None = None) -> No
     )
 
 
-def launch_chrome_for_cdp(
+def launch_browser_for_cdp(
     *,
     home_url: str,
     port: int | None = None,
     wait_for_close_s: float = 8.0,
     log_dir: Path | None = None,
+    browser_cfg: dict | None = None,
 ) -> int:
     """
-    Start installed Chrome with remote debugging, opening UPS in a normal window.
-    Playwright only attaches afterward — it never launches the browser.
+    Start installed Chrome or Edge with remote debugging, opening UPS in a normal window.
+    Playwright only attaches afterward.
     """
-    exe = chrome_executable()
-    user_data = system_chrome_user_data_dir()
+    browser_cfg = browser_cfg or {}
+    channel = ups_browser_channel(browser_cfg)
+    name = browser_display_name(channel)
+    exe = browser_executable(browser_cfg)
+    user_data = system_browser_user_data_dir(browser_cfg)
     if exe is None or user_data is None:
-        raise RuntimeError("Chrome executable or User Data folder not found.")
+        raise RuntimeError(f"{name} executable or User Data folder not found.")
 
-    profile = chrome_profile_directory()
-    port = port or chrome_cdp_port()
+    profile = browser_profile_directory()
+    port = port or browser_cdp_port(browser_cfg)
 
-    close_chrome_processes()
-    if wait_for_close_s > 0 and chrome_process_count() > 0:
-        _log(f"Waiting {wait_for_close_s:.0f}s for Chrome to close…")
+    close_browser_processes(browser_cfg=browser_cfg)
+    if wait_for_close_s > 0 and browser_process_count(browser_cfg) > 0:
+        _log(f"Waiting {wait_for_close_s:.0f}s for {name} to close…")
         deadline = time.monotonic() + wait_for_close_s
         while time.monotonic() < deadline:
-            if chrome_process_count() == 0:
+            if browser_process_count(browser_cfg) == 0:
                 break
             time.sleep(1.0)
-    ensure_chrome_closed()
+    ensure_browser_closed(browser_cfg)
 
     if cdp_endpoint_ready(port, timeout_s=1.0):
-        _log(f"CDP port {port} already listening — connecting to existing Chrome.")
+        _log(f"CDP port {port} already listening — connecting to existing {name}.")
         return port
 
     launch_attempts = (
@@ -273,7 +301,7 @@ def launch_chrome_for_cdp(
     )
     discovered: int | None = None
     for attempt_label, bind_localhost in launch_attempts:
-        cmd = _build_chrome_cmd(
+        cmd = _build_browser_cmd(
             exe=exe,
             user_data=user_data,
             profile=profile,
@@ -282,13 +310,13 @@ def launch_chrome_for_cdp(
             bind_localhost=bind_localhost,
         )
         _log(
-            f"Starting real Chrome ({attempt_label}, profile {profile!r}, "
+            f"Starting real {name} ({attempt_label}, profile {profile!r}, "
             f"debug port {port})…"
         )
-        _launch_chrome_process(cmd, log_dir=log_dir)
+        _launch_browser_process(cmd, log_dir=log_dir, browser_cfg=browser_cfg)
 
         for _ in range(20):
-            if chrome_process_count() > 0:
+            if browser_process_count(browser_cfg) > 0:
                 break
             time.sleep(0.5)
 
@@ -296,35 +324,57 @@ def launch_chrome_for_cdp(
             preferred=port,
             user_data=user_data,
             profile=profile,
+            browser_cfg=browser_cfg,
             timeout_s=60.0,
         )
         if discovered is not None:
             break
 
-        _log(f"WARN: Chrome debug port not ready ({attempt_label}) — retrying…")
-        close_chrome_processes(force=True)
+        _log(f"WARN: {name} debug port not ready ({attempt_label}) — retrying…")
+        close_browser_processes(force=True, browser_cfg=browser_cfg)
         time.sleep(2.0)
 
     if discovered is None:
+        debug_bat = (
+            "Run UPS Edge Debug.bat"
+            if channel == "msedge"
+            else "Run UPS Chrome Debug.bat"
+        )
         hint = (
-            f"Chrome did not open debug port {port}. "
-            "Close all Chrome windows and retry, or run 'Run UPS Chrome Debug.bat' "
-            "then set UPS_BROWSER_MODE=manual in .env. "
-            "See logs/chrome_launch_cmd.txt for the command used."
+            f"{name} did not open debug port {port}. "
+            f"Close all {name} windows and retry, or run '{debug_bat}' "
+            "then set UPS_BROWSER_MODE=manual in .env."
         )
         raise RuntimeError(hint)
 
     if discovered != port:
-        _log(f"Chrome debug port is {discovered} (configured {port}).")
+        _log(f"{name} debug port is {discovered} (configured {port}).")
 
-    if not wait_for_ups_tab(discovered, home_url=home_url, timeout_s=120.0):
+    if not wait_for_ups_tab(
+        discovered, home_url=home_url, browser_cfg=browser_cfg, timeout_s=120.0
+    ):
         _log(
-            "WARN: Chrome opened but no ups.com tab detected yet — "
+            f"WARN: {name} opened but no ups.com tab detected yet — "
             "Playwright will navigate after attach."
         )
 
-    _log(f"Chrome debug port {discovered} is ready.")
+    _log(f"{name} debug port {discovered} is ready.")
     return discovered
+
+
+def launch_chrome_for_cdp(
+    *,
+    home_url: str,
+    port: int | None = None,
+    wait_for_close_s: float = 8.0,
+    log_dir: Path | None = None,
+) -> int:
+    return launch_browser_for_cdp(
+        home_url=home_url,
+        port=port,
+        wait_for_close_s=wait_for_close_s,
+        log_dir=log_dir,
+    )
 
 
 def connect_playwright_cdp(playwright, port: int):
@@ -371,4 +421,4 @@ def goto_ups_home(page, home_url: str) -> None:
                 pass
         time.sleep(1.0)
 
-    raise RuntimeError(f"Chrome stayed on {page.url!r}; could not open UPS. {last_err}")
+    raise RuntimeError(f"Browser stayed on {page.url!r}; could not open UPS. {last_err}")

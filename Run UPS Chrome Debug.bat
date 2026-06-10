@@ -1,6 +1,9 @@
 @echo off
 setlocal EnableExtensions
 
+rem WARNING: Huntress and other EDR tools flag this as credential-theft behavior.
+rem Use only if IT approved UPS_ALLOW_UNSAFE_CDP=1. Prefer --setup-login instead.
+
 rem Start Chrome with remote debugging so UPS automation can attach.
 rem Leave this window open while the batch job runs, or start before Run UPS Online Batch.
 

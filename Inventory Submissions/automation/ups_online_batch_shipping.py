@@ -24,23 +24,28 @@ from automation.ups_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_HOME_URL,
     STORAGE_STATE,
-    chrome_cdp_port,
-    chrome_profile_directory,
+    allow_unsafe_cdp,
+    browser_cdp_port,
+    browser_display_name,
+    browser_profile_directory,
+    chrome_cdp_env_disabled,
     dedicated_ups_profile_dir,
     depot_labels_pdf_path,
     label_save_timeout_s,
     resolve_browser_user_data_dir,
+    system_browser_user_data_dir,
     system_chrome_user_data_dir,
-    chrome_cdp_env_disabled,
+    ups_browser_channel,
     ups_browser_mode,
     use_chrome_cdp_launch,
     use_system_chrome_profile,
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
 from automation.ups_chrome_launch import (
+    close_browser_processes,
     close_chrome_processes,
     connect_playwright_cdp,
-    launch_chrome_for_cdp,
+    launch_browser_for_cdp,
     pick_ups_page_from_context,
     wait_for_cdp_endpoint,
 )
@@ -98,16 +103,10 @@ def _env_bool(name: str, *, default: bool) -> bool:
 
 
 def _resolve_channel(browser_cfg: dict[str, Any]) -> str | None:
-    explicit = (
-        (os.environ.get("UPS_BROWSER_CHANNEL") or "").strip()
-        or str(browser_cfg.get("channel") or "").strip()
-    )
-    lowered = explicit.lower()
-    if lowered in ("chromium", "bundled", "playwright"):
-        return None
-    if lowered == "auto" or not explicit:
-        return "chrome"
-    return explicit
+    channel = ups_browser_channel(browser_cfg)
+    if channel == "msedge":
+        return "msedge"
+    return "chrome"
 
 
 def _using_system_chrome_profile(
@@ -116,13 +115,13 @@ def _using_system_chrome_profile(
 ) -> bool:
     if user_data_dir is None or not use_system_chrome_profile(browser_cfg):
         return False
-    chrome_root = system_chrome_user_data_dir()
-    if chrome_root is None:
+    system_root = system_browser_user_data_dir(browser_cfg)
+    if system_root is None:
         return False
     try:
-        return user_data_dir.resolve() == chrome_root.resolve()
+        return user_data_dir.resolve() == system_root.resolve()
     except OSError:
-        return str(user_data_dir).lower() == str(chrome_root).lower()
+        return str(user_data_dir).lower() == str(system_root).lower()
 
 
 def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> list[str]:
@@ -131,7 +130,7 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
         extra = [extra]
     base = ["--disable-blink-features=AutomationControlled"]
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
-        profile = chrome_profile_directory()
+        profile = browser_profile_directory()
         base.extend(
             [
                 f"--profile-directory={profile}",
@@ -239,16 +238,23 @@ def _open_system_chrome_via_cdp(
     p: Playwright,
     cfg: dict[str, Any],
 ) -> tuple[Browser, BrowserContext, Page]:
+    browser_cfg = cfg.get("browser", {})
     home_url = _ups_home_url(cfg)
-    profile = chrome_profile_directory()
+    profile = browser_profile_directory()
+    channel = ups_browser_channel(browser_cfg)
+    name = browser_display_name(channel)
     log_dir = Path(__file__).resolve().parent.parent / "logs"
     _log(
-        f"Launching real Chrome with profile {profile!r} and opening UPS "
+        f"Launching real {name} with profile {profile!r} and opening UPS "
         "(Playwright will attach — it does not launch the browser)."
     )
 
     try:
-        port = launch_chrome_for_cdp(home_url=home_url, log_dir=log_dir)
+        port = launch_browser_for_cdp(
+            home_url=home_url,
+            log_dir=log_dir,
+            browser_cfg=browser_cfg,
+        )
     except RuntimeError as exc:
         raise UpsBatchError(str(exc)) from exc
 
@@ -259,10 +265,15 @@ def _open_manual_cdp_attach(
     p: Playwright,
     cfg: dict[str, Any],
 ) -> tuple[Browser, BrowserContext, Page]:
-    port = chrome_cdp_port()
+    browser_cfg = cfg.get("browser", {})
+    port = browser_cdp_port(browser_cfg)
+    channel = ups_browser_channel(browser_cfg)
+    debug_bat = (
+        "Run UPS Edge Debug.bat" if channel == "msedge" else "Run UPS Chrome Debug.bat"
+    )
     _log(
-        f"Manual attach mode — start Chrome with 'Run UPS Chrome Debug.bat', "
-        f"then press Enter here when UPS is open (port {port})…"
+        f"Manual attach mode — start {browser_display_name(channel)} with "
+        f"'{debug_bat}', then press Enter here when UPS is open (port {port})…"
     )
     try:
         input()
@@ -271,7 +282,7 @@ def _open_manual_cdp_attach(
 
     if not wait_for_cdp_endpoint(port, timeout_s=5.0):
         raise UpsBatchError(
-            f"No Chrome debug port on {port}. Run 'Run UPS Chrome Debug.bat' first."
+            f"No debug port on {port}. Run '{debug_bat}' first."
         )
     return _attach_playwright_to_cdp(p, cfg, port=port)
 
@@ -287,15 +298,18 @@ def _open_dedicated_profile_browser(
     FedEx-style local profile under Inventory Submissions/ups_browser_profile.
     Run with --setup-login once to save a UPS session here.
     """
-    profile_dir = dedicated_ups_profile_dir()
+    browser_cfg = cfg.get("browser", {})
+    profile_dir = dedicated_ups_profile_dir(browser_cfg)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    args = _launch_args(cfg.get("browser", {}), user_data_dir=profile_dir)
+    args = _launch_args(browser_cfg, user_data_dir=profile_dir)
     home = _ups_home_url(cfg)
+    channel = _resolve_channel(browser_cfg) or "chrome"
+    name = browser_display_name(channel)
 
-    _log(f"Using dedicated UPS profile at {profile_dir}")
+    _log(f"Using dedicated UPS profile at {profile_dir} ({name})")
     context = p.chromium.launch_persistent_context(
         str(profile_dir),
-        channel="chrome",
+        channel=channel,
         headless=headless,
         slow_mo=slow_mo,
         args=args,
@@ -306,7 +320,7 @@ def _open_dedicated_profile_browser(
     page = _pick_ups_page(context, home_url=home)
     page.bring_to_front()
     _ensure_ups_home_page(page, cfg)
-    _log(f"Chrome ready (dedicated profile) — {page.url}")
+    _log(f"{name} ready (dedicated profile) — {page.url}")
     return None, context, page, True
 
 
@@ -331,6 +345,13 @@ def _open_browser(
     channels.append(None)
 
     mode = ups_browser_mode(browser_cfg)
+    if mode in ("cdp", "manual") and not allow_unsafe_cdp():
+        _log(
+            "UPS_BROWSER_MODE=cdp/manual is disabled (matches Huntress infostealer alerts). "
+            "Using isolated browser profile. One-time setup: "
+            "python run_ups_online_batch.py --setup-login"
+        )
+        mode = "dedicated"
 
     if mode == "manual":
         browser, context, page = _open_manual_cdp_attach(p, cfg)
@@ -345,12 +366,7 @@ def _open_browser(
     if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
         browser_cfg
     ):
-        if chrome_cdp_env_disabled():
-            _log(
-                "NOTE: UPS_USE_CHROME_CDP=0 in .env is ignored — "
-                "system Chrome always uses CDP attach now."
-            )
-        close_chrome_processes()
+        close_browser_processes(browser_cfg=browser_cfg)
         try:
             browser, context, page = _open_system_chrome_via_cdp(p, cfg)
             return browser, context, page, True, "cdp"
@@ -358,10 +374,10 @@ def _open_browser(
             _log(f"WARN: CDP attach failed: {exc}")
             _log(
                 "Falling back to dedicated UPS profile "
-                f"({dedicated_ups_profile_dir()}). "
+                f"({dedicated_ups_profile_dir(browser_cfg)}). "
                 "You will be prompted to log in if needed."
             )
-            close_chrome_processes(force=True)
+            close_browser_processes(force=True, browser_cfg=browser_cfg)
             none_ctx, context, page, persistent = _open_dedicated_profile_browser(
                 p, cfg, headless=headless, slow_mo=slow_mo
             )
@@ -802,7 +818,8 @@ def run_ups_depot_batch(
     browser_cfg = cfg.get("browser", {})
     creds_optional = _env_bool(
         "UPS_SKIP_AUTO_LOGIN",
-        default=use_system_chrome_profile(browser_cfg),
+        default=ups_browser_mode(browser_cfg) == "cdp"
+        and use_system_chrome_profile(browser_cfg),
     )
     creds = load_ups_credentials(cfg, optional=creds_optional)
     slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
@@ -862,16 +879,18 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
     browser_cfg = cfg.get("browser", {})
     slow_mo = int(browser_cfg.get("slow_mo_ms") or 80)
     home = _ups_home_url(cfg)
-    profile_dir = dedicated_ups_profile_dir()
+    profile_dir = dedicated_ups_profile_dir(browser_cfg)
     profile_dir.mkdir(parents=True, exist_ok=True)
+    channel = _resolve_channel(browser_cfg) or "chrome"
+    name = browser_display_name(channel)
 
-    _log(f"Opening dedicated UPS browser profile: {profile_dir}")
+    _log(f"Opening dedicated UPS browser profile in {name}: {profile_dir}")
     _log("Log into UPS in the browser window, then return here.")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
-            channel="chrome",
+            channel=channel,
             headless=False,
             slow_mo=slow_mo,
             args=["--disable-blink-features=AutomationControlled"],
