@@ -6,7 +6,7 @@
     "channel": "chrome",
     "use_persistent_profile": true,
     "use_system_chrome": true,
-    "use_chrome_cdp": true,
+    "use_chrome_cdp": false,
     "user_data_dir": "ups_browser_profile"
   },
   "ups": {

@@ -112,14 +112,18 @@ def chrome_executable() -> Path | None:
 
 
 def use_chrome_cdp_launch(browser_cfg: dict | None = None) -> bool:
-    """Launch installed Chrome with --remote-debugging-port (opens URL, keeps profile cookies)."""
+    """Optional CDP launch — off by default; Playwright Chrome is more reliable on RDP."""
     browser_cfg = browser_cfg or {}
     env_raw = (os.environ.get("UPS_USE_CHROME_CDP") or "").strip()
     if env_raw:
-        return _env_bool("UPS_USE_CHROME_CDP", default=True)
-    if browser_cfg.get("use_chrome_cdp") is False:
-        return False
-    return use_system_chrome_profile(browser_cfg)
+        return _env_bool("UPS_USE_CHROME_CDP", default=False)
+    if browser_cfg.get("use_chrome_cdp") is True:
+        return True
+    return False
+
+
+def kill_chrome_before_launch() -> bool:
+    return _env_bool("UPS_KILL_CHROME", default=True)
 
 
 def use_system_chrome_profile(browser_cfg: dict | None = None) -> bool:

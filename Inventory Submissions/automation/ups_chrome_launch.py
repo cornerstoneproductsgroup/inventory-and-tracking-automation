@@ -8,12 +8,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from automation.ups_batch_config import (
     chrome_cdp_port,
     chrome_executable,
     chrome_profile_directory,
+    kill_chrome_before_launch,
     system_chrome_user_data_dir,
 )
 
@@ -36,6 +37,54 @@ def chrome_process_count() -> int:
         return result.stdout.lower().count("chrome.exe")
     except Exception:
         return 0
+
+
+def close_chrome_processes(*, force: bool | None = None) -> int:
+    """
+    End chrome.exe so Playwright can open the profile with a debug session.
+    Returns remaining chrome process count.
+    """
+    remaining = chrome_process_count()
+    if remaining == 0:
+        return 0
+
+    should_kill = kill_chrome_before_launch() if force is None else force
+    if not should_kill:
+        _log(
+            f"WARN: {remaining} chrome.exe process(es) still running. "
+            "Set UPS_KILL_CHROME=1 or close Chrome manually."
+        )
+        return remaining
+
+    _log(f"Ending {remaining} chrome.exe process(es) before UPS automation…")
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        _log(f"WARN: taskkill chrome failed: {exc}")
+
+    for _ in range(20):
+        time.sleep(0.5)
+        remaining = chrome_process_count()
+        if remaining == 0:
+            _log("Chrome closed.")
+            return 0
+    _log(f"WARN: {remaining} chrome.exe process(es) still running after taskkill.")
+    return remaining
+
+
+def ensure_chrome_closed() -> None:
+    remaining = close_chrome_processes()
+    if remaining > 0:
+        raise RuntimeError(
+            f"{remaining} chrome.exe process(es) still running. "
+            "Close Chrome manually or set UPS_KILL_CHROME=1 in .env."
+        )
 
 
 def cdp_endpoint_ready(port: int, *, timeout_s: float = 2.0) -> bool:
@@ -97,25 +146,15 @@ def launch_chrome_for_cdp(
     profile = chrome_profile_directory()
     port = port or chrome_cdp_port()
 
-    running = chrome_process_count()
-    if running > 0:
-        _log(
-            f"WARN: {running} chrome.exe process(es) still running. "
-            "Close ALL Chrome windows (check system tray), then retry."
-        )
-        if wait_for_close_s > 0:
-            _log(f"Waiting {wait_for_close_s:.0f}s for Chrome to close…")
-            deadline = time.monotonic() + wait_for_close_s
-            while time.monotonic() < deadline:
-                if chrome_process_count() == 0:
-                    break
-                time.sleep(1.0)
-
-    if chrome_process_count() > 0:
-        raise RuntimeError(
-            "Chrome is still running. UPS automation must start Chrome with a "
-            "debug port — close every Chrome window and end background Chrome, then retry."
-        )
+    close_chrome_processes()
+    if wait_for_close_s > 0 and chrome_process_count() > 0:
+        _log(f"Waiting {wait_for_close_s:.0f}s for Chrome to close…")
+        deadline = time.monotonic() + wait_for_close_s
+        while time.monotonic() < deadline:
+            if chrome_process_count() == 0:
+                break
+            time.sleep(1.0)
+    ensure_chrome_closed()
 
     if cdp_endpoint_ready(port, timeout_s=1.0):
         _log(f"CDP port {port} already listening — connecting to existing Chrome.")
@@ -164,11 +203,10 @@ def launch_chrome_persistent_playwright(
     if user_data is None:
         raise RuntimeError("Chrome User Data folder not found.")
 
-    if chrome_process_count() > 0:
-        raise RuntimeError("Chrome is still running — close all windows before retry.")
+    ensure_chrome_closed()
 
     _log(
-        f"Fallback: Playwright launching Chrome with profile "
+        f"Playwright launching Chrome with profile "
         f"{chrome_profile_directory()!r}…"
     )
     context = playwright.chromium.launch_persistent_context(

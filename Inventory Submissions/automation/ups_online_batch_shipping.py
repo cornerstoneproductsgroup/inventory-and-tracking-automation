@@ -34,7 +34,7 @@ from automation.ups_batch_config import (
 )
 from automation.ups_credentials import UpsCredentials, load_ups_credentials
 from automation.ups_chrome_launch import (
-    chrome_process_count,
+    close_chrome_processes,
     connect_playwright_cdp,
     launch_chrome_for_cdp,
     launch_chrome_persistent_playwright,
@@ -263,33 +263,26 @@ def _open_browser(
             channels.append(alt)
     channels.append(None)
 
-    if _using_system_chrome_profile(user_data_dir, browser_cfg) and use_chrome_cdp_launch(
-        browser_cfg
-    ):
-        try:
-            browser, context, page = _open_system_chrome_via_cdp(p, cfg)
-            return browser, context, page, True
-        except UpsBatchError as exc:
-            _log(f"WARN: CDP Chrome launch failed: {exc}")
-            if chrome_process_count() > 0:
-                raise UpsBatchError(
-                    f"{exc} Close ALL Chrome windows (Task Manager → end chrome.exe), then retry."
-                ) from exc
-            _log("Trying Playwright Chrome profile launcher…")
-            return _open_system_chrome_persistent_fallback(
-                p,
-                cfg,
-                headless=headless,
-                slow_mo=slow_mo,
-                user_data_dir=user_data_dir,
-                launch_args=args,
-            )
-
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
+        close_chrome_processes()
+        if use_chrome_cdp_launch(browser_cfg):
+            try:
+                browser, context, page = _open_system_chrome_via_cdp(p, cfg)
+                return browser, context, page, True
+            except UpsBatchError as exc:
+                _log(f"WARN: CDP Chrome launch failed: {exc}")
+                close_chrome_processes(force=True)
         _log(
-            "Using installed Google Chrome profile "
-            f"({user_data_dir} / {chrome_profile_directory()}). "
-            "Close all Chrome windows before the script runs."
+            "Using installed Google Chrome profile via Playwright "
+            f"({user_data_dir} / {chrome_profile_directory()})."
+        )
+        return _open_system_chrome_persistent_fallback(
+            p,
+            cfg,
+            headless=headless,
+            slow_mo=slow_mo,
+            user_data_dir=user_data_dir,
+            launch_args=args,
         )
 
     last_err: Exception | None = None
