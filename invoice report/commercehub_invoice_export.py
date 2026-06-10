@@ -970,8 +970,12 @@ async def _run_sps_tractor_phase(
     if raw is None:
         _log("Tractor Supply (SPS): no matching invoices for the report day — no report saved.")
         return None
-    out = save_tractor_supply_csv(raw, report_day)
+    out, review_notes = save_tractor_supply_csv(raw, report_day)
     _log(f"Tractor Supply (SPS): saved {out}")
+    if review_notes:
+        _log(f"Tractor Supply (SPS): {len(review_notes)} item(s) to review before QuickBooks:")
+        for note in review_notes:
+            _log(f"  [tractor:review] {note}")
     try:
         from depot_excel_print import print_landscape_with_gridlines
 

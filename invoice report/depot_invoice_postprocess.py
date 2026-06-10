@@ -193,47 +193,278 @@ def _tractor_drop_stub_body_rows(rows: list[list[str]]) -> list[list[str]]:
     return out
 
 
-def _tractor_dedupe_invoice_total_first_row_per_po(rows: list[list[str]]) -> list[list[str]]:
+# 0-based output column indices (A..H after retailer append).
+_TRACTOR_COL_INV = 0
+_TRACTOR_COL_INV_DATE = 1
+_TRACTOR_COL_PO_DATE = 2
+_TRACTOR_COL_QTY_IX = 3
+_TRACTOR_COL_UNIT_IX = 4
+_TRACTOR_COL_TOTAL_IX = 5
+_TRACTOR_COL_STYLE_IX = 6
+_TRACTOR_HEADER_COLS: tuple[int, ...] = (
+    _TRACTOR_COL_INV_DATE,
+    _TRACTOR_COL_PO_DATE,
+    _TRACTOR_COL_TOTAL_IX,
+)
+_TRACTOR_DETAIL_COLS: tuple[int, ...] = (
+    _TRACTOR_COL_QTY_IX,
+    _TRACTOR_COL_UNIT_IX,
+    _TRACTOR_COL_STYLE_IX,
+)
+_TRACTOR_REQUIRED_FIELDS: tuple[tuple[int, str], ...] = (
+    (_TRACTOR_COL_INV, "Invoice Number"),
+    (_TRACTOR_COL_INV_DATE, "Invoice Date"),
+    (_TRACTOR_COL_PO_DATE, "PO Date"),
+    (_TRACTOR_COL_QTY_IX, "Qty Ordered"),
+    (_TRACTOR_COL_UNIT_IX, "Unit Price"),
+    (_TRACTOR_COL_TOTAL_IX, "Invoice Total"),
+    (_TRACTOR_COL_STYLE_IX, "Vendor Style"),
+)
+_TRACTOR_AMOUNT_TOLERANCE = 0.02
+
+
+def _tractor_note(notes: list[str], message: str) -> None:
+    notes.append(message)
+
+
+def _tractor_cell_text(row: list[str], col_ix: int) -> str:
+    if col_ix >= len(row):
+        return ""
+    return (row[col_ix] or "").strip()
+
+
+def _tractor_pad_row(row: list[str], width: int) -> list[str]:
+    padded = list(row)
+    if len(padded) < width:
+        padded.extend([""] * (width - len(padded)))
+    return padded
+
+
+def _tractor_row_has_header_fields(row: list[str]) -> bool:
+    return any(_tractor_cell_text(row, col_ix) for col_ix in _TRACTOR_HEADER_COLS)
+
+
+def _tractor_row_has_detail_fields(row: list[str]) -> bool:
+    return any(_tractor_cell_text(row, col_ix) for col_ix in _TRACTOR_DETAIL_COLS)
+
+
+def _tractor_row_is_header_only(row: list[str]) -> bool:
+    """Header half of a split line: dates and/or line total, no SKU/qty/price."""
+    if _tractor_cell_text(row, _TRACTOR_COL_STYLE_IX):
+        return False
+    if _tractor_cell_text(row, _TRACTOR_COL_QTY_IX) or _tractor_cell_text(row, _TRACTOR_COL_UNIT_IX):
+        return False
+    return _tractor_row_has_header_fields(row)
+
+
+def _tractor_row_is_detail_only(row: list[str]) -> bool:
+    """Detail half of a split line: SKU and/or qty/price, no header dates/total."""
+    if _tractor_cell_text(row, _TRACTOR_COL_STYLE_IX):
+        return True
+    has_qty_or_price = bool(
+        _tractor_cell_text(row, _TRACTOR_COL_QTY_IX) or _tractor_cell_text(row, _TRACTOR_COL_UNIT_IX)
+    )
+    return has_qty_or_price and not _tractor_row_has_header_fields(row)
+
+
+def _tractor_first_nonempty(block: list[list[str]], col_ix: int, *, rows_first: list[list[str]]) -> str:
+    for r in rows_first + block:
+        val = _tractor_cell_text(r, col_ix)
+        if val:
+            return val
+    return ""
+
+
+def _tractor_line_label(inv: str, sku: str) -> str:
+    return f"{inv} SKU {sku}" if sku else inv
+
+
+def _tractor_validate_merged_row(merged: list[str], label: str, notes: list[str]) -> None:
+    missing = [
+        label for col_ix, label in _TRACTOR_REQUIRED_FIELDS if not _tractor_cell_text(merged, col_ix)
+    ]
+    if missing:
+        _tractor_note(
+            notes,
+            f"Tractor {label}: incomplete row after merge (missing: {', '.join(missing)}).",
+        )
+
+    qty = _tractor_coerce_numeric(_tractor_cell_text(merged, _TRACTOR_COL_QTY_IX))
+    unit = _tractor_coerce_numeric(_tractor_cell_text(merged, _TRACTOR_COL_UNIT_IX))
+    total = _tractor_coerce_numeric(_tractor_cell_text(merged, _TRACTOR_COL_TOTAL_IX))
+    if isinstance(qty, (int, float)) and isinstance(unit, (int, float)) and isinstance(total, (int, float)):
+        expected = float(qty) * float(unit)
+        if abs(expected - float(total)) > _TRACTOR_AMOUNT_TOLERANCE:
+            _tractor_note(
+                notes,
+                f"Tractor {label}: qty ({qty}) × unit price ({unit}) = {expected:.2f} "
+                f"but invoice total is {float(total):.2f}.",
+            )
+
+
+def _tractor_pick_detail_row(group: list[list[str]]) -> list[str] | None:
+    for r in group:
+        if _tractor_cell_text(r, _TRACTOR_COL_STYLE_IX):
+            return r
+    for r in group:
+        if _tractor_row_is_detail_only(r):
+            return r
+    return None
+
+
+def _tractor_split_po_block_into_line_groups(
+    block: list[list[str]], inv: str, notes: list[str]
+) -> list[list[list[str]]]:
     """
-    SPS repeats the invoice total in column F on every line for the same invoice # (column A).
-    Keep F only on the first row of each consecutive block with the same invoice; clear F on
-    following rows so the sheet SUM is correct.
+    Within one PO (same invoice #), SPS emits a header row + detail row per SKU.
+    Pair them so each SKU becomes its own merge group (2 raw rows → 1 output row).
+    """
+    if len(block) == 1:
+        return [block]
+
+    groups: list[list[list[str]]] = []
+    pending_header: list[str] | None = None
+    i = 0
+    while i < len(block):
+        r = block[i]
+        if _tractor_row_is_header_only(r):
+            if pending_header is not None:
+                _tractor_note(
+                    notes,
+                    f"Tractor invoice {inv}: back-to-back header rows — using nearest header per line.",
+                )
+            pending_header = r
+            i += 1
+            continue
+        if _tractor_row_is_detail_only(r):
+            group: list[list[str]] = []
+            if pending_header is not None:
+                group.append(pending_header)
+                pending_header = None
+            group.append(r)
+            groups.append(group)
+            i += 1
+            continue
+        if pending_header is not None:
+            groups.append([pending_header, r])
+            pending_header = None
+        else:
+            groups.append([r])
+        i += 1
+    if pending_header is not None:
+        _tractor_note(
+            notes,
+            f"Tractor invoice {inv}: header row without a matching line item — row kept as-is.",
+        )
+        groups.append([pending_header])
+    return groups if groups else [block]
+
+
+def _tractor_merge_line_group(
+    group: list[list[str]],
+    block: list[list[str]],
+    inv: str,
+    width: int,
+    notes: list[str],
+) -> list[str]:
+    """Merge one header+detail pair (or a single complete row) into one output line."""
+    if len(group) == 1 and not _tractor_row_is_header_only(group[0]):
+        merged = _tractor_pad_row(group[0], width)
+        sku = _tractor_cell_text(merged, _TRACTOR_COL_STYLE_IX)
+        _tractor_validate_merged_row(merged, _tractor_line_label(inv, sku), notes)
+        return merged
+
+    header_rows = [r for r in group if _tractor_row_has_header_fields(r)]
+    block_headers = [r for r in block if _tractor_row_has_header_fields(r)]
+    detail_row = _tractor_pick_detail_row(group)
+
+    merged = [""] * width
+    merged[_TRACTOR_COL_INV] = inv
+    merged[_TRACTOR_COL_INV_DATE] = (
+        _tractor_first_nonempty(group, _TRACTOR_COL_INV_DATE, rows_first=header_rows)
+        or _tractor_first_nonempty(block, _TRACTOR_COL_INV_DATE, rows_first=block_headers)
+    )
+    merged[_TRACTOR_COL_PO_DATE] = (
+        _tractor_first_nonempty(group, _TRACTOR_COL_PO_DATE, rows_first=header_rows)
+        or _tractor_first_nonempty(block, _TRACTOR_COL_PO_DATE, rows_first=block_headers)
+    )
+    merged[_TRACTOR_COL_TOTAL_IX] = _tractor_first_nonempty(
+        group, _TRACTOR_COL_TOTAL_IX, rows_first=header_rows
+    )
+    if detail_row is not None:
+        merged[_TRACTOR_COL_QTY_IX] = _tractor_cell_text(detail_row, _TRACTOR_COL_QTY_IX)
+        merged[_TRACTOR_COL_UNIT_IX] = _tractor_cell_text(detail_row, _TRACTOR_COL_UNIT_IX)
+        merged[_TRACTOR_COL_STYLE_IX] = _tractor_cell_text(detail_row, _TRACTOR_COL_STYLE_IX)
+    if len(merged) > 7:
+        merged[7] = (
+            _tractor_first_nonempty(group, 7, rows_first=group) or _TRACTOR_RETAILER_VALUE
+        )
+
+    sku = _tractor_cell_text(merged, _TRACTOR_COL_STYLE_IX)
+    _tractor_validate_merged_row(merged, _tractor_line_label(inv, sku), notes)
+    return merged
+
+
+def _tractor_consolidate_po_rows_per_invoice(
+    rows: list[list[str]], notes: list[str]
+) -> list[list[str]]:
+    """
+    SPS splits each PO line across two rows (header + SKU detail). Within each invoice # block,
+    pair header/detail rows per SKU so one SKU → one output row (two SKUs → two output rows).
     """
     if len(rows) <= 1:
         return rows
-    f_ix = _TRACTOR_COL_CA - 1
-    out: list[list[str]] = [list(rows[0])]
+    width = max(len(r) for r in rows)
+    out: list[list[str]] = [_tractor_pad_row(rows[0], width)]
+    seen_po_sku: set[tuple[str, str]] = set()
     i = 1
     while i < len(rows):
-        inv = (rows[i][0] or "").strip()
-        block: list[list[str]] = []
-        while i < len(rows) and (rows[i][0] or "").strip() == inv:
-            block.append(list(rows[i]))
+        inv = _tractor_cell_text(rows[i], _TRACTOR_COL_INV)
+        if not inv:
+            out.append(_tractor_pad_row(rows[i], width))
             i += 1
-        for bi, r in enumerate(block):
-            if bi > 0 and f_ix < len(r):
-                r[f_ix] = ""
-            out.append(r)
+            continue
+        block: list[list[str]] = []
+        while i < len(rows) and _tractor_cell_text(rows[i], _TRACTOR_COL_INV) == inv:
+            block.append(_tractor_pad_row(rows[i], width))
+            i += 1
+        for group in _tractor_split_po_block_into_line_groups(block, inv, notes):
+            merged = _tractor_merge_line_group(group, block, inv, width, notes)
+            sku = _tractor_cell_text(merged, _TRACTOR_COL_STYLE_IX)
+            key = (inv, sku)
+            if key in seen_po_sku:
+                _tractor_note(
+                    notes,
+                    f"Tractor report: duplicate PO {inv} SKU {sku or '(blank)'} — kept first row only.",
+                )
+                continue
+            seen_po_sku.add(key)
+            out.append(merged)
     return out
 
 
-def save_tractor_supply_csv(source: Path, report_day: date) -> Path:
+def save_tractor_supply_csv(source: Path, report_day: date) -> tuple[Path, list[str]]:
     """
     Read the SPS download (plain CSV or a ZIP of CSVs), project raw columns A,B,E,M,O,CA,R to
     sheet columns A..G, append ``Retailer`` / ``Tractor Supply`` in column H, drop invoice-only
-    stub lines, keep invoice total (F) only on the first row per invoice #, apply Accounting to
+    stub lines, merge split header/detail rows into one row per PO line (invoice # + SKU), apply Accounting to
     columns E and F (Depot/Lowe's style), set column widths and center column D, total column F
     with a SUM row (total cell Accounting), and save ``.xlsx`` to the Tractor Supply share.
+
+    Returns ``(workbook_path, review_notes)``. Notes list anything worth checking before
+    QuickBooks entry; the report is always saved when rows exist.
     Uses COMMERCEHUB_TRACTOR_OUTPUT_DIR and COMMERCEHUB_OUTPUT_FALLBACK_DIR like Depot workbooks.
     """
     from dotenv import load_dotenv
 
     load_dotenv()
+    review_notes: list[str] = []
     raw_rows = _tractor_csv_rows_from_download(source)
-    rows = _tractor_dedupe_invoice_total_first_row_per_po(
+    rows = _tractor_consolidate_po_rows_per_invoice(
         _tractor_append_retailer_column(
             _tractor_drop_stub_body_rows(_tractor_project_report_columns(raw_rows))
-        )
+        ),
+        review_notes,
     )
     if not rows:
         raise RuntimeError("Tractor SPS export produced no rows after download merge.")
@@ -254,7 +485,15 @@ def save_tractor_supply_csv(source: Path, report_day: date) -> Path:
 
     for ri, row in enumerate(rows[1:], start=first_data):
         for ci, val in enumerate(row, start=1):
-            if ci == _TRACTOR_COL_UNIT_PRICE or ci == _TRACTOR_COL_CA:
+            if ci == _TRACTOR_COL_QTY:
+                num = _tractor_coerce_numeric(val)
+                if isinstance(num, (int, float)):
+                    ws.cell(row=ri, column=ci, value=int(num) if num == int(num) else num)
+                elif not str(val).strip():
+                    ws.cell(row=ri, column=ci, value=None)
+                else:
+                    ws.cell(row=ri, column=ci, value=val)
+            elif ci == _TRACTOR_COL_UNIT_PRICE or ci == _TRACTOR_COL_CA:
                 num = _tractor_coerce_numeric(val)
                 if num is not None:
                     ws.cell(row=ri, column=ci, value=num)
@@ -296,7 +535,7 @@ def save_tractor_supply_csv(source: Path, report_day: date) -> Path:
 
     _apply_openpyxl_print_file_and_page_footer(ws)
 
-    return _save_xlsx_or_fallback(wb, out_path)
+    return _save_xlsx_or_fallback(wb, out_path), review_notes
 
 
 def parse_order_line(value) -> int | None:
