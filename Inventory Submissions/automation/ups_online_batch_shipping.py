@@ -226,8 +226,53 @@ def _url_loaded(page: Page, url: str) -> bool:
     return target in current
 
 
+def _navigate_via_cdp(page: Page, url: str) -> bool:
+    try:
+        cdp = page.context.new_cdp_session(page)
+        cdp.send("Page.navigate", {"url": url})
+        page.wait_for_load_state("domcontentloaded", timeout=120_000)
+        return not _is_blank_tab_url(_page_url(page))
+    except Exception as exc:
+        _log(f"WARN: CDP navigate failed: {exc}")
+        return False
+
+
+def _navigate_via_address_bar(page: Page, url: str) -> bool:
+    """Same as a user pasting the UPS link into the address bar."""
+    for key in ("Control+l", "Alt+d", "F6"):
+        try:
+            page.keyboard.press(key)
+            page.wait_for_timeout(350)
+            page.keyboard.type(url, delay=12)
+            page.keyboard.press("Enter")
+            page.wait_for_load_state("domcontentloaded", timeout=120_000)
+            if not _is_blank_tab_url(_page_url(page)):
+                return True
+        except Exception:
+            continue
+    for sel in (
+        "#addressBarInput",
+        "input#searchbox",
+        '[aria-label*="Address"]',
+        '[aria-label*="address"]',
+        '[aria-label*="Search"]',
+    ):
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                loc.click()
+                loc.fill(url)
+                loc.press("Enter")
+                page.wait_for_load_state("domcontentloaded", timeout=120_000)
+                if not _is_blank_tab_url(_page_url(page)):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def _force_navigate_tab(page: Page, url: str, *, label: str, retries: int = 4) -> Page:
-    """Load URL in this tab — same as pasting in the address bar; retries if still blank."""
+    """Load URL in this tab — retries with goto, CDP, JS, and address-bar paste."""
     if _url_loaded(page, url):
         return page
 
@@ -249,18 +294,13 @@ def _force_navigate_tab(page: Page, url: str, *, label: str, retries: int = 4) -
         if _is_blank_tab_url(_page_url(page)):
             try:
                 page.evaluate("u => { window.location.href = u; }", url)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
             except Exception as exc:
                 last_err = exc
-        if _is_blank_tab_url(_page_url(page)):
-            try:
-                page.keyboard.press("Control+l")
-                page.wait_for_timeout(200)
-                page.keyboard.type(url, delay=15)
-                page.keyboard.press("Enter")
-                page.wait_for_load_state("domcontentloaded", timeout=120_000)
-            except Exception as exc:
-                last_err = exc
+        if _is_blank_tab_url(_page_url(page)) and _navigate_via_cdp(page, url):
+            pass
+        if _is_blank_tab_url(_page_url(page)) and _navigate_via_address_bar(page, url):
+            pass
         page.bring_to_front()
         if not _is_blank_tab_url(_page_url(page)):
             _log(f"Now on: {_page_url(page)!r}")
@@ -270,6 +310,91 @@ def _force_navigate_tab(page: Page, url: str, *, label: str, retries: int = 4) -
     raise UpsBatchError(
         f"Stuck on blank tab after trying to load UPS ({url!r}). {last_err}"
     )
+
+
+def _find_ups_tab_in_context(context: BrowserContext) -> Page | None:
+    for pg in context.pages:
+        if _is_ups_tab_url(_page_url(pg)):
+            return pg
+        try:
+            title = (pg.title() or "").lower()
+            if "ups" in title:
+                return pg
+        except Exception:
+            continue
+    return None
+
+
+def _wait_for_ups_tab(context: BrowserContext, *, wait_s: float = 12.0) -> Page | None:
+    deadline = time.time() + max(1.0, wait_s)
+    while time.time() < deadline:
+        found = _find_ups_tab_in_context(context)
+        if found is not None:
+            return found
+        try:
+            if context.pages:
+                context.pages[0].wait_for_timeout(500)
+            else:
+                time.sleep(0.5)
+        except Exception:
+            time.sleep(0.5)
+    return None
+
+
+def _resolve_ups_driver_page(context: BrowserContext, cfg: dict[str, Any]) -> Page:
+    """
+    Pick the tab Playwright should drive.
+
+    Edge often opens about:blank plus a restored UPS login tab. Prefer the UPS tab
+    when it exists; otherwise load UPS in tab 0 or open a fresh tab.
+    """
+    _log_browser_tabs(context)
+    login_url = _ups_login_url(cfg)
+
+    ups_tab = _wait_for_ups_tab(context, wait_s=12.0)
+    if ups_tab is not None:
+        ups_tab.bring_to_front()
+        try:
+            ups_tab.wait_for_load_state("domcontentloaded", timeout=60_000)
+        except Exception:
+            pass
+        for _ in range(24):
+            if _is_ups_tab_url(_page_url(ups_tab)):
+                break
+            ups_tab.wait_for_timeout(500)
+        _log(f"Using existing UPS tab: {_page_url(ups_tab)!r}")
+        _close_extra_tabs(context, keep=ups_tab)
+        return ups_tab
+
+    driver = context.pages[0] if context.pages else context.new_page()
+    driver.bring_to_front()
+    if not _is_blank_tab_url(_page_url(driver)) and _is_ups_tab_url(_page_url(driver)):
+        _close_extra_tabs(context, keep=driver)
+        return driver
+
+    try:
+        driver = _force_navigate_tab(
+            driver,
+            login_url,
+            label="Loading UPS in the blank tab",
+            retries=3,
+        )
+        _close_extra_tabs(context, keep=driver)
+        return driver
+    except UpsBatchError as exc:
+        _log(f"WARN: could not load UPS in tab 0 ({exc})")
+
+    _log("Opening a new browser tab for UPS…")
+    fresh = context.new_page()
+    fresh.bring_to_front()
+    fresh = _force_navigate_tab(fresh, login_url, label="New tab — UPS", retries=4)
+    _close_extra_tabs(context, keep=fresh)
+    fresh.bring_to_front()
+    if _is_blank_tab_url(_page_url(fresh)):
+        raise UpsBatchError(
+            "Browser stayed on about:blank. Close all Chrome/Edge windows and run again."
+        )
+    return fresh
 
 
 def _navigate_current_tab(page: Page, url: str, *, label: str) -> Page:
@@ -286,37 +411,13 @@ def _navigate_current_tab(page: Page, url: str, *, label: str) -> Page:
 
 
 def _ensure_ups_tab(page: Page, cfg: dict[str, Any]) -> Page:
-    """
-    Drive the first browser tab. If it is about:blank, load UPS in that tab first,
-    then close any extra restored tabs (never close UPS before blank is loaded).
-    """
-    context = page.context
-    _log_browser_tabs(context)
-    driver = context.pages[0] if context.pages else page
-    driver.bring_to_front()
-
-    current = _page_url(driver)
-    if _is_blank_tab_url(current) or not _is_ups_tab_url(current):
-        driver = _force_navigate_tab(
-            driver,
-            _ups_login_url(cfg),
-            label="Blank tab — loading UPS in this tab",
-        )
-
-    _close_extra_tabs(context, keep=driver)
-
-    if _is_blank_tab_url(_page_url(driver)) or not _is_ups_tab_url(_page_url(driver)):
-        driver = _force_navigate_tab(
-            driver,
-            _ups_login_url(cfg),
-            label="Retry — loading UPS in this tab",
-        )
-    return driver
+    """Always re-resolve the live UPS tab from the browser (never keep a stale blank page)."""
+    return _resolve_ups_driver_page(page.context, cfg)
 
 
 def bootstrap_ups_page(page: Page, cfg: dict[str, Any]) -> Page:
-    """Call immediately after opening the browser — fixes Edge about:blank startup tab."""
-    return _ensure_ups_tab(page, cfg)
+    """Call immediately after opening the browser — fixes about:blank startup tab."""
+    return _resolve_ups_driver_page(page.context, cfg)
 
 
 def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> Page:
