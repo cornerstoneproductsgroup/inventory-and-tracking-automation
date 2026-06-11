@@ -721,24 +721,66 @@ def _select_dropdown(page: Page, selector: str, *, value: str | None = None, lab
     raise UpsBatchError(f"Could not select {field}")
 
 
+_UPS_USERNAME_DEFAULT = "#username, input[name='username'], input#username"
+_UPS_PASSWORD_DEFAULT = "#password, input[name='password'], input#password"
+
 _HEADER_LOGIN_DEFAULTS = (
-    "button:has(span.text:text-is('Log In'))",
-    ".ups-anonymous_profile button",
+    "header button:has(span.text:text-is('Log In'))",
+    ".ups-header .ups-anonymous_profile button",
     "[data-test-id='anonymous-profile'] button",
-    "a:has(span.text:text-is('Log In'))",
-    "button:has-text('Log In')",
+)
+_POPOVER_LOGIN_DEFAULTS = (
+    ".ups-user-actions:visible button:has-text('Log In')",
+    ".ups-anonymous_profile:visible button:has-text('Log In')",
+    ".ups-user-actions:visible a[href*='lasso/login']",
+    ".ups-anonymous_profile:visible a[href*='lasso/login']",
 )
 _LOGIN_NAV_DEFAULTS = (
     "a[href*='lasso/login']",
     "a[href*='id.ups.com/u/login']",
-    "a[href*='id.ups.com']",
 )
-_DROPDOWN_LOGIN_DEFAULTS = (
-    ".ups-user-actions a[href*='lasso/login']",
-    ".ups-anonymous_profile a[href*='lasso/login']",
-    "a[href*='lasso/login']:visible",
-    "a[href*='id.ups.com']:visible",
-)
+
+
+def _is_ups_login_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    return "id.ups.com" in text or "lasso/login" in text
+
+
+def _is_ups_site_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    return "ups.com" in text
+
+
+def _is_external_auth_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    if not text or _is_blank_tab_url(text):
+        return False
+    if _is_ups_site_url(text):
+        return False
+    return any(
+        host in text
+        for host in (
+            "amazon.com",
+            "account.amazon",
+            "google.com",
+            "facebook.com",
+            "apple.com",
+        )
+    )
+
+
+def _close_non_ups_tabs(context: BrowserContext, *, keep: Page | None = None) -> None:
+    for pg in list(context.pages):
+        if keep is not None and pg is keep:
+            continue
+        url = _page_url(pg)
+        if _is_blank_tab_url(url) or _is_ups_site_url(url):
+            continue
+        try:
+            _log(f"Closing non-UPS tab: {url!r}")
+            pg.close()
+        except Exception:
+            pass
 
 
 def _combined_selectors(cfg: dict[str, Any], key: str, defaults: tuple[str, ...]) -> str:
@@ -761,6 +803,11 @@ def _login_field_selector(cfg: dict[str, Any], key: str, default: str) -> str:
 
 
 def _find_login_field(page: Page, cfg: dict[str, Any], key: str, *, default: str) -> Any:
+    if not _is_ups_login_url(_page_url(page)):
+        raise UpsBatchError(
+            f"UPS login field requested on non-login page: {_page_url(page)!r}. "
+            "An external sign-in page (e.g. Amazon) may have opened by mistake."
+        )
     raw = _login_field_selector(cfg, key, default)
     selectors = [s.strip() for s in raw.split(",") if s.strip()]
     contexts = [page, *page.frames]
@@ -801,6 +848,8 @@ def _raise_if_access_denied(page: Page, *, step: str) -> None:
 
 
 def _page_has_login_form(page: Page, cfg: dict[str, Any], *, username_default: str) -> bool:
+    if not _is_ups_login_url(_page_url(page)):
+        return False
     try:
         return _find_login_field(
             page, cfg, "username_input", default=username_default
@@ -813,110 +862,131 @@ def _find_page_with_login_form(
     context: BrowserContext, cfg: dict[str, Any], *, username_default: str
 ) -> Page | None:
     for pg in context.pages:
+        if not _is_ups_login_url(_page_url(pg)):
+            continue
         if _page_has_login_form(pg, cfg, username_default=username_default):
             pg.bring_to_front()
             return pg
     return None
 
 
-def _wait_for_login_navigation(page: Page, context: BrowserContext) -> Page:
-    pages_before = set(context.pages)
-    for _ in range(24):
-        found = [pg for pg in context.pages if pg not in pages_before]
-        if found:
-            found[0].bring_to_front()
-            try:
-                found[0].wait_for_load_state("domcontentloaded", timeout=30_000)
-            except Exception:
-                pass
-            return found[0]
-        current = _page_url(page).lower()
-        if "lasso/login" in current or "id.ups.com" in current:
-            return page
-        for pg in context.pages:
-            url = _page_url(pg).lower()
-            if "lasso/login" in url or "id.ups.com" in url:
-                pg.bring_to_front()
-                return pg
-        page.wait_for_timeout(500)
-    return page
-
-
-def _click_ups_login_link(
-    page: Page,
-    context: BrowserContext,
-    cfg: dict[str, Any],
-    *,
-    selectors: str,
-    label: str,
+def _wait_for_ups_login_page(
+    page: Page, context: BrowserContext, *, timeout_ms: int = 20_000
 ) -> Page:
-    if not _click_any(page, selectors, label=label):
-        return page
-    page = _wait_for_login_navigation(page, context)
-    if page not in context.pages and context.pages:
-        page = context.pages[0]
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 600))
+    pages_before = set(context.pages)
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        for pg in list(context.pages):
+            if pg not in pages_before and _is_external_auth_url(_page_url(pg)):
+                _log(f"Ignoring accidental external tab: {_page_url(pg)!r}")
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+        for pg in context.pages:
+            if _is_ups_login_url(_page_url(pg)):
+                pg.bring_to_front()
+                try:
+                    pg.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:
+                    pass
+                return pg
+        page.wait_for_timeout(350)
     return page
+
+
+def _click_popover_login(page: Page, cfg: dict[str, Any]) -> bool:
+    """Click the yellow Log In button inside the header flyout (not the header toggle)."""
+    popover_sels = _combined_selectors(cfg, "popover_login", _POPOVER_LOGIN_DEFAULTS)
+    for sel in [s.strip() for s in popover_sels.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            if not loc.is_visible(timeout=2000):
+                continue
+            loc.click(timeout=10_000)
+            _log(f"Clicked popover Log In ({sel!r}).")
+            return True
+        except Exception:
+            continue
+    for root_sel in (
+        ".ups-user-actions:visible",
+        ".ups-anonymous_profile:visible",
+        "[class*='user-actions']:visible",
+    ):
+        try:
+            root = page.locator(root_sel).first
+            if not root.is_visible(timeout=1500):
+                continue
+            btn = root.locator(
+                "button:has-text('Log In'), a[href*='lasso/login']"
+            ).first
+            if btn.is_visible(timeout=1500):
+                btn.click(timeout=10_000)
+                _log("Clicked popover Log In (panel button).")
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _open_ups_login_via_ui(page: Page, cfg: dict[str, Any]) -> Page:
-    """Open sign-in via UPS.com UI links, then lasso/login fallback if needed."""
+    """Open UPS id.ups.com sign-in — lasso URL first, header flyout as fallback."""
     page = _ensure_ups_home_page(page, cfg)
-    clear_blocking_overlays(page, cfg, log=_log)
+    dismiss_ups_startup_popups(page, cfg, log=_log)
     context = page.context
-    username_default = "#username, input[name='username'], input[type='email']"
+    username_default = _UPS_USERNAME_DEFAULT
+
+    _close_non_ups_tabs(context, keep=page)
 
     existing = _find_page_with_login_form(context, cfg, username_default=username_default)
     if existing:
         _log("UPS login form already open.")
         return existing
 
-    if "id.ups.com" in _page_url(page).lower():
-        page = _navigate_current_tab(
-            page,
-            _ups_home_url(cfg),
-            label="Leaving id.ups.com — returning to UPS home before login",
-        )
-        clear_blocking_overlays(page, cfg, log=_log)
+    _log("Opening UPS sign-in via lasso/login URL (same as pasting in address bar)…")
+    page = _navigate_current_tab(
+        page,
+        _ups_login_url(cfg),
+        label="Loading UPS sign-in",
+    )
+    page = _wait_for_ups_login_page(page, context)
+    _close_non_ups_tabs(context, keep=page)
 
-    nav_sels = _combined_selectors(cfg, "login_nav_link", _LOGIN_NAV_DEFAULTS)
-    page = _click_ups_login_link(page, context, cfg, selectors=nav_sels, label="login link")
-    clear_blocking_overlays(page, cfg, log=_log)
     existing = _find_page_with_login_form(context, cfg, username_default=username_default)
-    if existing:
-        _raise_if_access_denied(existing, step="opening login")
-        return existing
-
-    header_sels = _combined_selectors(cfg, "header_login", _HEADER_LOGIN_DEFAULTS)
-    dropdown_sels = _combined_selectors(cfg, "dropdown_login", _DROPDOWN_LOGIN_DEFAULTS)
-    if _click_any(page, header_sels, label="header Log In"):
-        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
-        page = _click_ups_login_link(
-            page, context, cfg, selectors=dropdown_sels, label="dropdown Log In"
+    if not existing:
+        _log("Lasso URL did not show login form — trying header Log In flyout…")
+        page = _ensure_ups_home_page(page, cfg)
+        dismiss_ups_startup_popups(page, cfg, log=_log)
+        header_sels = _combined_selectors(cfg, "header_login", _HEADER_LOGIN_DEFAULTS)
+        if _click_any(page, header_sels, label="header Log In", timeout_ms=8000):
+            page.wait_for_timeout(
+                _timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800)
+            )
+            if _click_popover_login(page, cfg):
+                page = _wait_for_ups_login_page(page, context)
+                _close_non_ups_tabs(context, keep=page)
+        existing = _find_page_with_login_form(
+            context, cfg, username_default=username_default
         )
-        clear_blocking_overlays(page, cfg, log=_log)
-        existing = _find_page_with_login_form(context, cfg, username_default=username_default)
-        if existing:
-            _raise_if_access_denied(existing, step="opening login")
-            return existing
 
-    if not _find_page_with_login_form(context, cfg, username_default=username_default):
-        _log("Login form not visible — opening UPS lasso/login URL…")
-        page = _navigate_current_tab(
-            page,
-            _ups_login_url(cfg),
-            label="Opening UPS sign-in (lasso)",
+    page = existing or page
+    if not _is_ups_login_url(_page_url(page)):
+        urls = [_page_url(pg) for pg in context.pages]
+        raise UpsBatchError(
+            "UPS login page did not open.\n"
+            f"Browser tabs: {urls!r}\n"
+            "If Amazon or another site opened, close it and run:\n"
+            "  python run_ups_online_batch.py --setup-login\n"
+            "Or set UPS_MANUAL_LOGIN=1 in .env."
         )
-        clear_blocking_overlays(page, cfg, log=_log)
 
-    page = _find_page_with_login_form(context, cfg, username_default=username_default) or page
     loc = _find_login_field(page, cfg, "username_input", default=username_default)
     try:
         loc.wait_for(state="visible", timeout=30_000)
     except Exception as exc:
         urls = [_page_url(pg) for pg in context.pages]
         raise UpsBatchError(
-            "UPS login form (#username) did not appear after clicking Log In.\n"
+            "UPS login form (#username) did not appear.\n"
             f"Browser tabs: {urls!r}\n"
             "Try one-time manual login saved to the profile:\n"
             "  python run_ups_online_batch.py --setup-login\n"
@@ -1000,7 +1070,7 @@ def _ups_login(
 ) -> Page:
     _log("Step 1/6: Open UPS home and clear popups…")
     page = _ensure_ups_home_page(page, cfg)
-    clear_blocking_overlays(page, cfg, log=_log)
+    dismiss_ups_startup_popups(page, cfg, log=_log)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
         _wait_for_manual_ups_login(page, cfg)
@@ -1041,13 +1111,19 @@ def _ups_login(
 
     _log(f"Step 2/6: Logging into UPS as {creds.username[:3]}…")
     page = _open_ups_login_via_ui(page, cfg)
+    _close_non_ups_tabs(page.context, keep=page)
+    if not _is_ups_login_url(_page_url(page)):
+        raise UpsBatchError(
+            f"Not on UPS login page before entering credentials ({_page_url(page)!r}). "
+            "Run python run_ups_online_batch.py --setup-login or set UPS_MANUAL_LOGIN=1."
+        )
 
     _type_login_field(
         page,
         cfg,
         "username_input",
         creds.username,
-        default="#username, input[name='username'], input[type='email']",
+        default=_UPS_USERNAME_DEFAULT,
     )
     page.wait_for_timeout(_timing_ms(cfg, "before_login_continue_ms", "UPS_BEFORE_LOGIN_CONTINUE_MS", 1500))
     verify_ms = _timing_ms(cfg, "verify_wait_ms", "UPS_VERIFY_WAIT_MS", 8000)
@@ -1066,12 +1142,19 @@ def _ups_login(
     page.wait_for_timeout(_timing_ms(cfg, "after_login_continue_ms", "UPS_AFTER_LOGIN_CONTINUE_MS", 2500))
     _raise_if_access_denied(page, step="after username")
 
+    _close_non_ups_tabs(page.context, keep=page)
+    if _is_external_auth_url(_page_url(page)):
+        raise UpsBatchError(
+            "UPS redirected to an external sign-in (e.g. Amazon). "
+            "Use python run_ups_online_batch.py --setup-login for a saved UPS session."
+        )
+
     _type_login_field(
         page,
         cfg,
         "password_input",
         creds.password,
-        default="#password, input[name='password'], input[type='password']",
+        default=_UPS_PASSWORD_DEFAULT,
     )
     if not _click_any(page, _sel(cfg, "login_continue"), label="Continue (password)"):
         raise UpsBatchError("Could not click Continue after password")
