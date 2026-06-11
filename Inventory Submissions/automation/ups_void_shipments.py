@@ -16,15 +16,18 @@ from automation.ups_online_batch_shipping import (
     UpsBatchError,
     _click_any,
     _ensure_ups_tab,
+    _is_blank_tab_url,
     _load_config,
     _log,
     _navigate_current_tab,
     _open_browser,
+    _page_url,
     _save_session,
     _sel,
     _select_dropdown,
     _timing_ms,
     _ups_login,
+    bootstrap_ups_page,
 )
 
 
@@ -51,6 +54,12 @@ def _history_url(cfg: dict[str, Any]) -> str:
 
 def _open_shipping_history(page: Page, cfg: dict[str, Any]) -> Page:
     page = _ensure_ups_tab(page, cfg)
+    if _is_blank_tab_url(_page_url(page)):
+        page = _navigate_current_tab(
+            page,
+            _history_url(cfg),
+            label="Blank tab — opening Shipping History",
+        )
     if "ship/history" in (page.url or "").lower():
         _log("Already on Shipping History.")
         return page
@@ -325,9 +334,11 @@ def run_ups_void_shipments(
             p, cfg, headless=headless, slow_mo=slow_mo
         )
         try:
+            page = bootstrap_ups_page(page, cfg)
             page = _ups_login(
                 page, cfg, creds, manual=manual_login, launch_source=launch_source
             )
+            page = _ensure_ups_tab(page, cfg)
             page = _open_shipping_history(page, cfg)
             _filter_history_by_date(page, cfg, target_date)
             _set_results_per_page(page, cfg, 50)
