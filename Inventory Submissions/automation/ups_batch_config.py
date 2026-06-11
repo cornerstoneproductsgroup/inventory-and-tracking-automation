@@ -1,4 +1,4 @@
-"""Paths and settings for UPS.com batch file shipping (Home Depot lane)."""
+"""Paths and settings for UPS.com batch file shipping (Depot, Special Order, Tractor)."""
 
 from __future__ import annotations
 
@@ -18,15 +18,26 @@ _PACKING_SLIPS = _p(
     r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips",
 )
 
+_CSV_OUTPUT_ROOT = (
+    _PACKING_SLIPS
+    / "1-Orders Before Extraction"
+    / "Order Splitter Output"
+    / "CSV File Output"
+)
+
 DEPOT_CSV_OUTPUT_DIR = _p(
     "UPS_DEPOT_CSV_DIR",
-    str(
-        _PACKING_SLIPS
-        / "1-Orders Before Extraction"
-        / "Order Splitter Output"
-        / "CSV File Output"
-        / "Depot"
-    ),
+    str(_CSV_OUTPUT_ROOT / "Depot"),
+)
+
+THDSO_CSV_OUTPUT_DIR = _p(
+    "UPS_THDSO_CSV_DIR",
+    str(_CSV_OUTPUT_ROOT / "Depot Special Order"),
+)
+
+TRACTOR_CSV_OUTPUT_DIR = _p(
+    "UPS_TRACTOR_CSV_DIR",
+    str(_CSV_OUTPUT_ROOT / "Tractor Supply"),
 )
 
 DEPOT_LABELS_MAIN_DIR = _p(
@@ -38,6 +49,58 @@ DEPOT_LABELS_MAIN_DIR = _p(
         / "1 - Main File For The Day"
     ),
 )
+
+THDSO_LABELS_MAIN_DIR = _p(
+    "UPS_THDSO_LABELS_MAIN_DIR",
+    str(
+        _PACKING_SLIPS
+        / "12-Depot Special Orders"
+        / "1 - UPS Shipping Labels"
+        / "1 - Main File For The Day"
+    ),
+)
+
+TRACTOR_LABELS_MAIN_DIR = _p(
+    "UPS_TRACTOR_LABELS_MAIN_DIR",
+    str(
+        _PACKING_SLIPS
+        / "6-Tractor Supply"
+        / "1 - UPS Shipping Labels"
+        / "1 - Main File For The Day"
+    ),
+)
+
+UPS_BATCH_LANE_ORDER: tuple[str, ...] = ("depot", "thdso", "tractor")
+
+_LANE_CSV_DIRS: dict[str, Path] = {
+    "depot": DEPOT_CSV_OUTPUT_DIR,
+    "thdso": THDSO_CSV_OUTPUT_DIR,
+    "tractor": TRACTOR_CSV_OUTPUT_DIR,
+}
+
+_LANE_LABELS_DIRS: dict[str, Path] = {
+    "depot": DEPOT_LABELS_MAIN_DIR,
+    "thdso": THDSO_LABELS_MAIN_DIR,
+    "tractor": TRACTOR_LABELS_MAIN_DIR,
+}
+
+_LANE_FILE_LABELS: dict[str, str] = {
+    "depot": "Depot",
+    "thdso": "Depot Special Order",
+    "tractor": "Tractor Supply",
+}
+
+_LANE_LABELS_PDF_PREFIX: dict[str, str] = {
+    "depot": "Home Depot",
+    "thdso": "Depot Special Order",
+    "tractor": "Tractor Supply",
+}
+
+_LANE_CSV_PATH_ENV: dict[str, str] = {
+    "depot": "UPS_DEPOT_CSV_PATH",
+    "thdso": "UPS_THDSO_CSV_PATH",
+    "tractor": "UPS_TRACTOR_CSV_PATH",
+}
 
 _INVENTORY_ROOT = Path(__file__).resolve().parent.parent
 
@@ -288,24 +351,68 @@ def resolve_browser_user_data_dir(browser_cfg: dict | None = None) -> Path | Non
     return dedicated_ups_profile_dir(browser_cfg)
 
 
-def depot_output_basename(order_date: date | None = None) -> str:
+def normalize_ups_lane(lane: str | None) -> str:
+    raw = (lane or "depot").strip().lower()
+    if raw in ("thdso", "depot_special", "depot_special_order", "special_order"):
+        return "thdso"
+    if raw in ("tractor", "tsc", "tractor_supply"):
+        return "tractor"
+    if raw in ("depot", "home_depot", "homedepot"):
+        return "depot"
+    raise ValueError(f"Unknown UPS batch lane: {lane!r} (use depot, thdso, or tractor)")
+
+
+def lane_file_label(lane: str) -> str:
+    return _LANE_FILE_LABELS[normalize_ups_lane(lane)]
+
+
+def lane_csv_dir(lane: str) -> Path:
+    return _LANE_CSV_DIRS[normalize_ups_lane(lane)]
+
+
+def lane_labels_dir(lane: str) -> Path:
+    return _LANE_LABELS_DIRS[normalize_ups_lane(lane)]
+
+
+def lane_csv_path_env_key(lane: str) -> str:
+    return _LANE_CSV_PATH_ENV[normalize_ups_lane(lane)]
+
+
+def lane_output_basename(lane: str, order_date: date | None = None) -> str:
     """e.g. Depot 6-10-2026 Output.csv"""
     d = order_date or date.today()
-    return f"Depot {date_stamp(d)} Output.csv"
+    return f"{lane_file_label(lane)} {date_stamp(d)} Output.csv"
+
+
+def lane_output_path(lane: str, order_date: date | None = None) -> Path:
+    return lane_csv_dir(lane) / lane_output_basename(lane, order_date)
+
+
+def lane_labels_pdf_name(lane: str, order_date: date | None = None) -> str:
+    """e.g. Home Depot 6-10-2026 Labels.pdf"""
+    d = order_date or date.today()
+    prefix = _LANE_LABELS_PDF_PREFIX[normalize_ups_lane(lane)]
+    return f"{prefix} {date_stamp(d)} Labels.pdf"
+
+
+def lane_labels_pdf_path(lane: str, order_date: date | None = None) -> Path:
+    return lane_labels_dir(lane) / lane_labels_pdf_name(lane, order_date)
+
+
+def depot_output_basename(order_date: date | None = None) -> str:
+    return lane_output_basename("depot", order_date)
 
 
 def depot_output_path(order_date: date | None = None) -> Path:
-    return DEPOT_CSV_OUTPUT_DIR / depot_output_basename(order_date)
+    return lane_output_path("depot", order_date)
 
 
 def depot_labels_pdf_name(order_date: date | None = None) -> str:
-    """e.g. Home Depot 6-10-2026 Labels.pdf"""
-    d = order_date or date.today()
-    return f"Home Depot {date_stamp(d)} Labels.pdf"
+    return lane_labels_pdf_name("depot", order_date)
 
 
 def depot_labels_pdf_path(order_date: date | None = None) -> Path:
-    return DEPOT_LABELS_MAIN_DIR / depot_labels_pdf_name(order_date)
+    return lane_labels_pdf_path("depot", order_date)
 
 
 def label_save_timeout_s() -> float:

@@ -26,7 +26,7 @@ Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
 Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
-Use --ups-online-batch-only to run only UPS.com batch file shipping (Home Depot CSV + labels).
+Use --ups-online-batch-only to run only UPS.com batch file shipping (Depot / Special Order / Tractor).
 Use --vendor-emails-only to run only Outlook vendor emails from z- Daily Vendor Orders.
 Use --amazon-seller-download-only to download Amazon Deferred Transaction CSV to the Input share.
 
@@ -623,8 +623,17 @@ def main() -> int:
         "--ups-online-batch-only",
         action="store_true",
         help=(
-            "Run only UPS.com batch file shipping for Home Depot "
+            "Run only UPS.com batch file shipping "
             "(login → upload CSV → process → save labels). Not part of All Steps."
+        ),
+    )
+    parser.add_argument(
+        "--ups-online-batch-lane",
+        choices=("depot", "thdso", "tractor", "all"),
+        default="depot",
+        help=(
+            "With --ups-online-batch-only: depot, thdso (Depot Special Order), "
+            "tractor (Tractor Supply), or all (default: depot)."
         ),
     )
     parser.add_argument(
@@ -940,15 +949,24 @@ def main() -> int:
                 "Update/pull Inventory Submissions and retry."
             )
             return 1
+        lane = args.ups_online_batch_lane
+        lane_titles = {
+            "depot": "Home Depot",
+            "thdso": "Depot Special Order",
+            "tractor": "Tractor Supply",
+            "all": "All lanes (Depot, Special Order, Tractor)",
+        }
+        lane_title = lane_titles.get(lane, lane)
         print(
             "\n"
             + "=" * 60
-            + "\nUPS.com Batch Shipping — Home Depot\n"
+            + f"\nUPS.com Batch Shipping — {lane_title}\n"
             + "=" * 60
         )
+        ups_cmd = [python_exe, str(ups_script), "--lane", lane]
         errors = _run_single(
-            "UPS Online Batch (Home Depot)",
-            [python_exe, str(ups_script)],
+            f"UPS Online Batch ({lane_title})",
+            ups_cmd,
             INVENTORY_DIR,
         )
         if errors:

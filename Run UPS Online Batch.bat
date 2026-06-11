@@ -13,7 +13,7 @@ for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss
 set "LOG=logs\ups_batch_%STAMP%.log"
 
 echo.
-echo === UPS.com Batch Shipping — Home Depot ===
+echo === UPS.com Batch Shipping ^(default: Home Depot; use --lane thdso^|tractor^|all^) ===
 echo Log: %LOG%
 echo.
 

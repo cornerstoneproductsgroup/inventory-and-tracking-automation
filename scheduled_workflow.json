@@ -61,7 +61,7 @@
   "_future_steps_examples": [
     {
       "id": "ups_online_batch",
-      "label": "UPS Online Batch — Home Depot CSV upload + labels",
+      "label": "UPS Online Batch — Depot / Special Order / Tractor CSV upload + labels",
       "enabled": false,
       "continue_on_error": true,
       "type": "workflow",

@@ -1,4 +1,4 @@
-"""UPS.com batch file shipping — Home Depot lane (up to 250 shipments)."""
+"""UPS.com batch file shipping — Depot, Special Order, and Tractor lanes."""
 
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ from automation.ups_batch_config import (
     dedicated_ups_profile_dir,
     depot_labels_pdf_path,
     label_save_timeout_s,
+    lane_labels_pdf_path,
+    normalize_ups_lane,
     resolve_browser_user_data_dir,
     system_browser_user_data_dir,
     system_chrome_user_data_dir,
@@ -50,7 +52,7 @@ from automation.ups_chrome_launch import (
     wait_for_cdp_endpoint,
 )
 from automation.ups_popup_dismiss import clear_blocking_overlays, dismiss_ups_startup_popups
-from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
+from automation.ups_lane_csv import UpsCsvSkip, resolve_upload_csv
 from automation.windows_open_file import fill_open_file_dialog
 from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
 
@@ -474,6 +476,89 @@ def _fill_field(page: Page, selector: str, value: str, *, label: str) -> None:
     raise UpsBatchError(f"Could not fill {label}")
 
 
+def _clear_field(page: Page, selector: str, *, label: str) -> None:
+    for sel in [s.strip() for s in selector.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=12_000)
+            loc.click(timeout=5000)
+            loc.fill("")
+            _log(f"Cleared {label}.")
+            return
+        except Exception:
+            continue
+    raise UpsBatchError(f"Could not clear {label}")
+
+
+def _batch_lane_key(cfg: dict[str, Any]) -> str:
+    raw = (os.environ.get("UPS_BATCH_LANE") or cfg.get("lane") or "depot").strip().lower()
+    if raw in ("thdso", "depot_special", "depot_special_order", "special_order"):
+        return "thdso"
+    if raw in ("tractor", "tsc", "tractor_supply"):
+        return "tractor"
+    return "depot"
+
+
+def _resolve_lane_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Ship-from + payment for the active lane (depot, thdso, tractor)."""
+    lane = _batch_lane_key(cfg)
+    lanes = cfg.get("lanes") if isinstance(cfg.get("lanes"), dict) else {}
+    lane_cfg = lanes.get(lane) or {}
+
+    ship: dict[str, Any] = dict(cfg.get("ship_from") or {})
+    ship.update(lane_cfg.get("ship_from") or {})
+    pay: dict[str, Any] = dict(cfg.get("payment") or {})
+    pay.update(lane_cfg.get("payment") or {})
+
+    if not str(ship.get("company") or "").strip():
+        ship["company"] = "TractorSupply" if lane == "tractor" else "HomeDepot.com"
+    if not str(ship.get("contact") or "").strip():
+        ship["contact"] = "Cornerstone Products Group"
+    if not str(pay.get("third_party_account") or "").strip():
+        pay["third_party_account"] = "87W6A8" if lane == "tractor" else "1YA668"
+    if not str(pay.get("third_party_zip") or "").strip():
+        pay["third_party_zip"] = "37027" if lane == "tractor" else "30339"
+    pay.setdefault("third_party_country", "United States")
+    pay.setdefault("billing_account_label", "186Y47 - Worldship")
+    return ship, pay
+
+
+def _select_my_default_address(page: Page, cfg: dict[str, Any]) -> None:
+    """Pick saved default origin so UPS exposes third-party billing."""
+    selectors = [
+        s.strip()
+        for s in (
+            _sel(cfg, "my_addresses_dropdown"),
+            "select.ups-dropdown:has(option:text-is('My Default Address'))",
+            "xpath=//*[contains(normalize-space(.),'My Addresses')]/following::select[1]",
+        )
+        if s.strip()
+    ]
+    last_err: Exception | None = None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=12_000)
+            loc.scroll_into_view_if_needed(timeout=3000)
+            loc.select_option(label="My Default Address")
+            _log("Selected My Default Address.")
+            page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+            return
+        except Exception as exc:
+            last_err = exc
+    raise UpsBatchError(f"Could not select My Default Address: {last_err}")
+
+
+def _click_ship_from_edit(page: Page, cfg: dict[str, Any]) -> None:
+    if not _click_any(
+        page,
+        _sel(cfg, "ship_from_edit") or "span:has-text('Edit'), a:has-text('Edit')",
+        label="Ship From Edit",
+    ):
+        raise UpsBatchError("Could not click Edit on Ship From address.")
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
+
+
 def _select_dropdown(page: Page, selector: str, *, value: str | None = None, label_text: str | None = None, field: str) -> None:
     for sel in [s.strip() for s in selector.split(",") if s.strip()]:
         try:
@@ -713,17 +798,30 @@ def _upload_csv(page: Page, cfg: dict[str, Any], csv_path: Path) -> None:
 
 def _fill_ship_from(page: Page, cfg: dict[str, Any]) -> None:
     _log("Step 5/6: Fill Ship From and payment…")
-    ship = cfg.get("ship_from") or {}
-    _fill_field(page, _sel(cfg, "company_name"), str(ship.get("company") or "HomeDepot.com"), label="Company")
-    _fill_field(page, _sel(cfg, "contact_name"), str(ship.get("contact") or "Cornerstone Products Group"), label="Contact")
-    _fill_field(page, _sel(cfg, "address_line1"), str(ship.get("address") or "1106 E Turner Rd"), label="Address")
-    _fill_field(page, _sel(cfg, "city"), str(ship.get("city") or "Lodi"), label="City")
-    _select_dropdown(page, _sel(cfg, "state"), value=str(ship.get("state") or "CA"), field="State")
-    _fill_field(page, _sel(cfg, "zip"), str(ship.get("zip") or "95240"), label="ZIP")
+    ship, _ = _resolve_lane_settings(cfg)
+    lane = _batch_lane_key(cfg)
+    _log(f"Ship From lane: {lane} — company {ship.get('company')!r}")
+
+    _select_my_default_address(page, cfg)
+    _click_ship_from_edit(page, cfg)
+
+    _fill_field(
+        page,
+        _sel(cfg, "company_name"),
+        str(ship.get("company") or "HomeDepot.com"),
+        label="Company",
+    )
+    _fill_field(
+        page,
+        _sel(cfg, "contact_name"),
+        str(ship.get("contact") or "Cornerstone Products Group"),
+        label="Contact",
+    )
+    _clear_field(page, _sel(cfg, "email") or "#origin-cac_email", label="Email")
 
 
 def _fill_payment(page: Page, cfg: dict[str, Any]) -> None:
-    pay = cfg.get("payment") or {}
+    _, pay = _resolve_lane_settings(cfg)
     if not _click_any(page, _sel(cfg, "bill_other_account"), label="Bill Other Account"):
         raise UpsBatchError("Could not select Bill Other Account")
     page.wait_for_timeout(500)
@@ -814,8 +912,9 @@ def _save_labels_pdf(labels_page: Page, dest: Path) -> None:
     raise UpsBatchError(f"Could not save label PDF to {dest}")
 
 
-def run_ups_depot_batch(
+def run_ups_batch(
     *,
+    lane: str = "depot",
     config_path: Path,
     csv_path: Path | None = None,
     order_date: date | None = None,
@@ -823,7 +922,10 @@ def run_ups_depot_batch(
     skip_upload: bool = False,
     headless: bool | None = None,
 ) -> UpsBatchResult:
+    lane_key = normalize_ups_lane(lane)
     cfg = _load_config(config_path)
+    cfg = dict(cfg)
+    cfg["lane"] = lane_key
     browser_cfg = cfg.get("browser", {})
     mode = ups_browser_mode(browser_cfg)
     creds_optional = mode != "dedicated" and _env_bool(
@@ -837,8 +939,13 @@ def run_ups_depot_batch(
     if headless is None:
         headless = bool(browser_cfg.get("headless", False))
 
-    upload_csv = resolve_upload_csv(order_date=order_date, explicit_path=csv_path) if not skip_upload else None
-    labels_dest = depot_labels_pdf_path(order_date)
+    _log(f"Lane: {lane_key}")
+    upload_csv = (
+        resolve_upload_csv(lane=lane_key, order_date=order_date, explicit_path=csv_path)
+        if not skip_upload
+        else None
+    )
+    labels_dest = lane_labels_pdf_path(lane_key, order_date)
 
     leave_browser_open = False
     with sync_playwright() as p:
@@ -878,6 +985,27 @@ def run_ups_depot_batch(
         csv_path=upload_csv or Path(""),
         labels_path=labels_dest,
         shipment_count=None,
+    )
+
+
+def run_ups_depot_batch(
+    *,
+    config_path: Path,
+    csv_path: Path | None = None,
+    order_date: date | None = None,
+    manual_login: bool = False,
+    skip_upload: bool = False,
+    headless: bool | None = None,
+) -> UpsBatchResult:
+    """Backward-compatible entry point for the Home Depot lane."""
+    return run_ups_batch(
+        lane="depot",
+        config_path=config_path,
+        csv_path=csv_path,
+        order_date=order_date,
+        manual_login=manual_login,
+        skip_upload=skip_upload,
+        headless=headless,
     )
 
 

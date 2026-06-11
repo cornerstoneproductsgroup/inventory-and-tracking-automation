@@ -1,4 +1,4 @@
-"""CLI: UPS.com batch file shipping — Home Depot CSV upload, process, save labels."""
+"""CLI: UPS.com batch file shipping — upload CSV, process batch, save labels."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,8 @@ _HERE = Path(__file__).resolve().parent
 _DEFAULT_CONFIG = _HERE / "ups_batch.json"
 if not _DEFAULT_CONFIG.is_file():
     _DEFAULT_CONFIG = _HERE / "ups_batch.example.json"
+
+_LANE_HELP = "depot (Home Depot), thdso (Depot Special Order), tractor (Tractor Supply), or all"
 
 
 def _parse_date(raw: str) -> date:
@@ -24,10 +26,60 @@ def _parse_date(raw: str) -> date:
     raise ValueError(f"Invalid date {raw!r}; use YYYY-MM-DD or MM/DD/YYYY.")
 
 
+def _run_lane(
+    *,
+    lane: str,
+    args: argparse.Namespace,
+    order_date: date | None,
+) -> int:
+    from automation.ups_lane_csv import UpsCsvSkip, resolve_upload_csv
+    from automation.ups_online_batch_shipping import UpsBatchError, run_ups_batch
+
+    if not args.skip_upload:
+        try:
+            csv_path = resolve_upload_csv(
+                lane=lane,
+                order_date=order_date,
+                explicit_path=args.csv,
+            )
+            print(f"[ups] [{lane}] CSV: {csv_path}", flush=True)
+        except UpsCsvSkip as exc:
+            print(
+                f"[ups] [{lane}] SKIP: no CSV for today (newest: {exc.top_filename})",
+                flush=True,
+            )
+            return 0
+        except FileNotFoundError as exc:
+            print(f"[ups] [{lane}] ERROR: {exc}", flush=True)
+            return 1
+
+    try:
+        result = run_ups_batch(
+            lane=lane,
+            config_path=args.config,
+            csv_path=args.csv,
+            order_date=order_date,
+            manual_login=args.manual_login,
+            skip_upload=args.skip_upload,
+        )
+    except UpsBatchError as exc:
+        print(f"[ups] [{lane}] ERROR: {exc}", flush=True)
+        return 1
+    except Exception as exc:
+        import traceback
+
+        print(f"[ups] [{lane}] ERROR: {exc}", flush=True)
+        traceback.print_exc()
+        return 1
+
+    print(f"[ups] [{lane}] Done — labels saved to {result.labels_path}", flush=True)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "UPS.com batch shipping (Home Depot): log in, upload today's Depot CSV, "
+            "UPS.com batch shipping: log in, upload today's Order Splitter CSV, "
             "fill ship-from/payment, process batch, save label PDF."
         )
     )
@@ -38,10 +90,16 @@ def main() -> int:
         help=f"UPS UI config JSON (default: {_DEFAULT_CONFIG.name})",
     )
     parser.add_argument(
+        "--lane",
+        choices=("depot", "thdso", "tractor", "all"),
+        default="depot",
+        help=f"Retailer lane to run ({_LANE_HELP}). Default: depot.",
+    )
+    parser.add_argument(
         "--csv",
         type=Path,
         default=None,
-        help="Depot CSV to upload (default: today's Order Splitter file).",
+        help="CSV to upload (default: today's Order Splitter file for the lane).",
     )
     parser.add_argument("--date", metavar="DATE", default=None, help="Order date for default CSV name.")
     parser.add_argument(
@@ -102,43 +160,16 @@ def main() -> int:
 
     order_date = _parse_date(args.date) if args.date else None
 
-    from automation.ups_depot_csv import DepotCsvSkip, resolve_upload_csv
-    from automation.ups_online_batch_shipping import UpsBatchError, run_ups_depot_batch
+    if args.lane == "all":
+        from automation.ups_batch_config import UPS_BATCH_LANE_ORDER
 
-    if not args.skip_upload:
-        try:
-            csv_path = resolve_upload_csv(order_date=order_date, explicit_path=args.csv)
-            print(f"[ups] CSV: {csv_path}", flush=True)
-        except DepotCsvSkip as exc:
-            print(f"[ups] SKIP: no Depot CSV for today (newest: {exc.top_filename})", flush=True)
-            return 0
-        except FileNotFoundError as exc:
-            print(f"[ups] ERROR: {exc}", flush=True)
-            return 1
+        exit_code = 0
+        for lane in UPS_BATCH_LANE_ORDER:
+            print(f"\n[ups] === Lane: {lane} ===", flush=True)
+            exit_code = max(exit_code, _run_lane(lane=lane, args=args, order_date=order_date))
+        return exit_code
 
-    try:
-        result = run_ups_depot_batch(
-            config_path=args.config,
-            csv_path=args.csv,
-            order_date=order_date,
-            manual_login=args.manual_login,
-            skip_upload=args.skip_upload,
-        )
-    except UpsBatchError as exc:
-        print(f"[ups] ERROR: {exc}", flush=True)
-        return 1
-    except Exception as exc:
-        import traceback
-
-        print(f"[ups] ERROR: {exc}", flush=True)
-        traceback.print_exc()
-        return 1
-
-    print(
-        f"[ups] Done — labels saved to {result.labels_path}",
-        flush=True,
-    )
-    return 0
+    return _run_lane(lane=args.lane, args=args, order_date=order_date)
 
 
 if __name__ == "__main__":

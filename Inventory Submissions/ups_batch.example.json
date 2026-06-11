@@ -15,13 +15,45 @@
     "username": "${UPS_USERNAME}",
     "password": "${UPS_PASSWORD}"
   },
+  "lane": "depot",
+  "lanes": {
+    "depot": {
+      "ship_from": {
+        "company": "HomeDepot.com",
+        "contact": "Cornerstone Products Group"
+      },
+      "payment": {
+        "third_party_account": "1YA668",
+        "third_party_zip": "30339",
+        "third_party_country": "United States"
+      }
+    },
+    "thdso": {
+      "ship_from": {
+        "company": "HomeDepot.com",
+        "contact": "Cornerstone Products Group"
+      },
+      "payment": {
+        "third_party_account": "1YA668",
+        "third_party_zip": "30339",
+        "third_party_country": "United States"
+      }
+    },
+    "tractor": {
+      "ship_from": {
+        "company": "TractorSupply",
+        "contact": "Cornerstone Products Group"
+      },
+      "payment": {
+        "third_party_account": "87W6A8",
+        "third_party_zip": "37027",
+        "third_party_country": "United States"
+      }
+    }
+  },
   "ship_from": {
     "company": "HomeDepot.com",
-    "contact": "Cornerstone Products Group",
-    "address": "1106 E Turner Rd",
-    "city": "Lodi",
-    "state": "CA",
-    "zip": "95240"
+    "contact": "Cornerstone Products Group"
   },
   "payment": {
     "third_party_account": "1YA668",
@@ -41,8 +73,11 @@
     "ship_now": "a:has-text('Ship Now'), button:has-text('Ship Now')",
     "browse_file": "#uploadFileButton, button:has-text('Browse for File')",
     "file_input": "input[type='file']",
+    "my_addresses_dropdown": "select.ups-dropdown:has(option:text-is('My Default Address'))",
+    "ship_from_edit": "span:has-text('Edit'), a:has-text('Edit')",
     "company_name": "#origin-cac_companyOrName",
     "contact_name": "#origin-cac_contactName",
+    "email": "#origin-cac_email",
     "address_line1": "#origin-cac_addressLine1",
     "city": "#origin-cac_city",
     "state": "#origin-cac_state",

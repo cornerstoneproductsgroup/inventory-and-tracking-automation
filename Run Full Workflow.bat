@@ -15,7 +15,7 @@ echo ============================================================
 echo   Full Workflow — main menu
 echo ============================================================
 echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
-echo   W  UPS Online Batch ^(Home Depot CSV upload + labels^)
+echo   W  UPS Online Batch ^(Depot / Special Order / Tractor^)
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
@@ -47,7 +47,43 @@ set "EXTRA_ARGS=--fedex-batch-only"
 goto RUN
 
 :OPT_W
-set "EXTRA_ARGS=--ups-online-batch-only"
+goto SUBMENU_UPS
+
+:SUBMENU_UPS
+cls
+echo.
+echo ============================================================
+echo   UPS Online Batch
+echo ============================================================
+echo   1  Home Depot
+echo   2  Depot Special Order
+echo   3  Tractor Supply
+echo   4  All three ^(Depot, Special Order, Tractor^)
+echo   0  Back to main menu
+echo.
+choice /C 01234 /N /M "Press 0-4: "
+REM 0=1 1=2 2=3 3=4 4=5
+if errorlevel 5 goto UPS_ALL
+if errorlevel 4 goto UPS_TRACTOR
+if errorlevel 3 goto UPS_THDSO
+if errorlevel 2 goto UPS_DEPOT
+if errorlevel 1 goto MAIN_MENU
+goto SUBMENU_UPS
+
+:UPS_DEPOT
+set "EXTRA_ARGS=--ups-online-batch-only --ups-online-batch-lane depot"
+goto RUN
+
+:UPS_THDSO
+set "EXTRA_ARGS=--ups-online-batch-only --ups-online-batch-lane thdso"
+goto RUN
+
+:UPS_TRACTOR
+set "EXTRA_ARGS=--ups-online-batch-only --ups-online-batch-lane tractor"
+goto RUN
+
+:UPS_ALL
+set "EXTRA_ARGS=--ups-online-batch-only --ups-online-batch-lane all"
 goto RUN
 
 :OPT_O
