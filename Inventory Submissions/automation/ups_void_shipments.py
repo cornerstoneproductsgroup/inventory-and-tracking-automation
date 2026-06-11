@@ -130,26 +130,36 @@ def _open_shipping_history(page: Page, cfg: dict[str, Any]) -> Page:
     return page
 
 
-def _pick_date_in_calendar(page: Page, ship_date: date) -> None:
-    if ship_date == date.today():
-        today = page.locator(
-            ".ups-official_datepicker_today, button.ups-official_datepicker_today"
-        ).first
-        today.wait_for(state="visible", timeout=12_000)
-        today.click()
-        return
+def _format_ups_history_date(ship_date: date) -> str:
+    """UPS custom date range text field format: M/D/YYYY (e.g. 6/11/2026)."""
+    return f"{ship_date.month}/{ship_date.day}/{ship_date.year}"
 
-    day_btn = page.locator(
-        "button.ups-official_datepicker_date_chooser_btn"
-    ).filter(has_text=str(ship_date.day))
-    if day_btn.count() > 0:
-        day_btn.first.click()
-        return
-    raise UpsBatchError(f"Could not pick calendar day for {ship_date.isoformat()}.")
+
+def _fill_custom_history_date(
+    page: Page, cfg: dict[str, Any], ship_date: date, *, field_key: str, default_sel: str, label: str
+) -> None:
+    selector = _sel(cfg, field_key) or default_sel
+    text = _format_ups_history_date(ship_date)
+    for sel in [s.strip() for s in selector.split(",") if s.strip()]:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=12_000)
+            loc.click(timeout=5000)
+            loc.press("Control+a")
+            page.wait_for_timeout(150)
+            loc.fill(text)
+            _log(f"Filled {label}: {text!r}")
+            return
+        except Exception:
+            continue
+    raise UpsBatchError(f"Could not fill {label} ({selector!r}).")
 
 
 def _filter_history_by_date(page: Page, cfg: dict[str, Any], ship_date: date) -> None:
-    _log(f"Filtering Shipping History to {ship_date.month}/{ship_date.day}/{ship_date.year}…")
+    _log(
+        f"Filtering Shipping History to "
+        f"{_format_ups_history_date(ship_date)}..."
+    )
     if not _click_any(
         page,
         _sel(cfg, "date_range_modify") or "#dateRangeModify",
@@ -166,13 +176,28 @@ def _filter_history_by_date(page: Page, cfg: dict[str, Any], ship_date: date) ->
     )
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
 
-    calendar_sel = (
-        _sel(cfg, "calendar_start")
-        or ".ups-icon-calendar, span.icon.ups-icon-calendar"
+    _fill_custom_history_date(
+        page,
+        cfg,
+        ship_date,
+        field_key="custom_start_date",
+        default_sel="#nwsCustomStartDatePicker",
+        label="Start Date",
     )
-    page.locator(calendar_sel).first.click()
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
-    _pick_date_in_calendar(page, ship_date)
+    end_sel = (_sel(cfg, "custom_end_date") or "#nwsCustomEndDatePicker").strip()
+    if end_sel:
+        try:
+            if page.locator(end_sel.split(",")[0].strip()).first.is_visible(timeout=1500):
+                _fill_custom_history_date(
+                    page,
+                    cfg,
+                    ship_date,
+                    field_key="custom_end_date",
+                    default_sel="#nwsCustomEndDatePicker",
+                    label="End Date",
+                )
+        except Exception:
+            pass
 
     if not _click_any(
         page,
