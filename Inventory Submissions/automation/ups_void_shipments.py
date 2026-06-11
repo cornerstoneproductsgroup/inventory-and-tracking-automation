@@ -101,7 +101,7 @@ def _open_shipping_history(page: Page, cfg: dict[str, Any]) -> Page:
     opened = False
     if _open_shipping_history_via_shipping_menu(page, cfg):
         opened = True
-        _log("Opened Shipping History via Shipping → View Shipping History.")
+        _log("Opened Shipping History via Shipping -> View Shipping History.")
     elif _open_shipping_history_via_profile_menu(page, cfg):
         opened = True
         _log("Opened Shipping History via user profile menu.")

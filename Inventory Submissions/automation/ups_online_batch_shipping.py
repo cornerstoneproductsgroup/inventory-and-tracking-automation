@@ -60,7 +60,14 @@ from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dia
 
 
 def _log(msg: str) -> None:
-    print(f"[ups] {msg}", flush=True)
+    text = f"[ups] {msg}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        import sys
+
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, errors="replace").decode(enc), flush=True)
 
 
 class UpsBatchError(Exception):
