@@ -14,12 +14,9 @@ from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError, syn
 from automation.config import load_sps_settings
 
 
-UPS_TRACKING_CSV_DEFAULT = Path(
-    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction"
-    r"\Order Splitter Output\z - UPS Tracking\UPS_CSV_EXPORT.csv"
-)
-_env_ups_csv = (os.environ.get("UPS_TRACKING_CSV_PATH") or "").strip()
-CSV_PATH = Path(_env_ups_csv) if _env_ups_csv else UPS_TRACKING_CSV_DEFAULT
+from automation.ups_tracking_csv import resolve_ups_tracking_csv_path
+
+CSV_PATH = resolve_ups_tracking_csv_path()
 DASHBOARD_URL = "https://commerce.spscommerce.com/fulfillment/dashboard/"
 TRANSACTIONS_LIST_URL = "https://commerce.spscommerce.com/fulfillment/transactions/list/"
 _HERE = Path(__file__).resolve().parent
@@ -49,30 +46,17 @@ def normalize_po(value: str) -> str:
 
 
 def load_tracking_map(csv_path: Path) -> dict[str, str]:
+    """PO (column A) and tracking (column B) from WorldShip UPS_CSV_EXPORT."""
+    from automation.ups_tracking_csv import iter_po_tracking_rows
+
     if not csv_path.is_file():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    rows: list[list[str]] | None = None
-    for enc in ("utf-8-sig", "latin1"):
-        try:
-            with csv_path.open("r", newline="", encoding=enc) as f:
-                rows = list(csv.reader(f))
-            break
-        except UnicodeDecodeError:
-            continue
-
-    if not rows:
-        return {}
-
     out: dict[str, str] = {}
-    for row in rows:
-        if len(row) < 2:
-            continue
-        po = normalize_po(row[0])
-        tracking = (row[1] or "").strip().split()[0]
-        if not po or not tracking:
-            continue
-        out[po] = tracking  # last row wins for duplicate POs in the sheet
+    for po_raw, tracking in iter_po_tracking_rows(csv_path):
+        po = normalize_po(po_raw)
+        if po and tracking:
+            out[po] = tracking  # last row wins for duplicate POs
     return out
 
 

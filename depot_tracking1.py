@@ -1,8 +1,11 @@
 
+import os
 import re
+import sys
 import time
 import csv
-import os
+from pathlib import Path
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -12,11 +15,16 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-UPS_TRACKING_CSV_DEFAULT = (
-    r"\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction"
-    r"\Order Splitter Output\z - UPS Tracking\UPS_CSV_EXPORT.csv"
+_INV = Path(__file__).resolve().parent / "Inventory Submissions"
+if _INV.is_dir() and str(_INV) not in sys.path:
+    sys.path.insert(0, str(_INV))
+
+from automation.ups_tracking_csv import (  # noqa: E402
+    iter_po_tracking_rows,
+    resolve_ups_tracking_csv_path,
 )
-TRACKING_CSV = (os.environ.get("UPS_TRACKING_CSV_PATH") or "").strip() or UPS_TRACKING_CSV_DEFAULT
+
+TRACKING_CSV = str(resolve_ups_tracking_csv_path())
 ORDER_URL = "https://dsm.commercehub.com/dsm/gotoOrderRealmForm.do?action=web_quickship&tabContext=web_quickship&status=open&substatus=no-activity&merchant=thehomedepot"
 EMAIL = "rfetzer@cornerstoneproductsgroup.com"
 PASSWORD = "Lowesdepotdepotso1106!"
@@ -142,61 +150,15 @@ def _pick_tracking_field(fieldnames, po_field):
 
 
 def load_tracking_csv(path):
+    """PO (column A) and tracking (column B) from WorldShip UPS_CSV_EXPORT."""
     tracking_dict = {}
     if not os.path.exists(path):
         return tracking_dict
-    rows = None
-    for enc in ("utf-8-sig", "latin1"):
-        try:
-            with open(path, mode="r", newline="", encoding=enc) as file:
-                reader = csv.reader(file)
-                rows = list(reader)
-            break
-        except UnicodeDecodeError:
-            continue
-    if not rows:
-        return tracking_dict
-
-    header = [c.strip() for c in rows[0]]
-    non_empty = sum(1 for c in header if c)
-    if any(_looks_like_ups_tracking(c) for c in header):
-        looks_like_header = False
-    else:
-        joined = " ".join(header).lower()
-        looks_like_header = non_empty >= 2 and any(
-            kw in joined
-            for kw in (
-                "tracking",
-                "track #",
-                "po#",
-                "purchase order",
-                "reference",
-                "ship to",
-            )
-        )
-
-    if looks_like_header:
-        po_field = _pick_po_field(header)
-        track_field = _pick_tracking_field(header, po_field)
-        po_i = header.index(po_field) if po_field in header else 0
-        track_i = header.index(track_field) if track_field and track_field in header else 1
-        data_rows = rows[1:]
-    else:
-        po_i, track_i = 0, 1
-        data_rows = rows
-
-    for row in data_rows:
-        if len(row) <= max(po_i, track_i):
-            continue
-        po_raw = row[po_i].strip()
-        track_raw = row[track_i].strip()
-        if not po_raw or not track_raw:
-            continue
+    for po_raw, track_raw in iter_po_tracking_rows(path):
         # Worldship often puts PO# and product text in one field, e.g. "13895885 Coarse 10"
         po_token = po_raw.split()[0]
-        if not po_token:
-            continue
-        register_po_tracking(tracking_dict, po_token, track_raw)
+        if po_token:
+            register_po_tracking(tracking_dict, po_token, track_raw)
     return tracking_dict
 
 
