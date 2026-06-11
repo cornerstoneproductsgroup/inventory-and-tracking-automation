@@ -47,6 +47,47 @@ def overlay_still_blocking(page) -> bool:
         return False
 
 
+def _dismiss_ups_home_teasers(page, log: Callable[[str], None]) -> bool:
+    """Close or hide UPS marketing/app teaser cards that block header Log In."""
+    teaser_close = (
+        ".enhanced-app-teaser-wrapper button[aria-label='Close']",
+        ".teaser-card-1 button[aria-label='Close']",
+        ".enhanced-app-teaser-wrapper .ups-icon-close",
+        ".enhanced-app-teaser-wrapper button.close",
+        "button:has-text('No thanks')",
+        "button:has-text('Not now')",
+        "button:has-text('Maybe later')",
+    )
+    if _try_click(page, list(teaser_close), label="UPS home app teaser", log=log):
+        return True
+    try:
+        hidden = page.evaluate(
+            """() => {
+            let n = 0;
+            const selectors = [
+                '.enhanced-app-teaser-wrapper',
+                '.teaser-card-1',
+                '.teaser-card-1.collapsed',
+            ];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach((el) => {
+                    el.style.setProperty('display', 'none', 'important');
+                    el.style.setProperty('visibility', 'hidden', 'important');
+                    el.style.setProperty('pointer-events', 'none', 'important');
+                    n += 1;
+                });
+            }
+            return n;
+        }"""
+        )
+        if hidden:
+            log(f"Hidden {hidden} UPS home teaser overlay(s) (JS).")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _try_click(page, selectors: list[str], *, label: str, log: Callable[[str], None]) -> bool:
     for sel in selectors:
         try:
@@ -198,6 +239,16 @@ def dismiss_ups_startup_popups(
     dismissed_any = False
     for attempt in range(1, rounds + 1):
         dismissed = False
+
+        if _dismiss_ups_home_teasers(page, emit):
+            dismissed = True
+        elif _try_click(
+            page,
+            _popup_selectors(cfg, "app_teaser_close", ()),
+            label="UPS app teaser (config)",
+            log=emit,
+        ):
+            dismissed = True
 
         if _try_click(page, location_deny, label="location prompt", log=emit):
             dismissed = True

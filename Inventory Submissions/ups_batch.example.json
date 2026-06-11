@@ -11,6 +11,7 @@
   },
   "ups": {
     "home_url": "https://www.ups.com/us/en/home",
+    "login_url": "https://www.ups.com/lasso/login?loc=en_US&returnto=https%3A%2F%2Fwww.ups.com%2Fus%2Fen%2Fhome",
     "batch_landing_url": "https://www.ups.com/us/en/shipping/batch-file-shipping",
     "username": "${UPS_USERNAME}",
     "password": "${UPS_PASSWORD}"
@@ -89,6 +90,7 @@
     "billing_account": "label:has-text('186Y47'), label[for='billMyAccountSection0']",
     "preview_batch": "button:has-text('Preview Batch')",
     "process_all": "#nwsCartProcessAll, button:has-text('Process All')",
+    "app_teaser_close": ".enhanced-app-teaser-wrapper button[aria-label='Close'], .teaser-card-1 button[aria-label='Close'], button:has-text('No thanks'), button:has-text('Not now')",
     "cookie_close": "#onetrust-close-btn-container button, button.onetrust-close-btn-handler, button[aria-label='Close']",
     "cookie_accept": "#onetrust-accept-btn-handler, button:has-text('Accept All Cookies')",
     "cookie_settings_close": "#onetrust-pc-sdk button.onetrust-close-btn-handler, #onetrust-pc-sdk button[aria-label='Close']",

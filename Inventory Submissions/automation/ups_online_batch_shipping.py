@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import time
+from urllib.parse import quote
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -153,6 +154,16 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
 def _ups_home_url(cfg: dict[str, Any]) -> str:
     ups = cfg.get("ups") or {}
     return str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
+
+
+def _ups_login_url(cfg: dict[str, Any]) -> str:
+    ups = cfg.get("ups") or {}
+    explicit = (os.environ.get("UPS_LOGIN_URL") or str(ups.get("login_url") or "")).strip()
+    if explicit:
+        return explicit
+    home = _ups_home_url(cfg)
+    returnto = quote(home, safe="")
+    return f"https://www.ups.com/lasso/login?loc=en_US&returnto={returnto}"
 
 
 def _pick_ups_page(context: BrowserContext, *, home_url: str) -> Page:
@@ -448,16 +459,19 @@ def _save_session(context: BrowserContext, *, persistent: bool) -> None:
 
 def _click_any(page: Page, selectors: str, *, label: str = "", timeout_ms: int = 15_000) -> bool:
     for sel in [s.strip() for s in selectors.split(",") if s.strip()]:
-        try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=timeout_ms)
-            loc.scroll_into_view_if_needed(timeout=3000)
-            loc.click(timeout=timeout_ms)
-            if label:
-                _log(f"Clicked {label}.")
-            return True
-        except Exception as exc:
-            _log(f"WARN: {label or sel} — {exc}")
+        loc = page.locator(sel).first
+        for force in (False, True):
+            try:
+                loc.wait_for(state="visible", timeout=timeout_ms)
+                loc.scroll_into_view_if_needed(timeout=3000)
+                loc.click(timeout=timeout_ms, force=force)
+                if label:
+                    suffix = " (force)" if force else ""
+                    _log(f"Clicked {label}{suffix}.")
+                return True
+            except Exception as exc:
+                if force:
+                    _log(f"WARN: {label or sel} — {exc}")
     return False
 
 
@@ -575,9 +589,51 @@ def _select_dropdown(page: Page, selector: str, *, value: str | None = None, lab
     raise UpsBatchError(f"Could not select {field}")
 
 
-def _type_login_field(page: Page, selector: str, text: str) -> None:
-    loc = page.locator(selector).first
-    loc.wait_for(state="visible", timeout=20_000)
+def _login_field_selector(cfg: dict[str, Any], key: str, default: str) -> str:
+    return _sel(cfg, key) or default
+
+
+def _find_login_field(page: Page, cfg: dict[str, Any], key: str, *, default: str) -> Any:
+    raw = _login_field_selector(cfg, key, default)
+    selectors = [s.strip() for s in raw.split(",") if s.strip()]
+    contexts = [page, *page.frames]
+    for ctx in contexts:
+        for sel in selectors:
+            try:
+                loc = ctx.locator(sel).first
+                if loc.count() > 0 and loc.is_visible(timeout=600):
+                    return loc
+            except Exception:
+                continue
+    return page.locator(selectors[0]).first
+
+
+def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> None:
+    """Navigate to UPS sign-in (avoids homepage teasers blocking Log In)."""
+    clear_blocking_overlays(page, cfg, log=_log)
+    username_default = "#username, input[name='username'], input[type='email']"
+    try:
+        if _find_login_field(page, cfg, "username_input", default=username_default).is_visible(
+            timeout=1500
+        ):
+            _log("UPS login form already open.")
+            return
+    except Exception:
+        pass
+
+    login_url = _ups_login_url(cfg)
+    _log(f"Opening UPS login page: {login_url}")
+    page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
+    clear_blocking_overlays(page, cfg, log=_log)
+
+    loc = _find_login_field(page, cfg, "username_input", default=username_default)
+    loc.wait_for(state="visible", timeout=30_000)
+
+
+def _type_login_field(page: Page, cfg: dict[str, Any], key: str, text: str, *, default: str) -> None:
+    loc = _find_login_field(page, cfg, key, default=default)
+    loc.wait_for(state="visible", timeout=30_000)
     loc.click()
     loc.fill("")
     loc.press_sequentially(text, delay=40)
@@ -680,13 +736,23 @@ def _ups_login(
 
     _log(f"Step 2/6: Logging into UPS as {creds.username[:3]}…")
 
-    if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
-        raise UpsBatchError("Could not click header Log In")
-    page.wait_for_timeout(600)
-    if not _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In"):
-        _log("WARN: dropdown Log In not found — may already be on login page.")
+    try:
+        _open_ups_login_form(page, cfg)
+    except Exception as exc:
+        _log(f"WARN: direct login page failed ({exc}) — trying header Log In…")
+        clear_blocking_overlays(page, cfg, log=_log)
+        if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
+            raise UpsBatchError("Could not open UPS login (direct URL or header Log In).") from exc
+        page.wait_for_timeout(600)
+        _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In")
 
-    _type_login_field(page, _sel(cfg, "username_input"), creds.username)
+    _type_login_field(
+        page,
+        cfg,
+        "username_input",
+        creds.username,
+        default="#username, input[name='username'], input[type='email']",
+    )
     verify_ms = _timing_ms(cfg, "verify_wait_ms", "UPS_VERIFY_WAIT_MS", 8000)
     try:
         page.locator(_sel(cfg, "verify_success")).first.wait_for(
@@ -701,7 +767,13 @@ def _ups_login(
         raise UpsBatchError("Could not click Continue after username")
 
     page.wait_for_timeout(800)
-    _type_login_field(page, _sel(cfg, "password_input"), creds.password)
+    _type_login_field(
+        page,
+        cfg,
+        "password_input",
+        creds.password,
+        default="#password, input[name='password'], input[type='password']",
+    )
     if not _click_any(page, _sel(cfg, "login_continue"), label="Continue (password)"):
         raise UpsBatchError("Could not click Continue after password")
 
@@ -1036,8 +1108,9 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
             ignore_default_args=["--enable-automation", "--no-sandbox"],
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(home, wait_until="domcontentloaded", timeout=120_000)
-        print("\n>>> Log into UPS in Chrome, then press Enter here to save the session…")
+        page.goto(_ups_login_url(cfg), wait_until="domcontentloaded", timeout=120_000)
+        clear_blocking_overlays(page, cfg, log=_log)
+        print("\n>>> Log into UPS in the browser, then press Enter here to save the session…")
         try:
             input()
         except EOFError:
