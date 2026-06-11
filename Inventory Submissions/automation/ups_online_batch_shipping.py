@@ -229,10 +229,43 @@ def _url_loaded(page: Page, url: str) -> bool:
     return target in current
 
 
+def _pick_ups_driver_page(context: BrowserContext) -> Page:
+    """Prefer an existing UPS tab; otherwise use the first tab."""
+    if not context.pages:
+        return context.new_page()
+    for pg in context.pages:
+        url = _page_url(pg)
+        if _is_ups_tab_url(url) and not _is_blank_tab_url(url):
+            return pg
+    return context.pages[0]
+
+
+def _goto_tab_url(page: Page, url: str, *, label: str = "") -> bool:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    except Exception as exc:
+        _log(f"WARN: page.goto failed: {exc}")
+        return False
+    if _is_blank_tab_url(_page_url(page)):
+        return False
+    if label:
+        _log(f"{label}: {_page_url(page)!r}")
+    return True
+
+
+def _js_navigate_tab(page: Page, url: str) -> bool:
+    try:
+        page.evaluate("(target) => { window.location.assign(target); }", url)
+        page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    except Exception as exc:
+        _log(f"WARN: JS navigate failed: {exc}")
+        return False
+    return not _is_blank_tab_url(_page_url(page))
+
+
 def _paste_url_in_address_bar(page: Page, url: str) -> bool:
     """
-    Paste a URL into the browser address bar (Ctrl+L, select all, paste, Enter).
-    This matches what works manually when the tab is about:blank.
+    Last-resort: paste into the address bar (Ctrl+L) when page.goto does not work.
     """
     page.bring_to_front()
     page.wait_for_timeout(400)
@@ -248,16 +281,16 @@ def _paste_url_in_address_bar(page: Page, url: str) -> bool:
     for focus_key in ("Control+l", "Alt+d", "F6"):
         try:
             page.keyboard.press(focus_key)
-            page.wait_for_timeout(350)
+            page.wait_for_timeout(300)
             page.keyboard.press("Control+a")
-            page.wait_for_timeout(100)
+            page.wait_for_timeout(80)
             page.keyboard.insert_text(url)
-            page.wait_for_timeout(100)
+            page.wait_for_timeout(80)
             page.keyboard.press("Enter")
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=120_000)
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)
             if not _is_blank_tab_url(_page_url(page)):
                 return True
         except Exception:
@@ -266,44 +299,47 @@ def _paste_url_in_address_bar(page: Page, url: str) -> bool:
 
 
 def _load_ups_in_tab(page: Page, url: str) -> Page:
-    """If the tab is about:blank, paste the UPS URL in the address bar and go."""
+    """Load UPS in the current tab — page.goto first, then JS / address-bar fallbacks."""
     current = _page_url(page)
     if not _is_blank_tab_url(current) and _is_ups_tab_url(current):
         return page
 
-    _log(f"Tab URL is {current!r} — pasting UPS link in address bar.")
-    for attempt in range(1, 5):
-        _log(f"Address bar paste attempt {attempt}/4…")
-        if _paste_url_in_address_bar(page, url):
-            _log(f"Loaded: {_page_url(page)!r}")
-            return page
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-        except Exception as exc:
-            _log(f"WARN: page.goto fallback failed: {exc}")
-        if not _is_blank_tab_url(_page_url(page)):
-            _log(f"Loaded via goto: {_page_url(page)!r}")
-            return page
-        page.wait_for_timeout(1000)
+    _log(f"Tab URL is {current!r} — loading {url!r}")
+    page.bring_to_front()
+    page.wait_for_timeout(800)
+
+    loaders: tuple[tuple[str, Any], ...] = (
+        ("page.goto", lambda: _goto_tab_url(page, url)),
+        ("JS navigate", lambda: _js_navigate_tab(page, url)),
+        ("address bar paste", lambda: _paste_url_in_address_bar(page, url)),
+    )
+    for attempt in range(1, 4):
+        _log(f"UPS load attempt {attempt}/3…")
+        for name, load in loaders:
+            try:
+                if load():
+                    _log(f"Loaded via {name}: {_page_url(page)!r}")
+                    return page
+            except Exception as exc:
+                _log(f"WARN: {name} error: {exc}")
+            page.wait_for_timeout(400)
+        page.wait_for_timeout(800)
 
     raise UpsBatchError(
-        f"Still on about:blank after pasting UPS URL ({url!r}). "
-        "Close all browser windows and run again."
+        f"Still on about:blank after loading UPS ({url!r}). "
+        "Close all Edge windows for this profile and run again."
     )
 
 
 def _resolve_ups_driver_page(context: BrowserContext, cfg: dict[str, Any]) -> Page:
-    """
-    Use the first tab. If about:blank, paste the UPS *home* URL (not id.ups.com login —
-    direct login URLs trigger Akamai Access Denied for automation).
-    """
+    """Use the best UPS tab; load home if the driver tab is blank or non-UPS."""
     _log_browser_tabs(context)
     home_url = _ups_home_url(cfg)
-    driver = context.pages[0] if context.pages else context.new_page()
+    driver = _pick_ups_driver_page(context)
     driver.bring_to_front()
 
     current = _page_url(driver).lower()
-    if _is_blank_tab_url(current) or not _is_ups_tab_url(current) or "id.ups.com" in current:
+    if _is_blank_tab_url(current) or not _is_ups_tab_url(current):
         driver = _load_ups_in_tab(driver, home_url)
 
     _close_extra_tabs(context, keep=driver)
@@ -463,7 +499,8 @@ def _open_dedicated_profile_browser(
         accept_downloads=True,
     )
     context.add_init_script(_STEALTH_INIT)
-    page = context.pages[0] if context.pages else context.new_page()
+    page = _pick_ups_driver_page(context)
+    page.wait_for_timeout(600)
     page = bootstrap_ups_page(page, cfg)
     page = _ensure_ups_home_page(page, cfg)
     _log(f"{name} ready (dedicated profile) — {page.url}")
