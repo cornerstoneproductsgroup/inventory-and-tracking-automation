@@ -115,6 +115,9 @@
   "timing": {
     "verify_wait_ms": 8000,
     "after_login_ms": 2000,
+    "login_type_delay_ms": 100,
+    "before_login_continue_ms": 1500,
+    "after_login_continue_ms": 2500,
     "after_upload_ms": 3000,
     "after_process_all_ms": 45000,
     "post_void_browser_wait_s": 120,

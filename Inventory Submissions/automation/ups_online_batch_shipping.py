@@ -69,6 +69,9 @@ class UpsBatchError(Exception):
 
 _STEALTH_INIT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+window.chrome = window.chrome || { runtime: {} };
 """
 
 
@@ -291,16 +294,17 @@ def _load_ups_in_tab(page: Page, url: str) -> Page:
 
 def _resolve_ups_driver_page(context: BrowserContext, cfg: dict[str, Any]) -> Page:
     """
-    Use the first tab. If it is about:blank, paste the UPS login URL in the
-    address bar (same as doing it manually), then close any extra tabs.
+    Use the first tab. If about:blank, paste the UPS *home* URL (not id.ups.com login —
+    direct login URLs trigger Akamai Access Denied for automation).
     """
     _log_browser_tabs(context)
-    login_url = _ups_login_url(cfg)
+    home_url = _ups_home_url(cfg)
     driver = context.pages[0] if context.pages else context.new_page()
     driver.bring_to_front()
 
-    if _is_blank_tab_url(_page_url(driver)) or not _is_ups_tab_url(_page_url(driver)):
-        driver = _load_ups_in_tab(driver, login_url)
+    current = _page_url(driver).lower()
+    if _is_blank_tab_url(current) or not _is_ups_tab_url(current) or "id.ups.com" in current:
+        driver = _load_ups_in_tab(driver, home_url)
 
     _close_extra_tabs(context, keep=driver)
     driver.bring_to_front()
@@ -736,9 +740,34 @@ def _find_login_field(page: Page, cfg: dict[str, Any], key: str, *, default: str
     return page.locator(selectors[0]).first
 
 
-def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> Page:
-    """Navigate to UPS sign-in (avoids homepage teasers blocking Log In)."""
-    page = _ensure_ups_tab(page, cfg)
+def _is_access_denied_page(page: Page) -> bool:
+    try:
+        body = (page.locator("body").inner_text(timeout=4000) or "").lower()
+    except Exception:
+        return False
+    return (
+        "access denied" in body
+        or "errors.edgesuite.net" in body
+        or "don't have permission to access" in body
+    )
+
+
+def _raise_if_access_denied(page: Page, *, step: str) -> None:
+    if not _is_access_denied_page(page):
+        return
+    raise UpsBatchError(
+        f"UPS blocked login at {step} (Access Denied — Akamai bot protection).\n"
+        "Automated username/password login is often blocked.\n"
+        "Recommended fix — one-time manual login saved to the UPS browser profile:\n"
+        "  python run_ups_online_batch.py --setup-login\n"
+        "Log in manually in the browser window, press Enter in the console, then rerun.\n"
+        "Or set UPS_MANUAL_LOGIN=1 in .env for this run."
+    )
+
+
+def _open_ups_login_via_ui(page: Page, cfg: dict[str, Any]) -> Page:
+    """Open sign-in by clicking Log In on ups.com (never paste id.ups.com directly)."""
+    page = _ensure_ups_home_page(page, cfg)
     clear_blocking_overlays(page, cfg, log=_log)
     username_default = "#username, input[name='username'], input[type='email']"
     try:
@@ -750,26 +779,41 @@ def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> Page:
     except Exception:
         pass
 
-    login_url = _ups_login_url(cfg)
-    page = _navigate_current_tab(
-        page,
-        login_url,
-        label="Opening UPS login in this tab",
-    )
+    if "id.ups.com" in _page_url(page).lower():
+        page = _navigate_current_tab(
+            page,
+            _ups_home_url(cfg),
+            label="Leaving id.ups.com — returning to UPS home before login",
+        )
+        clear_blocking_overlays(page, cfg, log=_log)
+
+    if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
+        raise UpsBatchError("Could not click Log In on UPS home page.")
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
+    _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In")
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 600))
     clear_blocking_overlays(page, cfg, log=_log)
 
     loc = _find_login_field(page, cfg, "username_input", default=username_default)
     loc.wait_for(state="visible", timeout=30_000)
+    _raise_if_access_denied(page, step="opening login")
     return page
+
+
+def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> Page:
+    """Backward-compatible alias — always uses the UPS.com Log In button flow."""
+    return _open_ups_login_via_ui(page, cfg)
 
 
 def _type_login_field(page: Page, cfg: dict[str, Any], key: str, text: str, *, default: str) -> None:
     loc = _find_login_field(page, cfg, key, default=default)
     loc.wait_for(state="visible", timeout=30_000)
+    type_delay = _timing_ms(cfg, "login_type_delay_ms", "UPS_LOGIN_TYPE_DELAY_MS", 100)
     loc.click()
-    loc.fill("")
-    loc.press_sequentially(text, delay=40)
+    page.wait_for_timeout(300)
+    loc.press("Control+a")
+    page.wait_for_timeout(150)
+    loc.press_sequentially(text, delay=type_delay)
 
 
 def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
@@ -780,6 +824,8 @@ def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
     except Exception:
         pass
     for sel in (
+        "#user-profile",
+        "button.user-profile-btn",
         "a:has-text('Log Out')",
         "button:has-text('Log Out')",
         "[data-test-id='user-menu']",
@@ -868,18 +914,7 @@ def _ups_login(
         )
 
     _log(f"Step 2/6: Logging into UPS as {creds.username[:3]}…")
-
-    try:
-        page = _open_ups_login_form(page, cfg)
-    except Exception as exc:
-        _log(f"WARN: direct login page failed ({exc}) — trying header Log In…")
-        page = _ensure_ups_tab(page, cfg)
-        clear_blocking_overlays(page, cfg, log=_log)
-        if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
-            raise UpsBatchError("Could not open UPS login (direct URL or header Log In).") from exc
-        page.wait_for_timeout(600)
-        _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In")
-        page = _ensure_ups_tab(page, cfg)
+    page = _open_ups_login_via_ui(page, cfg)
 
     _type_login_field(
         page,
@@ -888,6 +923,7 @@ def _ups_login(
         creds.username,
         default="#username, input[name='username'], input[type='email']",
     )
+    page.wait_for_timeout(_timing_ms(cfg, "before_login_continue_ms", "UPS_BEFORE_LOGIN_CONTINUE_MS", 1500))
     verify_ms = _timing_ms(cfg, "verify_wait_ms", "UPS_VERIFY_WAIT_MS", 8000)
     try:
         page.locator(_sel(cfg, "verify_success")).first.wait_for(
@@ -901,7 +937,9 @@ def _ups_login(
     if not _click_any(page, _sel(cfg, "login_continue"), label="Continue (username)"):
         raise UpsBatchError("Could not click Continue after username")
 
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(_timing_ms(cfg, "after_login_continue_ms", "UPS_AFTER_LOGIN_CONTINUE_MS", 2500))
+    _raise_if_access_denied(page, step="after username")
+
     _type_login_field(
         page,
         cfg,
@@ -913,6 +951,7 @@ def _ups_login(
         raise UpsBatchError("Could not click Continue after password")
 
     page.wait_for_timeout(_timing_ms(cfg, "after_login_ms", "UPS_AFTER_LOGIN_MS", 2000))
+    _raise_if_access_denied(page, step="after password")
     _log("Login submitted.")
     return _ensure_ups_tab(page, cfg)
 
@@ -1294,10 +1333,11 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
             ignore_default_args=["--enable-automation", "--no-sandbox"],
         )
         page = context.pages[0] if context.pages else context.new_page()
+        page = bootstrap_ups_page(page, cfg)
         page = _navigate_current_tab(
             page,
-            _ups_login_url(cfg),
-            label="Setup — loading UPS login in this tab",
+            _ups_home_url(cfg),
+            label="Setup — loading UPS home in this tab",
         )
         clear_blocking_overlays(page, cfg, log=_log)
         print("\n>>> Log into UPS in the browser, then press Enter here to save the session…")
