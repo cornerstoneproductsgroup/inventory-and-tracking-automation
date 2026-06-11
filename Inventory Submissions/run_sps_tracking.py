@@ -1076,10 +1076,27 @@ def ensure_partner_selected(page: Page, partner_name: str) -> None:
     raise RuntimeError(f"Could not select Partner '{wanted}' in Advanced Search.")
 
 
+def _document_type_input_selectors() -> tuple[str, ...]:
+    return (
+        "input[data-testid='advancedSearchDocTypesMultiselect__option-list-input']",
+        "input[data-testid='advancedSearchDocumentTypeMultiselect__option-list-input']",
+        'input[placeholder*="Select a Document Type" i]',
+        "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::input[1]",
+    )
+
+
+def _status_input_selectors() -> tuple[str, ...]:
+    return (
+        "input[data-testid='advancedSearchStatusesMultiselect__option-list-input']",
+        'input[placeholder*="Select a Status" i]',
+        "xpath=//*[contains(normalize-space(.), 'Status')]/following::input[1]",
+    )
+
+
 def clear_document_type_filter(page: Page) -> None:
     """Ensure Document Type is empty so partner/workflow search is not over-filtered."""
     # Remove selected chips if present.
-    for _ in range(6):
+    for _ in range(8):
         removed = False
         for sel in (
             "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
@@ -1109,10 +1126,7 @@ def clear_document_type_filter(page: Page) -> None:
 
     # Also clear typed value if input exists.
     for ctx in _contexts(page):
-        for sel in (
-            "input[data-testid='advancedSearchDocumentTypeMultiselect__option-list-input']",
-            "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::input[1]",
-        ):
+        for sel in _document_type_input_selectors():
             try:
                 loc = ctx.locator(sel)
                 if loc.count() == 0:
@@ -1139,10 +1153,7 @@ def ensure_document_type_order(page: Page) -> None:
         clear_click_blockers(page)
         field = None
         for ctx in _contexts(page):
-            for sel in (
-                "input[data-testid='advancedSearchDocumentTypeMultiselect__option-list-input']",
-                "xpath=//*[contains(normalize-space(.), 'Document Type')]/following::input[1]",
-            ):
+            for sel in _document_type_input_selectors():
                 try:
                     loc = ctx.locator(sel)
                     if loc.count() == 0:
@@ -1166,7 +1177,7 @@ def ensure_document_type_order(page: Page) -> None:
             field.fill("", timeout=700)
         except Exception:
             pass
-        field.type("Order", delay=20)
+        field.type("Order", delay=25)
         picked = click_first_visible(
             page,
             [
@@ -1174,15 +1185,16 @@ def ensure_document_type_order(page: Page) -> None:
                 "li[role='option']:has-text('Order'):not(:has-text('Forwarded'))",
                 "[role='option']:has-text('Order'):not(:has-text('Forwarded'))",
             ],
-            timeout_ms=1_400,
+            timeout_ms=2_500,
         )
         if not picked:
             try:
                 field.press("ArrowDown")
+                page.wait_for_timeout(120)
                 field.press("Enter")
             except Exception:
                 pass
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(200)
         if _document_type_filter_is_order(page):
             print(f"Document Type filter confirmed as 'Order' on attempt {attempt}.")
             return

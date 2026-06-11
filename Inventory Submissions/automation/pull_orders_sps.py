@@ -27,7 +27,9 @@ from run_sps_tracking import (  # noqa: E402
     ensure_document_type_order,
     wait_for_transactions_page_ready,
     _contexts,
+    _document_type_filter_is_order,
     _raise_if_cookie_or_auth_wall,
+    _status_input_selectors,
 )
 
 DOWNLOAD_TIMEOUT_MS = 180_000
@@ -38,14 +40,38 @@ def _log(msg: str) -> None:
     print(f"[pull-orders/sps] {msg}", flush=True)
 
 
+def _status_filter_tags(page: Page) -> list[str]:
+    tags: list[str] = []
+    for ctx in _contexts(page):
+        for sel in (
+            "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'tag') or contains(@class,'chip')]",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                for i in range(min(loc.count(), 8)):
+                    text = (loc.nth(i).inner_text(timeout=500) or "").strip()
+                    if text and text not in tags:
+                        tags.append(text)
+            except Exception:
+                continue
+    return tags
+
+
+def _status_filter_is_new_only(page: Page) -> bool:
+    tags = [t.lower() for t in _status_filter_tags(page)]
+    if not tags:
+        return False
+    return tags == ["new"]
+
+
 def _clear_status_filter(page: Page) -> None:
     """Remove all Status chips (e.g. New + Cancelled) before applying a single status."""
-    for _ in range(10):
+    for _ in range(12):
         removed = False
         for sel in (
+            "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'tag') or contains(@class,'chip')][1]//*[contains(@class,'close') or self::button][1]",
             "xpath=//*[contains(normalize-space(.), 'Status')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
             "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'close') or contains(@class,'sps-icon-close')][1]",
-            "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'tag') or contains(@class,'chip')][1]//*[contains(@class,'close') or self::button][1]",
         ):
             for ctx in _contexts(page):
                 try:
@@ -54,7 +80,7 @@ def _clear_status_filter(page: Page) -> None:
                         continue
                     loc.first.click(timeout=700, force=True)
                     removed = True
-                    page.wait_for_timeout(80)
+                    page.wait_for_timeout(120)
                     break
                 except Exception:
                     continue
@@ -62,6 +88,19 @@ def _clear_status_filter(page: Page) -> None:
                 break
         if not removed:
             break
+    for ctx in _contexts(page):
+        for sel in _status_input_selectors():
+            try:
+                loc = ctx.locator(sel)
+                if loc.count() == 0:
+                    continue
+                inp = loc.first
+                if not inp.is_visible():
+                    continue
+                inp.click(timeout=600, force=True)
+                inp.fill("", timeout=500)
+            except Exception:
+                continue
 
 
 def ensure_status_new(page: Page) -> None:
@@ -72,10 +111,7 @@ def ensure_status_new(page: Page) -> None:
         clear_click_blockers(page)
         field = None
         for ctx in _contexts(page):
-            for sel in (
-                "input[data-testid='advancedSearchStatusesMultiselect__option-list-input']",
-                "xpath=//*[contains(normalize-space(.), 'Status')]/following::input[1]",
-            ):
+            for sel in _status_input_selectors():
                 try:
                     loc = ctx.locator(sel)
                     if loc.count() == 0:
@@ -99,19 +135,21 @@ def ensure_status_new(page: Page) -> None:
             field.fill("", timeout=700)
         except Exception:
             pass
-        field.type("New", delay=20)
+        field.type("New", delay=25)
         if click_first_visible(
             page,
             [
-                "xpath=//*[@role='option' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new')]",
-                "xpath=//*[contains(@class,'option') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new')]",
+                "xpath=//*[@role='option' and normalize-space(.)='New']",
+                "li[role='option']:has-text('New'):not(:has-text('Renew'))",
+                "[role='option']:has-text('New'):not(:has-text('Renew'))",
             ],
             timeout_ms=2500,
         ):
-            page.wait_for_timeout(200)
-            return
+            page.wait_for_timeout(250)
+            if _status_filter_is_new_only(page):
+                return
         page.wait_for_timeout(180)
-    raise RuntimeError("Could not set Status filter to 'New'.")
+    raise RuntimeError("Could not set Status filter to 'New' only.")
 
 
 def open_order_new_search(page: Page) -> None:
@@ -135,10 +173,15 @@ def open_order_new_search(page: Page) -> None:
     ensure_document_type_order(page)
     _clear_status_filter(page)
     ensure_status_new(page)
+    if not _document_type_filter_is_order(page):
+        raise RuntimeError("Document Type filter is not 'Order' before search.")
+    if not _status_filter_is_new_only(page):
+        tags = _status_filter_tags(page)
+        raise RuntimeError(f"Status filter must be 'New' only before search (found: {tags}).")
     click_advanced_search_button(page)
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(1200)
-    _log("Search complete.")
+    _log("Search complete (Document Type=Order, Status=New).")
 
 
 def _result_rows(page: Page):
@@ -160,18 +203,26 @@ def _result_rows(page: Page):
 
 def _row_matches_tractor(text: str) -> bool:
     t = text.lower()
+    if "document type" in t:
+        return False
     if "tractor supply dropship" not in t:
         return False
-    if "cancelled" in t:
+    if "cancelled" in t or "accepted" in t or "error" in t:
+        return False
+    if "order" not in t or "new" not in t:
         return False
     return True
 
 
 def _row_matches_grainger(text: str) -> bool:
     t = text.lower()
+    if "document type" in t:
+        return False
     if not re.search(r"\bgrainger\b", t):
         return False
-    if "cancelled" in t:
+    if "cancelled" in t or "accepted" in t or "error" in t:
+        return False
+    if "order" not in t or "new" not in t:
         return False
     return True
 
