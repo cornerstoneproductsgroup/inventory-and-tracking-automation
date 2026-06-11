@@ -161,20 +161,6 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
     return out
 
 
-def _launch_args_with_startup_url(
-    browser_cfg: dict[str, Any],
-    *,
-    user_data_dir: Path | None,
-    startup_url: str | None,
-) -> list[str]:
-    """Edge/Chrome open the UPS URL on launch when passed as the final argument."""
-    args = _launch_args(browser_cfg, user_data_dir=user_data_dir)
-    url = (startup_url or "").strip()
-    if url and url not in args:
-        args.append(url)
-    return args
-
-
 def _ups_home_url(cfg: dict[str, Any]) -> str:
     ups = cfg.get("ups") or {}
     return str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
@@ -560,10 +546,7 @@ def _open_dedicated_profile_browser(
     browser_cfg = cfg.get("browser", {})
     profile_dir = dedicated_ups_profile_dir(browser_cfg)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    home = _ups_home_url(cfg)
-    args = _launch_args_with_startup_url(
-        browser_cfg, user_data_dir=profile_dir, startup_url=home
-    )
+    args = _launch_args(browser_cfg, user_data_dir=profile_dir)
     channel = _resolve_channel(browser_cfg) or "chrome"
     name = browser_display_name(channel)
 
@@ -664,10 +647,7 @@ def _open_browser(
             if user_data_dir is not None:
                 if not _using_system_chrome_profile(user_data_dir, browser_cfg):
                     user_data_dir.mkdir(parents=True, exist_ok=True)
-                home = _ups_home_url(cfg)
-                launch_kwargs["args"] = _launch_args_with_startup_url(
-                    browser_cfg, user_data_dir=user_data_dir, startup_url=home
-                )
+                launch_kwargs["args"] = _launch_args(browser_cfg, user_data_dir=user_data_dir)
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,
@@ -1738,9 +1718,7 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
     _log("Log into UPS in the browser window, then return here.")
 
     with sync_playwright() as p:
-        setup_args = _launch_args_with_startup_url(
-            browser_cfg, user_data_dir=profile_dir, startup_url=home
-        )
+        setup_args = _launch_args(browser_cfg, user_data_dir=profile_dir)
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
             channel=channel,
