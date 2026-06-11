@@ -131,18 +131,17 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
     extra = browser_cfg.get("args") or []
     if isinstance(extra, str):
         extra = [extra]
-    base = ["--disable-blink-features=AutomationControlled"]
+    base: list[str] = [
+        "--disable-session-crashed-bubble",
+        "--disable-restore-session-state",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if ups_browser_channel(browser_cfg) != "msedge":
+        base.insert(0, "--disable-blink-features=AutomationControlled")
     if _using_system_chrome_profile(user_data_dir, browser_cfg):
         profile = browser_profile_directory()
-        base.extend(
-            [
-                f"--profile-directory={profile}",
-                "--disable-session-crashed-bubble",
-                "--disable-restore-session-state",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-        )
+        base.append(f"--profile-directory={profile}")
     out: list[str] = []
     for arg in [*base, *extra]:
         text = str(arg).strip()
@@ -166,49 +165,123 @@ def _ups_login_url(cfg: dict[str, Any]) -> str:
     return f"https://www.ups.com/lasso/login?loc=en_US&returnto={returnto}"
 
 
-def _pick_ups_page(context: BrowserContext, *, home_url: str) -> Page:
-    for pg in context.pages:
+_BLANK_TAB_URLS = frozenset(
+    {
+        "about:blank",
+        "chrome://newtab/",
+        "edge://newtab/",
+        "",
+    }
+)
+
+
+def _page_url(page: Page) -> str:
+    try:
+        return (page.url or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_blank_tab_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    return text in _BLANK_TAB_URLS or text.startswith("chrome://newtab") or text.startswith("edge://newtab")
+
+
+def _is_ups_tab_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    return "ups.com" in text or "id.ups.com" in text
+
+
+def _log_browser_tabs(context: BrowserContext) -> None:
+    try:
+        urls = [_page_url(pg) for pg in context.pages]
+        _log(f"Browser tabs ({len(urls)}): {urls!r}")
+    except Exception:
+        pass
+
+
+def _pick_ups_page(
+    context: BrowserContext,
+    *,
+    home_url: str = "",
+    wait_ms: int = 3000,
+) -> Page:
+    """Prefer an existing UPS/login tab over about:blank (Edge may restore both)."""
+    deadline = time.time() + max(0, wait_ms) / 1000.0
+    while True:
+        for pg in context.pages:
+            try:
+                if _is_ups_tab_url(_page_url(pg)):
+                    pg.bring_to_front()
+                    return pg
+            except Exception:
+                continue
+        for pg in context.pages:
+            try:
+                if not _is_blank_tab_url(_page_url(pg)):
+                    pg.bring_to_front()
+                    return pg
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            break
         try:
-            if "ups.com" in (pg.url or "").lower():
-                pg.bring_to_front()
-                return pg
+            if context.pages:
+                context.pages[0].wait_for_timeout(300)
+            else:
+                time.sleep(0.3)
         except Exception:
-            continue
-    for pg in context.pages:
-        try:
-            url = (pg.url or "").strip()
-            if url and url not in ("about:blank", "chrome://newtab/", ""):
-                pg.bring_to_front()
-                return pg
-        except Exception:
-            continue
+            time.sleep(0.3)
+
     if context.pages:
-        pg = context.pages[0]
+        pg = context.pages[-1]
         pg.bring_to_front()
         return pg
     return context.new_page()
 
 
-def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
+def _close_blank_tabs(context: BrowserContext, *, keep: Page) -> None:
+    for pg in list(context.pages):
+        if pg is keep:
+            continue
+        if not _is_blank_tab_url(_page_url(pg)):
+            continue
+        try:
+            pg.close()
+            _log(f"Closed blank tab ({_page_url(pg)!r}).")
+        except Exception:
+            pass
+
+
+def _ensure_ups_tab(page: Page, cfg: dict[str, Any], *, wait_ms: int = 1500) -> Page:
+    """Switch Playwright to the UPS tab if the browser focused about:blank instead."""
+    context = page.context
+    best = _pick_ups_page(context, home_url=_ups_home_url(cfg), wait_ms=wait_ms)
+    if best is not page:
+        _log(f"Using UPS tab {best.url!r} (was on {page.url!r}).")
+    best.bring_to_front()
+    if _is_ups_tab_url(_page_url(best)):
+        _close_blank_tabs(context, keep=best)
+    return best
+
+
+def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> Page:
+    page = _ensure_ups_tab(page, cfg)
     home_url = _ups_home_url(cfg)
-    current = (page.url or "").strip().lower()
-    if "ups.com" not in current:
+    current = _page_url(page).lower()
+    if not _is_ups_tab_url(current):
         _log(f"Navigating to {home_url} (current tab: {page.url!r})")
         last_err: Exception | None = None
         for attempt in range(1, 4):
             try:
                 page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-                if "ups.com" in (page.url or "").lower():
+                page = _ensure_ups_tab(page, cfg, wait_ms=800)
+                if _is_ups_tab_url(_page_url(page)):
                     break
             except Exception as exc:
                 last_err = exc
                 _log(f"WARN: UPS navigation attempt {attempt}/3: {exc}")
-                if attempt < 3:
-                    try:
-                        page = page.context.new_page()
-                        page.bring_to_front()
-                    except Exception:
-                        pass
+                page = _ensure_ups_tab(page, cfg, wait_ms=800)
         else:
             raise UpsBatchError(
                 f"Could not open UPS home page (stuck on {page.url!r}). {last_err}"
@@ -217,6 +290,7 @@ def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> None:
         _log(f"On UPS: {page.url}")
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
     clear_blocking_overlays(page, cfg, log=_log)
+    return page
 
 
 def _attach_playwright_to_cdp(
@@ -235,7 +309,7 @@ def _attach_playwright_to_cdp(
                 continue
             context = browser.contexts[0]
             page = pick_ups_page_from_context(context, home_url=home_url)
-            _ensure_ups_home_page(page, cfg)
+            page = _ensure_ups_home_page(page, cfg)
             _log(f"Attached to Chrome on port {port} — {page.url}")
             return browser, context, page
         except Exception as exc:
@@ -330,9 +404,14 @@ def _open_dedicated_profile_browser(
         accept_downloads=True,
     )
     context.add_init_script(_STEALTH_INIT)
-    page = _pick_ups_page(context, home_url=home)
-    page.bring_to_front()
-    _ensure_ups_home_page(page, cfg)
+    if context.pages:
+        try:
+            context.pages[0].wait_for_timeout(1500)
+        except Exception:
+            time.sleep(1.5)
+    _log_browser_tabs(context)
+    page = _pick_ups_page(context, home_url=home, wait_ms=3000)
+    page = _ensure_ups_home_page(page, cfg)
     _log(f"{name} ready (dedicated profile) — {page.url}")
     return None, context, page, True
 
@@ -424,9 +503,14 @@ def _open_browser(
                     **launch_kwargs,
                 )
                 context.add_init_script(_STEALTH_INIT)
-                page = _pick_ups_page(context, home_url=home)
-                page.bring_to_front()
-                _ensure_ups_home_page(page, cfg)
+                if context.pages:
+                    try:
+                        context.pages[0].wait_for_timeout(1500)
+                    except Exception:
+                        time.sleep(1.5)
+                _log_browser_tabs(context)
+                page = _pick_ups_page(context, home_url=home, wait_ms=3000)
+                page = _ensure_ups_home_page(page, cfg)
                 _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
                 return None, context, page, True, "persistent"
 
@@ -608,8 +692,9 @@ def _find_login_field(page: Page, cfg: dict[str, Any], key: str, *, default: str
     return page.locator(selectors[0]).first
 
 
-def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> None:
+def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> Page:
     """Navigate to UPS sign-in (avoids homepage teasers blocking Log In)."""
+    page = _ensure_ups_tab(page, cfg)
     clear_blocking_overlays(page, cfg, log=_log)
     username_default = "#username, input[name='username'], input[type='email']"
     try:
@@ -617,18 +702,20 @@ def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> None:
             timeout=1500
         ):
             _log("UPS login form already open.")
-            return
+            return page
     except Exception:
         pass
 
     login_url = _ups_login_url(cfg)
     _log(f"Opening UPS login page: {login_url}")
     page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
+    page = _ensure_ups_tab(page, cfg, wait_ms=1000)
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
     clear_blocking_overlays(page, cfg, log=_log)
 
     loc = _find_login_field(page, cfg, "username_input", default=username_default)
     loc.wait_for(state="visible", timeout=30_000)
+    return page
 
 
 def _type_login_field(page: Page, cfg: dict[str, Any], key: str, text: str, *, default: str) -> None:
@@ -692,18 +779,18 @@ def _ups_login(
     *,
     manual: bool,
     launch_source: str,
-) -> None:
+) -> Page:
     _log("Step 1/6: Open UPS home and clear popups…")
-    _ensure_ups_home_page(page, cfg)
+    page = _ensure_ups_home_page(page, cfg)
     clear_blocking_overlays(page, cfg, log=_log)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
         _wait_for_manual_ups_login(page, cfg)
-        return
+        return _ensure_ups_tab(page, cfg)
 
     if _is_ups_logged_in(page, cfg):
         _log("Already logged in (Chrome profile session) — skipping login.")
-        return
+        return page
 
     has_creds = bool((creds.username or "").strip() and (creds.password or "").strip())
     skip_auto = launch_source in ("cdp", "manual") and _env_bool(
@@ -715,7 +802,7 @@ def _ups_login(
         clear_blocking_overlays(page, cfg, log=_log)
         if _is_ups_logged_in(page, cfg):
             _log("Logged in after clearing popups — continuing.")
-            return
+            return page
         raise UpsBatchError(
             "Not logged into UPS (Log In still visible). Popups may be blocking the page. "
             "Dismiss them manually in Chrome, or set UPS_SKIP_AUTO_LOGIN=0 with "
@@ -737,14 +824,16 @@ def _ups_login(
     _log(f"Step 2/6: Logging into UPS as {creds.username[:3]}…")
 
     try:
-        _open_ups_login_form(page, cfg)
+        page = _open_ups_login_form(page, cfg)
     except Exception as exc:
         _log(f"WARN: direct login page failed ({exc}) — trying header Log In…")
+        page = _ensure_ups_tab(page, cfg)
         clear_blocking_overlays(page, cfg, log=_log)
         if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
             raise UpsBatchError("Could not open UPS login (direct URL or header Log In).") from exc
         page.wait_for_timeout(600)
         _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In")
+        page = _ensure_ups_tab(page, cfg)
 
     _type_login_field(
         page,
@@ -779,6 +868,7 @@ def _ups_login(
 
     page.wait_for_timeout(_timing_ms(cfg, "after_login_ms", "UPS_AFTER_LOGIN_MS", 2000))
     _log("Login submitted.")
+    return _ensure_ups_tab(page, cfg)
 
 
 def _on_create_shipment_page(page: Page, cfg: dict[str, Any]) -> bool:
@@ -1025,12 +1115,15 @@ def run_ups_batch(
             p, cfg, headless=headless, slow_mo=slow_mo
         )
         try:
-            _ups_login(
+            page = _ups_login(
                 page, cfg, creds, manual=manual_login, launch_source=launch_source
             )
+            page = _ensure_ups_tab(page, cfg)
             _navigate_batch_shipping(page, cfg)
+            page = _ensure_ups_tab(page, cfg)
             if upload_csv is not None:
                 _upload_csv(page, cfg, upload_csv)
+            page = _ensure_ups_tab(page, cfg)
             _fill_ship_from(page, cfg)
             _fill_payment(page, cfg)
             labels_page = _preview_and_process(page, cfg, context)
@@ -1099,16 +1192,23 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
     _log("Log into UPS in the browser window, then return here.")
 
     with sync_playwright() as p:
+        setup_args = _launch_args(browser_cfg, user_data_dir=profile_dir)
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
             channel=channel,
             headless=False,
             slow_mo=slow_mo,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=setup_args,
             ignore_default_args=["--enable-automation", "--no-sandbox"],
         )
-        page = context.pages[0] if context.pages else context.new_page()
+        if context.pages:
+            try:
+                context.pages[0].wait_for_timeout(1500)
+            except Exception:
+                time.sleep(1.5)
+        page = _pick_ups_page(context, home_url=home, wait_ms=3000)
         page.goto(_ups_login_url(cfg), wait_until="domcontentloaded", timeout=120_000)
+        page = _ensure_ups_tab(page, cfg)
         clear_blocking_overlays(page, cfg, log=_log)
         print("\n>>> Log into UPS in the browser, then press Enter here to save the session…")
         try:
