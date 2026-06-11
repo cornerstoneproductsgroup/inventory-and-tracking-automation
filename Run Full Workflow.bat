@@ -15,7 +15,7 @@ echo ============================================================
 echo   Full Workflow — main menu
 echo ============================================================
 echo   F  FedEx Batch ^(Lowe's CSV upload, finalize, labels^)
-echo   W  UPS Online Batch ^(Depot / Special Order / Tractor^)
+echo   W  WorldShip / UPS shipping
 echo   O  Vendor Emails ^(Outlook — ALL or pick one vendor^)
 echo   0  Pull Orders ^(CommerceHub PDF/CSV, SPS, warehouse print^)
 echo   S  Scheduled morning chain ^(see SCHEDULED_WORKFLOW.md^)
@@ -47,13 +47,34 @@ set "EXTRA_ARGS=--fedex-batch-only"
 goto RUN
 
 :OPT_W
-goto SUBMENU_UPS
+goto SUBMENU_W
+
+:SUBMENU_W
+cls
+echo.
+echo ============================================================
+echo   WorldShip / UPS shipping
+echo ============================================================
+echo   1  WorldShip Batch Import ^(CornerstoneMaster — default^)
+echo   2  UPS.com Online Batch ^(Depot / Special Order / Tractor^)
+echo   0  Back to main menu
+echo.
+choice /C 012 /N /M "Press 0-2: "
+REM 0=1 1=2 2=3
+if errorlevel 3 goto SUBMENU_UPS
+if errorlevel 2 goto WORLDSHIP_IMPORT
+if errorlevel 1 goto MAIN_MENU
+goto SUBMENU_W
+
+:WORLDSHIP_IMPORT
+set "EXTRA_ARGS=--worldship-import-only"
+goto RUN
 
 :SUBMENU_UPS
 cls
 echo.
 echo ============================================================
-echo   UPS Online Batch
+echo   UPS.com Online Batch
 echo ============================================================
 echo   1  Home Depot
 echo   2  Depot Special Order
@@ -69,7 +90,7 @@ if errorlevel 5 goto UPS_ALL
 if errorlevel 4 goto UPS_TRACTOR
 if errorlevel 3 goto UPS_THDSO
 if errorlevel 2 goto UPS_DEPOT
-if errorlevel 1 goto MAIN_MENU
+if errorlevel 1 goto SUBMENU_W
 goto SUBMENU_UPS
 
 :UPS_DEPOT

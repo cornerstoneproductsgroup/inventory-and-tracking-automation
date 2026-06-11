@@ -272,6 +272,9 @@ def _void_single_row(page: Page, cfg: dict[str, Any], row, *, dry_run: bool) -> 
 
     try:
         void_btn.click()
+        page.wait_for_timeout(
+            _timing_ms(cfg, "before_void_yes_ms", "UPS_VOID_BEFORE_YES_MS", 1000)
+        )
         if not _click_any(
             page,
             _sel(cfg, "void_yes") or "#nbsVoidShipmentModalYes",
@@ -279,7 +282,9 @@ def _void_single_row(page: Page, cfg: dict[str, Any], row, *, dry_run: bool) -> 
             timeout_ms=12_000,
         ):
             return "failed"
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(
+            _timing_ms(cfg, "after_void_yes_ms", "UPS_VOID_AFTER_YES_MS", 3000)
+        )
         _click_any(
             page,
             _sel(cfg, "void_close") or "#nbsVoidShipmentConfirmationModalClose",

@@ -60,6 +60,14 @@
   ],
   "_future_steps_examples": [
     {
+      "id": "worldship_import",
+      "label": "WorldShip Batch Import — CornerstoneMaster labels",
+      "enabled": false,
+      "continue_on_error": true,
+      "type": "workflow",
+      "args": ["--worldship-import-only"]
+    },
+    {
       "id": "ups_online_batch",
       "label": "UPS Online Batch — Depot / Special Order / Tractor CSV upload + labels",
       "enabled": false,

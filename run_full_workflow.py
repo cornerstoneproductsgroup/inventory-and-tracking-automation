@@ -26,6 +26,7 @@ Use --invoice-report-date YYYY-MM-DD (or MM/DD/YYYY) for a custom invoice report
 Use --tracking-invoicing-only to skip inventories and run tracking lanes only.
 Use --pull-orders-only to run only the morning order pull (CommerceHub PDF/CSV, SPS, warehouse print).
 Use --fedex-batch-only to run only FedEx batch shipping (Lowe's CSV upload + labels).
+Use --worldship-import-only to run only UPS WorldShip batch import (CornerstoneMaster labels).
 Use --ups-online-batch-only to run only UPS.com batch file shipping (Depot / Special Order / Tractor).
 Use --vendor-emails-only to run only Outlook vendor emails from z- Daily Vendor Orders.
 Use --amazon-seller-download-only to download Amazon Deferred Transaction CSV to the Input share.
@@ -620,6 +621,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--worldship-import-only",
+        action="store_true",
+        help=(
+            "Run only UPS WorldShip desktop batch import "
+            "(Batch Import wizard → label save from CornerstoneMaster). Not part of All Steps."
+        ),
+    )
+    parser.add_argument(
         "--ups-online-batch-only",
         action="store_true",
         help=(
@@ -722,6 +731,14 @@ def main() -> int:
         parser.error("--invoice-report-only cannot be combined with --skip-invoice-report")
     if args.pull_orders_only and args.invoice_report_only:
         parser.error("--pull-orders-only cannot be combined with --invoice-report-only")
+    if args.worldship_import_only and args.invoice_report_only:
+        parser.error("--worldship-import-only cannot be combined with --invoice-report-only")
+    if args.pull_orders_only and args.worldship_import_only:
+        parser.error("--pull-orders-only cannot be combined with --worldship-import-only")
+    if args.fedex_batch_only and args.worldship_import_only:
+        parser.error("--fedex-batch-only cannot be combined with --worldship-import-only")
+    if args.ups_online_batch_only and args.worldship_import_only:
+        parser.error("--ups-online-batch-only cannot be combined with --worldship-import-only")
     if args.ups_online_batch_only and args.invoice_report_only:
         parser.error("--ups-online-batch-only cannot be combined with --invoice-report-only")
     if args.pull_orders_only and args.ups_online_batch_only:
@@ -734,6 +751,8 @@ def main() -> int:
         parser.error("--fedex-batch-only cannot be combined with --pull-orders-only")
     if args.amazon_seller_download_only and args.invoice_report_only:
         parser.error("--amazon-seller-download-only cannot be combined with --invoice-report-only")
+    if args.amazon_seller_download_only and args.worldship_import_only:
+        parser.error("--amazon-seller-download-only cannot be combined with --worldship-import-only")
     if args.amazon_seller_download_only and args.ups_online_batch_only:
         parser.error("--amazon-seller-download-only cannot be combined with --ups-online-batch-only")
     if args.amazon_seller_download_only and args.pull_orders_only:
@@ -742,6 +761,8 @@ def main() -> int:
         parser.error("--amazon-seller-download-only cannot be combined with --fedex-batch-only")
     if args.vendor_emails_only and args.invoice_report_only:
         parser.error("--vendor-emails-only cannot be combined with --invoice-report-only")
+    if args.vendor_emails_only and args.worldship_import_only:
+        parser.error("--vendor-emails-only cannot be combined with --worldship-import-only")
     if args.vendor_emails_only and args.ups_online_batch_only:
         parser.error("--vendor-emails-only cannot be combined with --ups-online-batch-only")
     if args.vendor_emails_only and args.pull_orders_only:
@@ -755,6 +776,7 @@ def main() -> int:
 
     tracking_invoicing_only = bool(args.tracking_invoicing_only)
     pull_orders_only = bool(args.pull_orders_only)
+    worldship_import_only = bool(args.worldship_import_only)
     ups_online_batch_only = bool(args.ups_online_batch_only)
     fedex_batch_only = bool(args.fedex_batch_only)
     amazon_seller_download_only = bool(args.amazon_seller_download_only)
@@ -939,6 +961,33 @@ def main() -> int:
                 print(f"  - {e}")
             return 1
         print("\nVendor emails completed successfully.")
+        return 0
+
+    if worldship_import_only:
+        worldship_script = INVENTORY_DIR / "run_worldship_import.py"
+        if not worldship_script.is_file():
+            print(
+                f"\nERROR: Missing WorldShip import script:\n  {worldship_script}\n"
+                "Update/pull Inventory Submissions and retry."
+            )
+            return 1
+        print(
+            "\n"
+            + "=" * 60
+            + "\nUPS WorldShip — Batch Import + CornerstoneMaster label save\n"
+            + "=" * 60
+        )
+        errors = _run_single(
+            "WorldShip Batch Import",
+            [python_exe, str(worldship_script)],
+            INVENTORY_DIR,
+        )
+        if errors:
+            print("\nCompleted with errors:")
+            for e in errors:
+                print(f"  - {e}")
+            return 1
+        print("\nWorldShip import completed successfully.")
         return 0
 
     if ups_online_batch_only:

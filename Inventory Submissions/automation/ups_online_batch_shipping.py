@@ -760,6 +760,8 @@ def _resolve_lane_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[st
         ship["company"] = "TractorSupply" if lane == "tractor" else "HomeDepot.com"
     if not str(ship.get("contact") or "").strip():
         ship["contact"] = "Cornerstone Products Group"
+    if not str(ship.get("email") or "").strip():
+        ship["email"] = "orders@cornerstoneproductsgroup.com"
     if not str(pay.get("third_party_account") or "").strip():
         pay["third_party_account"] = "87W6A8" if lane == "tractor" else "1YA668"
     if not str(pay.get("third_party_zip") or "").strip():
@@ -1459,7 +1461,12 @@ def _fill_ship_from(page: Page, cfg: dict[str, Any]) -> None:
         str(ship.get("contact") or "Cornerstone Products Group"),
         label="Contact",
     )
-    _clear_field(page, _sel(cfg, "email") or "#origin-cac_email", label="Email")
+    _fill_field(
+        page,
+        _sel(cfg, "email") or "#origin-cac_email",
+        str(ship.get("email") or "orders@cornerstoneproductsgroup.com"),
+        label="Email",
+    )
 
 
 def _fill_payment(page: Page, cfg: dict[str, Any]) -> None:

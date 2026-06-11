@@ -54,7 +54,8 @@
   },
   "ship_from": {
     "company": "HomeDepot.com",
-    "contact": "Cornerstone Products Group"
+    "contact": "Cornerstone Products Group",
+    "email": "orders@cornerstoneproductsgroup.com"
   },
   "payment": {
     "third_party_account": "1YA668",
@@ -127,6 +128,8 @@
     "after_history_filter_ms": 3000,
     "history_page_ms": 2500,
     "between_void_ms": 600,
+    "before_void_yes_ms": 1000,
+    "after_void_yes_ms": 3000,
     "micro_pause_ms": 400,
     "popup_wait_ms": 1800,
     "popup_dismiss_rounds": 4

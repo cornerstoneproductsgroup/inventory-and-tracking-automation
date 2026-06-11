@@ -1,4 +1,30 @@
 @echo off
-echo WorldShip has been replaced by UPS.com online batch shipping.
-echo Running Run UPS Online Batch.bat instead...
-call "%~dp0Run UPS Online Batch.bat"
+setlocal EnableExtensions
+cd /d "%~dp0Inventory Submissions"
+
+set "PY=.venv\Scripts\python.exe"
+if not exist "%PY%" (
+  echo WARN: .venv not found — using system python.
+  set "PY=python"
+)
+
+if not exist "logs" mkdir "logs"
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%i"
+set "LOG=logs\worldship_%STAMP%.log"
+
+echo.
+echo === UPS WorldShip Batch Import ^(CornerstoneMaster labels^) ===
+echo Log: %LOG%
+echo.
+
+"%PY%" -u run_worldship_import.py %* > "%LOG%" 2>&1
+set "EXITCODE=%ERRORLEVEL%"
+type "%LOG%"
+echo.
+if "%EXITCODE%"=="0" (
+  echo Completed OK.
+) else (
+  echo Failed ^(exit %EXITCODE%^). See log: %LOG%
+)
+pause
+exit /b %EXITCODE%
