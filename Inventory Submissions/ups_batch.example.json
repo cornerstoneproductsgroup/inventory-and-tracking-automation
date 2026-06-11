@@ -98,6 +98,7 @@
     "location_deny": "button:has-text('Never allow'), button:has-text('Block')",
     "extension_dismiss": "button[aria-label='Close'], button[aria-label='Dismiss']",
     "user_profile": "#user-profile",
+    "view_shipping_history": "span:text-is('View Shipping History'), span:has-text('View Shipping History'), a:has-text('View Shipping History')",
     "shipping_history": "span.main-text:text-is('Shipping History'), a:has-text('Shipping History')",
     "date_range_modify": "#dateRangeModify",
     "history_date_range": "#nwsHistoryDateRangeDropdown",

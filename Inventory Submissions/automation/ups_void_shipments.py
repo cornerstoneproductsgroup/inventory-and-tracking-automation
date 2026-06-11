@@ -52,6 +52,38 @@ def _history_url(cfg: dict[str, Any]) -> str:
     return str(_void_cfg(cfg).get("history_url") or DEFAULT_HISTORY_URL).strip()
 
 
+def _on_shipping_history_page(page: Page) -> bool:
+    return "ship/history" in (_page_url(page) or "").lower()
+
+
+def _open_shipping_history_via_shipping_menu(page: Page, cfg: dict[str, Any]) -> bool:
+    """Shipping tab → View Shipping History (primary nav after login)."""
+    shipping_tab = (
+        _sel(cfg, "shipping_tab")
+        or "button[aria-controls='subsection-shipping'], button:has-text('Shipping')"
+    )
+    view_history = (
+        _sel(cfg, "view_shipping_history")
+        or "span:text-is('View Shipping History'), span:has-text('View Shipping History'), a:has-text('View Shipping History')"
+    )
+    if not _click_any(page, shipping_tab, label="Shipping tab"):
+        return False
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 700))
+    return _click_any(page, view_history, label="View Shipping History")
+
+
+def _open_shipping_history_via_profile_menu(page: Page, cfg: dict[str, Any]) -> bool:
+    if not _click_any(page, _sel(cfg, "user_profile") or "#user-profile", label="User profile"):
+        return False
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 500))
+    return _click_any(
+        page,
+        _sel(cfg, "shipping_history")
+        or "span.main-text:text-is('Shipping History'), a:has-text('Shipping History')",
+        label="Shipping History (profile menu)",
+    )
+
+
 def _open_shipping_history(page: Page, cfg: dict[str, Any]) -> Page:
     page = _ensure_ups_tab(page, cfg)
     if _is_blank_tab_url(_page_url(page)):
@@ -60,30 +92,40 @@ def _open_shipping_history(page: Page, cfg: dict[str, Any]) -> Page:
             _history_url(cfg),
             label="Blank tab — opening Shipping History",
         )
-    if "ship/history" in (page.url or "").lower():
+    if _on_shipping_history_page(page):
         _log("Already on Shipping History.")
         return page
 
+    clear_blocking_overlays(page, cfg, log=_log)
+
     opened = False
-    if _click_any(page, _sel(cfg, "user_profile") or "#user-profile", label="User profile"):
-        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 500))
-        opened = _click_any(
-            page,
-            _sel(cfg, "shipping_history")
-            or "span.main-text:text-is('Shipping History'), a:has-text('Shipping History')",
-            label="Shipping History",
-        )
+    if _open_shipping_history_via_shipping_menu(page, cfg):
+        opened = True
+        _log("Opened Shipping History via Shipping → View Shipping History.")
+    elif _open_shipping_history_via_profile_menu(page, cfg):
+        opened = True
+        _log("Opened Shipping History via user profile menu.")
 
     if not opened:
         page = _navigate_current_tab(
             page,
             _history_url(cfg),
-            label="Opening Shipping History",
+            label="Opening Shipping History (direct URL)",
         )
+    else:
+        try:
+            page.wait_for_url("**/ship/history**", timeout=60_000)
+        except Exception:
+            _log("WARN: Shipping History URL not detected after menu click — waiting for load.")
 
     page.wait_for_load_state("domcontentloaded", timeout=60_000)
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
     clear_blocking_overlays(page, cfg, log=_log)
+    if not _on_shipping_history_page(page):
+        raise UpsBatchError(
+            f"Could not open Shipping History (current URL: {_page_url(page)!r}). "
+            "Check selectors shipping_tab and view_shipping_history in ups_batch.json."
+        )
     _log(f"Shipping History: {page.url}")
     return page
 
