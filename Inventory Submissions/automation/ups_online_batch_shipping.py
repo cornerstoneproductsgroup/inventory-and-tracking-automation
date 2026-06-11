@@ -161,6 +161,20 @@ def _launch_args(browser_cfg: dict[str, Any], *, user_data_dir: Path | None) -> 
     return out
 
 
+def _launch_args_with_startup_url(
+    browser_cfg: dict[str, Any],
+    *,
+    user_data_dir: Path | None,
+    startup_url: str | None,
+) -> list[str]:
+    """Edge/Chrome open the UPS URL on launch when passed as the final argument."""
+    args = _launch_args(browser_cfg, user_data_dir=user_data_dir)
+    url = (startup_url or "").strip()
+    if url and url not in args:
+        args.append(url)
+    return args
+
+
 def _ups_home_url(cfg: dict[str, Any]) -> str:
     ups = cfg.get("ups") or {}
     return str(ups.get("home_url") or DEFAULT_HOME_URL).strip()
@@ -247,17 +261,36 @@ def _pick_ups_driver_page(context: BrowserContext) -> Page:
     return context.pages[0]
 
 
+def _wait_until_tab_navigated(page: Page, *, timeout_ms: int = 20_000) -> bool:
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if not _is_blank_tab_url(_page_url(page)):
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
 def _goto_tab_url(page: Page, url: str, *, label: str = "") -> bool:
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    except Exception as exc:
-        _log(f"WARN: page.goto failed: {exc}")
-        return False
-    if _is_blank_tab_url(_page_url(page)):
-        return False
-    if label:
-        _log(f"{label}: {_page_url(page)!r}")
-    return True
+    for wait_until in ("commit", "domcontentloaded"):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=45_000)
+        except Exception as exc:
+            _log(f"WARN: page.goto ({wait_until}) raised: {exc}")
+        if _wait_until_tab_navigated(page, timeout_ms=15_000):
+            if label:
+                _log(f"{label}: {_page_url(page)!r}")
+            return True
+    return False
+
+
+def _wait_for_startup_ups_tab(context: BrowserContext, *, timeout_ms: int = 20_000) -> Page | None:
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        found = _pick_ups_driver_page(context)
+        if not _is_blank_tab_url(_page_url(found)):
+            return found
+        time.sleep(0.35)
+    return None
 
 
 def _js_navigate_tab(page: Page, url: str) -> bool:
@@ -305,23 +338,57 @@ def _paste_url_in_address_bar(page: Page, url: str) -> bool:
     return False
 
 
+def _open_ups_in_fresh_tab(page: Page, url: str) -> Page | None:
+    """about:blank first tabs in Edge profiles often ignore navigation — use a new tab."""
+    context = page.context
+    fresh = context.new_page()
+    fresh.bring_to_front()
+    try:
+        for name, load in (
+            ("new tab page.goto", lambda: _goto_tab_url(fresh, url)),
+            ("new tab JS navigate", lambda: _js_navigate_tab(fresh, url)),
+            ("new tab address bar paste", lambda: _paste_url_in_address_bar(fresh, url)),
+        ):
+            try:
+                if load():
+                    _log(f"Loaded via {name}: {_page_url(fresh)!r}")
+                    for pg in list(context.pages):
+                        if pg is fresh:
+                            continue
+                        if _is_blank_tab_url(_page_url(pg)):
+                            try:
+                                pg.close()
+                            except Exception:
+                                pass
+                    return fresh
+            except Exception as exc:
+                _log(f"WARN: {name} error: {exc}")
+    except Exception as exc:
+        _log(f"WARN: fresh tab open failed: {exc}")
+    try:
+        fresh.close()
+    except Exception:
+        pass
+    return None
+
+
 def _load_ups_in_tab(page: Page, url: str) -> Page:
-    """Load UPS in the current tab — page.goto first, then JS / address-bar fallbacks."""
+    """Load UPS in the current tab — page.goto first, then JS / address-bar / new tab."""
     current = _page_url(page)
     if not _is_blank_tab_url(current) and _is_ups_tab_url(current):
         return page
 
     _log(f"Tab URL is {current!r} — loading {url!r}")
     page.bring_to_front()
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(500)
 
     loaders: tuple[tuple[str, Any], ...] = (
         ("page.goto", lambda: _goto_tab_url(page, url)),
         ("JS navigate", lambda: _js_navigate_tab(page, url)),
         ("address bar paste", lambda: _paste_url_in_address_bar(page, url)),
     )
-    for attempt in range(1, 4):
-        _log(f"UPS load attempt {attempt}/3…")
+    for attempt in range(1, 3):
+        _log(f"UPS load attempt {attempt}/2...")
         for name, load in loaders:
             try:
                 if load():
@@ -329,8 +396,11 @@ def _load_ups_in_tab(page: Page, url: str) -> Page:
                     return page
             except Exception as exc:
                 _log(f"WARN: {name} error: {exc}")
-            page.wait_for_timeout(400)
-        page.wait_for_timeout(800)
+            page.wait_for_timeout(300)
+
+    fresh = _open_ups_in_fresh_tab(page, url)
+    if fresh is not None:
+        return fresh
 
     raise UpsBatchError(
         f"Still on about:blank after loading UPS ({url!r}). "
@@ -490,8 +560,10 @@ def _open_dedicated_profile_browser(
     browser_cfg = cfg.get("browser", {})
     profile_dir = dedicated_ups_profile_dir(browser_cfg)
     profile_dir.mkdir(parents=True, exist_ok=True)
-    args = _launch_args(browser_cfg, user_data_dir=profile_dir)
     home = _ups_home_url(cfg)
+    args = _launch_args_with_startup_url(
+        browser_cfg, user_data_dir=profile_dir, startup_url=home
+    )
     channel = _resolve_channel(browser_cfg) or "chrome"
     name = browser_display_name(channel)
 
@@ -506,8 +578,7 @@ def _open_dedicated_profile_browser(
         accept_downloads=True,
     )
     context.add_init_script(_STEALTH_INIT)
-    page = _pick_ups_driver_page(context)
-    page.wait_for_timeout(600)
+    page = _wait_for_startup_ups_tab(context) or _pick_ups_driver_page(context)
     page = bootstrap_ups_page(page, cfg)
     page = _ensure_ups_home_page(page, cfg)
     _log(f"{name} ready (dedicated profile) — {page.url}")
@@ -594,14 +665,19 @@ def _open_browser(
                 if not _using_system_chrome_profile(user_data_dir, browser_cfg):
                     user_data_dir.mkdir(parents=True, exist_ok=True)
                 home = _ups_home_url(cfg)
-                launch_kwargs["args"] = list(args)
+                launch_kwargs["args"] = _launch_args_with_startup_url(
+                    browser_cfg, user_data_dir=user_data_dir, startup_url=home
+                )
                 context = p.chromium.launch_persistent_context(
                     str(user_data_dir),
                     accept_downloads=True,
                     **launch_kwargs,
                 )
                 context.add_init_script(_STEALTH_INIT)
-                page = context.pages[0] if context.pages else context.new_page()
+                page = _wait_for_startup_ups_tab(context) or (
+                    context.pages[0] if context.pages else context.new_page()
+                )
+                page = bootstrap_ups_page(page, cfg)
                 page = _ensure_ups_home_page(page, cfg)
                 _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
                 return None, context, page, True, "persistent"
@@ -1056,35 +1132,116 @@ def _type_login_field(page: Page, cfg: dict[str, Any], key: str, text: str, *, d
     loc.press_sequentially(text, delay=type_delay)
 
 
+_LOGGED_IN_SELECTORS = (
+    "#user-profile",
+    "button#user-profile",
+    "button.user-profile-btn",
+    ".ups-userProfile",
+    ".ups-user_profile",
+    "[data-test-id='user-menu']",
+    "[data-test-id='user-profile']",
+    "a:has-text('Log Out')",
+    "button:has-text('Log Out')",
+    "a:has-text('My Profile')",
+    "button[aria-label*='Profile']",
+)
+
+_DEFAULT_HISTORY_PROBE_URL = "https://www.ups.com/ship/history?loc=en_US"
+
+
+def _history_probe_url(cfg: dict[str, Any]) -> str:
+    void = cfg.get("void")
+    if isinstance(void, dict) and void.get("history_url"):
+        return str(void["history_url"]).strip()
+    return _DEFAULT_HISTORY_PROBE_URL
+
+
+def _url_suggests_ups_session(url: str | None) -> bool:
+    text = (url or "").lower()
+    return "iss=" in text and "id.ups.com" in text
+
+
 def _is_ups_logged_in(page: Page, cfg: dict[str, Any]) -> bool:
     """Only True on positive logged-in signals — never guess when UI is blocked."""
     try:
-        if page.locator("#username").first.is_visible(timeout=1200):
+        if page.locator("#username").first.is_visible(timeout=800):
             return False
     except Exception:
         pass
-    for sel in (
-        "#user-profile",
-        "button.user-profile-btn",
-        "a:has-text('Log Out')",
-        "button:has-text('Log Out')",
-        "[data-test-id='user-menu']",
-        ".ups-userProfile",
-        "a:has-text('My Profile')",
-    ):
+
+    profile_sel = _sel(cfg, "user_profile")
+    selectors = [s.strip() for s in profile_sel.split(",") if s.strip()] if profile_sel else []
+    selectors.extend(_LOGGED_IN_SELECTORS)
+    seen: set[str] = set()
+    for sel in selectors:
+        if sel in seen:
+            continue
+        seen.add(sel)
         try:
             if page.locator(sel).first.is_visible(timeout=1500):
                 return True
         except Exception:
             continue
+
     try:
-        login = page.locator(_sel(cfg, "header_login")).first
-        if login.is_visible(timeout=2500):
-            text = (login.inner_text(timeout=2000) or "").lower()
+        has_profile = page.evaluate(
+            """() => !!(
+                document.querySelector('#user-profile') ||
+                document.querySelector('button.user-profile-btn') ||
+                document.querySelector('.ups-userProfile')
+            )"""
+        )
+        if has_profile:
+            return True
+    except Exception:
+        pass
+
+    try:
+        login = page.locator(
+            _combined_selectors(cfg, "header_login", _HEADER_LOGIN_DEFAULTS)
+        ).first
+        if login.is_visible(timeout=2000):
+            text = (login.inner_text(timeout=1500) or "").lower()
             if "log in" in text:
                 return False
     except Exception:
         pass
+    return False
+
+
+def _wait_for_ups_session_ready(page: Page, cfg: dict[str, Any], *, timeout_ms: int = 20_000) -> None:
+    """After SSO landing (?iss=id.ups.com), wait for the header profile to appear."""
+    if not _url_suggests_ups_session(_page_url(page)):
+        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
+        return
+
+    _log("UPS identity session landing — waiting for saved login to appear...")
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        dismiss_ups_startup_popups(page, cfg, log=_log)
+        if _is_ups_logged_in(page, cfg):
+            return
+        page.wait_for_timeout(500)
+
+
+def _probe_ups_logged_in_via_history(page: Page, cfg: dict[str, Any]) -> bool:
+    """Navigate to Shipping History — if it loads, the profile session is valid."""
+    history_url = _history_probe_url(cfg)
+    current = _page_url(page).lower()
+    if "ship/history" in current:
+        return True
+    _log("Probing saved UPS session via Shipping History URL...")
+    try:
+        page.goto(history_url, wait_until="domcontentloaded", timeout=45_000)
+    except Exception as exc:
+        _log(f"WARN: history probe navigation failed: {exc}")
+        return False
+    url = _page_url(page).lower()
+    if "ship/history" in url and "lasso/login" not in url and "id.ups.com" not in url:
+        _log("Session probe OK — Shipping History loaded.")
+        return True
+    if "id.ups.com" in url or "lasso/login" in url:
+        _log("Session probe — redirected to UPS login (session expired).")
     return False
 
 
@@ -1115,13 +1272,18 @@ def _ups_login(
     _log("Step 1/6: Open UPS home and clear popups…")
     page = _ensure_ups_home_page(page, cfg)
     dismiss_ups_startup_popups(page, cfg, log=_log)
+    _wait_for_ups_session_ready(page, cfg)
 
     if manual or _env_bool("UPS_MANUAL_LOGIN", default=False):
         _wait_for_manual_ups_login(page, cfg)
         return _ensure_ups_tab(page, cfg)
 
     if _is_ups_logged_in(page, cfg):
-        _log("Already logged in (Chrome profile session) — skipping login.")
+        _log("Already logged in (browser profile session) — skipping login.")
+        return page
+
+    if launch_source == "dedicated" and _probe_ups_logged_in_via_history(page, cfg):
+        _log("Already logged in (Shipping History probe) — skipping login.")
         return page
 
     has_creds = bool((creds.username or "").strip() and (creds.password or "").strip())
@@ -1576,7 +1738,9 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
     _log("Log into UPS in the browser window, then return here.")
 
     with sync_playwright() as p:
-        setup_args = _launch_args(browser_cfg, user_data_dir=profile_dir)
+        setup_args = _launch_args_with_startup_url(
+            browser_cfg, user_data_dir=profile_dir, startup_url=home
+        )
         context = p.chromium.launch_persistent_context(
             str(profile_dir),
             channel=channel,
@@ -1585,7 +1749,9 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
             args=setup_args,
             ignore_default_args=["--enable-automation", "--no-sandbox"],
         )
-        page = context.pages[0] if context.pages else context.new_page()
+        page = _wait_for_startup_ups_tab(context) or (
+            context.pages[0] if context.pages else context.new_page()
+        )
         page = bootstrap_ups_page(page, cfg)
         page = _navigate_current_tab(
             page,
