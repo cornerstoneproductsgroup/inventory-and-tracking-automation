@@ -200,92 +200,67 @@ def _log_browser_tabs(context: BrowserContext) -> None:
         pass
 
 
-def _pick_ups_page(
-    context: BrowserContext,
-    *,
-    home_url: str = "",
-    wait_ms: int = 3000,
-) -> Page:
-    """Prefer an existing UPS/login tab over about:blank (Edge may restore both)."""
-    deadline = time.time() + max(0, wait_ms) / 1000.0
-    while True:
-        for pg in context.pages:
-            try:
-                if _is_ups_tab_url(_page_url(pg)):
-                    pg.bring_to_front()
-                    return pg
-            except Exception:
-                continue
-        for pg in context.pages:
-            try:
-                if not _is_blank_tab_url(_page_url(pg)):
-                    pg.bring_to_front()
-                    return pg
-            except Exception:
-                continue
-        if time.time() >= deadline:
-            break
-        try:
-            if context.pages:
-                context.pages[0].wait_for_timeout(300)
-            else:
-                time.sleep(0.3)
-        except Exception:
-            time.sleep(0.3)
-
-    if context.pages:
-        pg = context.pages[-1]
-        pg.bring_to_front()
-        return pg
-    return context.new_page()
-
-
-def _close_blank_tabs(context: BrowserContext, *, keep: Page) -> None:
+def _close_extra_tabs(context: BrowserContext, *, keep: Page) -> None:
     for pg in list(context.pages):
         if pg is keep:
             continue
-        if not _is_blank_tab_url(_page_url(pg)):
-            continue
         try:
+            _log(f"Closing extra tab: {_page_url(pg)!r}")
             pg.close()
-            _log(f"Closed blank tab ({_page_url(pg)!r}).")
         except Exception:
             pass
 
 
-def _ensure_ups_tab(page: Page, cfg: dict[str, Any], *, wait_ms: int = 1500) -> Page:
-    """Switch Playwright to the UPS tab if the browser focused about:blank instead."""
+def _navigate_current_tab(page: Page, url: str, *, label: str) -> Page:
+    """Load a URL in the current tab (same as pasting into the address bar)."""
+    current = _page_url(page)
+    cur_l = current.lower()
+    tgt_l = url.lower()
+    if not _is_blank_tab_url(current):
+        if cur_l.rstrip("/") == tgt_l.rstrip("/"):
+            return page
+        if "lasso/login" in tgt_l and "lasso/login" in cur_l:
+            return page
+        if "id.ups.com" in tgt_l and "id.ups.com" in cur_l:
+            return page
+    _log(f"{label} — tab was {current!r}")
+    page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+    page.bring_to_front()
+    _log(f"Now on: {_page_url(page)!r}")
+    return page
+
+
+def _ensure_ups_tab(page: Page, cfg: dict[str, Any]) -> Page:
+    """
+    Drive the first browser tab only. If it is about:blank, load UPS in that tab
+    (do not hop to a restored UPS tab in the background).
+    """
     context = page.context
-    best = _pick_ups_page(context, home_url=_ups_home_url(cfg), wait_ms=wait_ms)
-    if best is not page:
-        _log(f"Using UPS tab {best.url!r} (was on {page.url!r}).")
-    best.bring_to_front()
-    if _is_ups_tab_url(_page_url(best)):
-        _close_blank_tabs(context, keep=best)
-    return best
+    _log_browser_tabs(context)
+    driver = context.pages[0] if context.pages else page
+    driver.bring_to_front()
+    _close_extra_tabs(context, keep=driver)
+
+    current = _page_url(driver)
+    if _is_blank_tab_url(current) or not _is_ups_tab_url(current):
+        driver = _navigate_current_tab(
+            driver,
+            _ups_login_url(cfg),
+            label="Blank tab — loading UPS login in this tab",
+        )
+    return driver
 
 
 def _ensure_ups_home_page(page: Page, cfg: dict[str, Any]) -> Page:
     page = _ensure_ups_tab(page, cfg)
     home_url = _ups_home_url(cfg)
     current = _page_url(page).lower()
-    if not _is_ups_tab_url(current):
-        _log(f"Navigating to {home_url} (current tab: {page.url!r})")
-        last_err: Exception | None = None
-        for attempt in range(1, 4):
-            try:
-                page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-                page = _ensure_ups_tab(page, cfg, wait_ms=800)
-                if _is_ups_tab_url(_page_url(page)):
-                    break
-            except Exception as exc:
-                last_err = exc
-                _log(f"WARN: UPS navigation attempt {attempt}/3: {exc}")
-                page = _ensure_ups_tab(page, cfg, wait_ms=800)
-        else:
-            raise UpsBatchError(
-                f"Could not open UPS home page (stuck on {page.url!r}). {last_err}"
-            )
+    if _is_blank_tab_url(current) or not _is_ups_tab_url(current):
+        page = _navigate_current_tab(
+            page,
+            home_url,
+            label="Loading UPS home in this tab",
+        )
     else:
         _log(f"On UPS: {page.url}")
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 400))
@@ -404,13 +379,7 @@ def _open_dedicated_profile_browser(
         accept_downloads=True,
     )
     context.add_init_script(_STEALTH_INIT)
-    if context.pages:
-        try:
-            context.pages[0].wait_for_timeout(1500)
-        except Exception:
-            time.sleep(1.5)
-    _log_browser_tabs(context)
-    page = _pick_ups_page(context, home_url=home, wait_ms=3000)
+    page = context.pages[0] if context.pages else context.new_page()
     page = _ensure_ups_home_page(page, cfg)
     _log(f"{name} ready (dedicated profile) — {page.url}")
     return None, context, page, True
@@ -503,13 +472,7 @@ def _open_browser(
                     **launch_kwargs,
                 )
                 context.add_init_script(_STEALTH_INIT)
-                if context.pages:
-                    try:
-                        context.pages[0].wait_for_timeout(1500)
-                    except Exception:
-                        time.sleep(1.5)
-                _log_browser_tabs(context)
-                page = _pick_ups_page(context, home_url=home, wait_ms=3000)
+                page = context.pages[0] if context.pages else context.new_page()
                 page = _ensure_ups_home_page(page, cfg)
                 _log(f"Browser: {label} (profile {user_data_dir}) — {page.url}")
                 return None, context, page, True, "persistent"
@@ -707,9 +670,11 @@ def _open_ups_login_form(page: Page, cfg: dict[str, Any]) -> Page:
         pass
 
     login_url = _ups_login_url(cfg)
-    _log(f"Opening UPS login page: {login_url}")
-    page.goto(login_url, wait_until="domcontentloaded", timeout=120_000)
-    page = _ensure_ups_tab(page, cfg, wait_ms=1000)
+    page = _navigate_current_tab(
+        page,
+        login_url,
+        label="Opening UPS login in this tab",
+    )
     page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
     clear_blocking_overlays(page, cfg, log=_log)
 
@@ -1201,14 +1166,12 @@ def run_ups_browser_setup(*, config_path: Path) -> None:
             args=setup_args,
             ignore_default_args=["--enable-automation", "--no-sandbox"],
         )
-        if context.pages:
-            try:
-                context.pages[0].wait_for_timeout(1500)
-            except Exception:
-                time.sleep(1.5)
-        page = _pick_ups_page(context, home_url=home, wait_ms=3000)
-        page.goto(_ups_login_url(cfg), wait_until="domcontentloaded", timeout=120_000)
-        page = _ensure_ups_tab(page, cfg)
+        page = context.pages[0] if context.pages else context.new_page()
+        page = _navigate_current_tab(
+            page,
+            _ups_login_url(cfg),
+            label="Setup — loading UPS login in this tab",
+        )
         clear_blocking_overlays(page, cfg, log=_log)
         print("\n>>> Log into UPS in the browser, then press Enter here to save the session…")
         try:
