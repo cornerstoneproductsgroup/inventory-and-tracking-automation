@@ -63,8 +63,9 @@
     "billing_account_label": "186Y47 - Worldship"
   },
   "selectors": {
-    "header_login": "a:has(span.text:text-is('Log In')), button:has(span.text:text-is('Log In')), a:has-text('Log In')",
-    "dropdown_login": "a:has(span.text:text-is('Log In')), button:has(span.text:text-is('Log In'))",
+    "header_login": "button:has(span.text:text-is('Log In')), .ups-anonymous_profile button, [data-test-id='anonymous-profile'] button",
+    "login_nav_link": "a[href*='lasso/login'], a[href*='id.ups.com/u/login'], a[href*='id.ups.com']",
+    "dropdown_login": ".ups-user-actions a[href*='lasso/login'], .ups-anonymous_profile a[href*='lasso/login'], a[href*='lasso/login']:visible, a[href*='id.ups.com']:visible",
     "username_input": "#username, input[name='username']",
     "password_input": "#password, input[name='password']",
     "login_continue": "button:has-text('Continue'), button._button-login-id, button._button-login-password",

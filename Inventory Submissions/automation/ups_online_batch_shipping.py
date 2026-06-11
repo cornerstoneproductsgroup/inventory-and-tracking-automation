@@ -721,6 +721,41 @@ def _select_dropdown(page: Page, selector: str, *, value: str | None = None, lab
     raise UpsBatchError(f"Could not select {field}")
 
 
+_HEADER_LOGIN_DEFAULTS = (
+    "button:has(span.text:text-is('Log In'))",
+    ".ups-anonymous_profile button",
+    "[data-test-id='anonymous-profile'] button",
+    "a:has(span.text:text-is('Log In'))",
+    "button:has-text('Log In')",
+)
+_LOGIN_NAV_DEFAULTS = (
+    "a[href*='lasso/login']",
+    "a[href*='id.ups.com/u/login']",
+    "a[href*='id.ups.com']",
+)
+_DROPDOWN_LOGIN_DEFAULTS = (
+    ".ups-user-actions a[href*='lasso/login']",
+    ".ups-anonymous_profile a[href*='lasso/login']",
+    "a[href*='lasso/login']:visible",
+    "a[href*='id.ups.com']:visible",
+)
+
+
+def _combined_selectors(cfg: dict[str, Any], key: str, defaults: tuple[str, ...]) -> str:
+    raw = _sel(cfg, key)
+    parts: list[str] = []
+    if raw:
+        parts.extend(s.strip() for s in raw.split(",") if s.strip())
+    parts.extend(defaults)
+    seen: set[str] = set()
+    out: list[str] = []
+    for sel in parts:
+        if sel not in seen:
+            seen.add(sel)
+            out.append(sel)
+    return ", ".join(out)
+
+
 def _login_field_selector(cfg: dict[str, Any], key: str, default: str) -> str:
     return _sel(cfg, key) or default
 
@@ -765,19 +800,76 @@ def _raise_if_access_denied(page: Page, *, step: str) -> None:
     )
 
 
+def _page_has_login_form(page: Page, cfg: dict[str, Any], *, username_default: str) -> bool:
+    try:
+        return _find_login_field(
+            page, cfg, "username_input", default=username_default
+        ).is_visible(timeout=800)
+    except Exception:
+        return False
+
+
+def _find_page_with_login_form(
+    context: BrowserContext, cfg: dict[str, Any], *, username_default: str
+) -> Page | None:
+    for pg in context.pages:
+        if _page_has_login_form(pg, cfg, username_default=username_default):
+            pg.bring_to_front()
+            return pg
+    return None
+
+
+def _wait_for_login_navigation(page: Page, context: BrowserContext) -> Page:
+    pages_before = set(context.pages)
+    for _ in range(24):
+        found = [pg for pg in context.pages if pg not in pages_before]
+        if found:
+            found[0].bring_to_front()
+            try:
+                found[0].wait_for_load_state("domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+            return found[0]
+        current = _page_url(page).lower()
+        if "lasso/login" in current or "id.ups.com" in current:
+            return page
+        for pg in context.pages:
+            url = _page_url(pg).lower()
+            if "lasso/login" in url or "id.ups.com" in url:
+                pg.bring_to_front()
+                return pg
+        page.wait_for_timeout(500)
+    return page
+
+
+def _click_ups_login_link(
+    page: Page,
+    context: BrowserContext,
+    cfg: dict[str, Any],
+    *,
+    selectors: str,
+    label: str,
+) -> Page:
+    if not _click_any(page, selectors, label=label):
+        return page
+    page = _wait_for_login_navigation(page, context)
+    if page not in context.pages and context.pages:
+        page = context.pages[0]
+    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 600))
+    return page
+
+
 def _open_ups_login_via_ui(page: Page, cfg: dict[str, Any]) -> Page:
-    """Open sign-in by clicking Log In on ups.com (never paste id.ups.com directly)."""
+    """Open sign-in via UPS.com UI links, then lasso/login fallback if needed."""
     page = _ensure_ups_home_page(page, cfg)
     clear_blocking_overlays(page, cfg, log=_log)
+    context = page.context
     username_default = "#username, input[name='username'], input[type='email']"
-    try:
-        if _find_login_field(page, cfg, "username_input", default=username_default).is_visible(
-            timeout=1500
-        ):
-            _log("UPS login form already open.")
-            return page
-    except Exception:
-        pass
+
+    existing = _find_page_with_login_form(context, cfg, username_default=username_default)
+    if existing:
+        _log("UPS login form already open.")
+        return existing
 
     if "id.ups.com" in _page_url(page).lower():
         page = _navigate_current_tab(
@@ -787,15 +879,49 @@ def _open_ups_login_via_ui(page: Page, cfg: dict[str, Any]) -> Page:
         )
         clear_blocking_overlays(page, cfg, log=_log)
 
-    if not _click_any(page, _sel(cfg, "header_login"), label="header Log In"):
-        raise UpsBatchError("Could not click Log In on UPS home page.")
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
-    _click_any(page, _sel(cfg, "dropdown_login"), label="dropdown Log In")
-    page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 600))
+    nav_sels = _combined_selectors(cfg, "login_nav_link", _LOGIN_NAV_DEFAULTS)
+    page = _click_ups_login_link(page, context, cfg, selectors=nav_sels, label="login link")
     clear_blocking_overlays(page, cfg, log=_log)
+    existing = _find_page_with_login_form(context, cfg, username_default=username_default)
+    if existing:
+        _raise_if_access_denied(existing, step="opening login")
+        return existing
 
+    header_sels = _combined_selectors(cfg, "header_login", _HEADER_LOGIN_DEFAULTS)
+    dropdown_sels = _combined_selectors(cfg, "dropdown_login", _DROPDOWN_LOGIN_DEFAULTS)
+    if _click_any(page, header_sels, label="header Log In"):
+        page.wait_for_timeout(_timing_ms(cfg, "micro_pause_ms", "UPS_MICRO_PAUSE_MS", 800))
+        page = _click_ups_login_link(
+            page, context, cfg, selectors=dropdown_sels, label="dropdown Log In"
+        )
+        clear_blocking_overlays(page, cfg, log=_log)
+        existing = _find_page_with_login_form(context, cfg, username_default=username_default)
+        if existing:
+            _raise_if_access_denied(existing, step="opening login")
+            return existing
+
+    if not _find_page_with_login_form(context, cfg, username_default=username_default):
+        _log("Login form not visible — opening UPS lasso/login URL…")
+        page = _navigate_current_tab(
+            page,
+            _ups_login_url(cfg),
+            label="Opening UPS sign-in (lasso)",
+        )
+        clear_blocking_overlays(page, cfg, log=_log)
+
+    page = _find_page_with_login_form(context, cfg, username_default=username_default) or page
     loc = _find_login_field(page, cfg, "username_input", default=username_default)
-    loc.wait_for(state="visible", timeout=30_000)
+    try:
+        loc.wait_for(state="visible", timeout=30_000)
+    except Exception as exc:
+        urls = [_page_url(pg) for pg in context.pages]
+        raise UpsBatchError(
+            "UPS login form (#username) did not appear after clicking Log In.\n"
+            f"Browser tabs: {urls!r}\n"
+            "Try one-time manual login saved to the profile:\n"
+            "  python run_ups_online_batch.py --setup-login\n"
+            "Or set UPS_MANUAL_LOGIN=1 in .env for this run."
+        ) from exc
     _raise_if_access_denied(page, step="opening login")
     return page
 
