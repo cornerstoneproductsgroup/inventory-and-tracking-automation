@@ -59,10 +59,12 @@ echo   1  Home Depot
 echo   2  Depot Special Order
 echo   3  Tractor Supply
 echo   4  All three ^(Depot, Special Order, Tractor^)
+echo   5  Void today's shipments ^(Shipping History^)
 echo   0  Back to main menu
 echo.
-choice /C 01234 /N /M "Press 0-4: "
-REM 0=1 1=2 2=3 3=4 4=5
+choice /C 012345 /N /M "Press 0-5: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6
+if errorlevel 6 goto UPS_VOID
 if errorlevel 5 goto UPS_ALL
 if errorlevel 4 goto UPS_TRACTOR
 if errorlevel 3 goto UPS_THDSO
@@ -85,6 +87,10 @@ goto RUN
 :UPS_ALL
 set "EXTRA_ARGS=--ups-online-batch-only --ups-online-batch-lane all"
 goto RUN
+
+:UPS_VOID
+call "%~dp0Run UPS Void Shipments.bat"
+goto MAIN_MENU
 
 :OPT_O
 set "EXTRA_ARGS=--vendor-emails-only"

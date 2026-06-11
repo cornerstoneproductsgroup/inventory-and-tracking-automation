@@ -421,3 +421,22 @@ def label_save_timeout_s() -> float:
         return max(30.0, float(raw))
     except ValueError:
         return 180.0
+
+
+def post_void_browser_wait_s(cfg: dict | None = None) -> float:
+    """
+    Seconds to keep the browser open after labels are saved so you can void shipments.
+    Set UPS_LEAVE_BROWSER_OPEN_AFTER_SUCCESS=1 to leave open until you close it manually.
+    """
+    if _env_bool("UPS_LEAVE_BROWSER_OPEN_AFTER_SUCCESS", default=False):
+        return -1.0
+    timing = (cfg or {}).get("timing") or {}
+    raw = (
+        str(timing.get("post_void_browser_wait_s") or "").strip()
+        or (os.environ.get("UPS_POST_VOID_WAIT_S") or "").strip()
+        or "120"
+    )
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 120.0

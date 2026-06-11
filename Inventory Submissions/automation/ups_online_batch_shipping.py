@@ -34,6 +34,7 @@ from automation.ups_batch_config import (
     depot_labels_pdf_path,
     label_save_timeout_s,
     lane_labels_pdf_path,
+    post_void_browser_wait_s,
     normalize_ups_lane,
     resolve_browser_user_data_dir,
     system_browser_user_data_dir,
@@ -978,6 +979,41 @@ def _fill_payment(page: Page, cfg: dict[str, Any]) -> None:
             raise UpsBatchError(f"Could not select billing account: {exc}") from exc
 
 
+def _wait_for_labels_ready(labels_page: Page, cfg: dict[str, Any]) -> None:
+    """Give Process All time to finish rendering labels before saving PDF."""
+    labels_page.wait_for_load_state("domcontentloaded", timeout=120_000)
+    try:
+        labels_page.wait_for_load_state("networkidle", timeout=180_000)
+        _log("Label page network idle.")
+    except Exception:
+        _log("WARN: label page still loading — continuing after extra wait.")
+    settle_ms = _timing_ms(cfg, "after_process_all_ms", "UPS_AFTER_PROCESS_ALL_MS", 45_000)
+    _log(f"Waiting {settle_ms / 1000:.0f}s for all labels to finish loading…")
+    labels_page.wait_for_timeout(settle_ms)
+
+
+def _pause_for_void_window(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    total = int(seconds)
+    _log(
+        f"Labels saved — leaving browser open for {total}s "
+        "so you can void shipments (bulk void is only available before closing the batch)."
+    )
+    milestones = {total, 90, 60, 30, 15, 10, 5}
+    end = time.time() + seconds
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        sec_left = int(remaining) + (1 if remaining % 1 else 0)
+        if sec_left in milestones:
+            _log(f"  {sec_left}s until browser closes…")
+            milestones.discard(sec_left)
+        time.sleep(min(5.0, remaining))
+    _log("Void window ended — closing browser.")
+
+
 def _preview_and_process(page: Page, cfg: dict[str, Any], context: BrowserContext) -> Page:
     _log("Step 6/6: Preview Batch and Process All…")
     if not _click_any(page, _sel(cfg, "preview_batch"), label="Preview Batch"):
@@ -986,12 +1022,12 @@ def _preview_and_process(page: Page, cfg: dict[str, Any], context: BrowserContex
     _log("Batch Processing page loaded.")
 
     process_sel = _sel(cfg, "process_all")
-    with context.expect_page(timeout=120_000) as page_info:
+    with context.expect_page(timeout=180_000) as page_info:
         if not _click_any(page, process_sel, label="Process All", timeout_ms=30_000):
             raise UpsBatchError("Could not click Process All")
     labels_page = page_info.value
-    labels_page.wait_for_load_state("domcontentloaded", timeout=60_000)
     _log("Label print/preview page opened.")
+    _wait_for_labels_ready(labels_page, cfg)
     return labels_page
 
 
@@ -1075,6 +1111,7 @@ def run_ups_batch(
     labels_dest = lane_labels_pdf_path(lane_key, order_date)
 
     leave_browser_open = False
+    post_void_wait_s = 0.0
     with sync_playwright() as p:
         browser, context, page, persistent, launch_source = _open_browser(
             p, cfg, headless=headless, slow_mo=slow_mo
@@ -1094,18 +1131,27 @@ def run_ups_batch(
             labels_page = _preview_and_process(page, cfg, context)
             _save_labels_pdf(labels_page, labels_dest)
             _save_session(context, persistent=persistent)
+            post_void_wait_s = post_void_browser_wait_s(cfg)
         except Exception as exc:
             leave_browser_open = _env_bool("UPS_LEAVE_BROWSER_OPEN_ON_ERROR", default=True)
             _log(f"ERROR: {exc}")
             if leave_browser_open:
                 _log(
-                    "Leaving Chrome open so you can inspect the page. "
-                    "Close Chrome manually when done."
+                    "Leaving browser open so you can inspect the page. "
+                    "Close it manually when done."
                 )
             raise
         finally:
-            if leave_browser_open:
-                pass
+            if leave_browser_open or post_void_wait_s < 0:
+                _log(
+                    "Browser left open — void shipments in UPS, then close the window when finished."
+                )
+            elif post_void_wait_s > 0:
+                _pause_for_void_window(post_void_wait_s)
+                if browser is not None:
+                    browser.close()
+                else:
+                    context.close()
             elif browser is not None:
                 browser.close()
             else:

@@ -95,12 +95,32 @@
     "cookie_accept": "#onetrust-accept-btn-handler, button:has-text('Accept All Cookies')",
     "cookie_settings_close": "#onetrust-pc-sdk button.onetrust-close-btn-handler, #onetrust-pc-sdk button[aria-label='Close']",
     "location_deny": "button:has-text('Never allow'), button:has-text('Block')",
-    "extension_dismiss": "button[aria-label='Close'], button[aria-label='Dismiss']"
+    "extension_dismiss": "button[aria-label='Close'], button[aria-label='Dismiss']",
+    "user_profile": "#user-profile",
+    "shipping_history": "span.main-text:text-is('Shipping History'), a:has-text('Shipping History')",
+    "date_range_modify": "#dateRangeModify",
+    "history_date_range": "#nwsHistoryDateRangeDropdown",
+    "date_range_apply": "#dateRangeApply",
+    "calendar_start": ".ups-icon-calendar",
+    "results_per_page": "#-resultsPerPage, select[name='resultsPerPage']",
+    "history_table_row": "tbody tr:has(.ups-icon-ellipses)",
+    "action_void": "#action_void",
+    "void_yes": "#nbsVoidShipmentModalYes",
+    "void_close": "#nbsVoidShipmentConfirmationModalClose",
+    "pagination_next": "button:has(span:text-is('Next')), a:has(span:text-is('Next'))"
+  },
+  "void": {
+    "history_url": "https://www.ups.com/ship/history?loc=en_US"
   },
   "timing": {
     "verify_wait_ms": 8000,
     "after_login_ms": 2000,
     "after_upload_ms": 3000,
+    "after_process_all_ms": 45000,
+    "post_void_browser_wait_s": 120,
+    "after_history_filter_ms": 3000,
+    "history_page_ms": 2500,
+    "between_void_ms": 600,
     "micro_pause_ms": 400,
     "popup_wait_ms": 1800,
     "popup_dismiss_rounds": 4
