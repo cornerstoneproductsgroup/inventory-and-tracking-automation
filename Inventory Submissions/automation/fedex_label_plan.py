@@ -6,7 +6,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from automation.fedex_batch_config import LOWES_LABELS_ROOT, label_filename, warehouse_label_queue_path
+from automation.fedex_batch_config import (
+    LOWES_LABELS_ROOT,
+    label_filename,
+    lowes_fedex_warehouse_daily_path,
+    vendor_label_pdf_path,
+    warehouse_label_queue_path,
+)
+from automation.fedex_batch_config import warehouse_label_print_mode
 from automation.fedex_lowes_csv import LowesOrderRow
 from automation.warehouse_print_vendors import is_warehouse_print_vendor
 from automation.fedex_reference import vendor_for_sku
@@ -89,10 +96,14 @@ def print_label_plan(groups: list[VendorLabelGroup]) -> None:
     for group in groups:
         skus = ", ".join(t.sku for t in group.targets)
         if is_warehouse_print_vendor(group.vendor_folder):
-            dest = str(warehouse_label_queue_path(group.vendor_folder))
+            dest = str(vendor_label_pdf_path(group.vendor_folder))
+            extra = f" + daily {lowes_fedex_warehouse_daily_path().name}"
+            if warehouse_label_print_mode() == "queue":
+                extra += f" + queue {warehouse_label_queue_path(group.vendor_folder).name}"
         else:
             dest = str(group.save_dir)
-        _log(f"  [{group.vendor_folder}] {len(group.targets)} label(s) → {dest}")
+            extra = ""
+        _log(f"  [{group.vendor_folder}] {len(group.targets)} label(s) → {dest}{extra}")
         _log(f"      SKUs: {skus}")
 
 

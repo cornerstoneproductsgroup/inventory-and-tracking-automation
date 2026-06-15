@@ -89,6 +89,21 @@ def _record_lowes_skip(workflow_name: str, reason: str) -> None:
         print(f"{step}: Skipped — {reason}", flush=True)
 
 
+def _is_navigation_abort_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "err_aborted" in text or "navigation failed" in text
+
+
+def _settle_rithum_page(page: Page, *, extra_ms: int = 0) -> None:
+    """Let in-flight redirects finish before the next CommerceHub navigation."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception:
+        pass
+    base_ms = 400 if _chain_fast() else 1500
+    page.wait_for_timeout(max(0, base_ms + extra_ms))
+
+
 def _login_probe_timeout_ms() -> int:
     ch = _commercehub_timeouts()
     if ch:
@@ -290,6 +305,40 @@ class LowesTrackingAutomation:
             return value
         # Supports config values like "gotoOrderRealmForm.do?..."
         return urljoin("https://dsm.commercehub.com/dsm/", value)
+
+    def _safe_goto(self, page: Page, raw_url: str, *, label: str = "") -> None:
+        """Navigate to a Rithum URL; retry when a prior submit left navigation in flight."""
+        url = self._normalize_rithum_url(raw_url)
+        tag = label or url
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                _settle_rithum_page(page, extra_ms=500 if attempt == 2 else 1000)
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+                return
+            except Exception as exc:
+                if _is_navigation_abort_error(exc) and attempt < max_attempts:
+                    print(
+                        f"WARN: navigation aborted for {tag} "
+                        f"(attempt {attempt}/{max_attempts - 1}) — retrying…",
+                        flush=True,
+                    )
+                    continue
+                if attempt < max_attempts and "timeout" in str(exc).lower():
+                    print(f"WARN: navigation timeout for {tag} — retrying…", flush=True)
+                    continue
+                raise
+
+    def _between_workflows_settle(
+        self, page: Page, prev_workflow: str | None, next_workflow: str
+    ) -> None:
+        extra = 0
+        if prev_workflow == "ship_to_store" and next_workflow == "ship_to_customer":
+            extra = 800 if _chain_fast() else 2500
+        elif prev_workflow:
+            extra = 300 if _chain_fast() else 800
+        _settle_rithum_page(page, extra_ms=extra)
 
     def _extract_url_from_onclick(self, onclick: str) -> Optional[str]:
         if not onclick:
@@ -598,7 +647,7 @@ class LowesTrackingAutomation:
         if not orders_url:
             raise ValueError(f"Missing orders_url for workflow '{workflow_name}'")
         max_orders = int(self.config["automation"].get("max_orders", 50))
-        page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+        self._safe_goto(page, orders_url, label=f"{workflow_name} orders list")
         _fast = _chain_fast()
         link_timeout_ms = _lowes_order_links_timeout_ms()
         try:
@@ -866,7 +915,7 @@ class LowesTrackingAutomation:
         if not po_links_selector:
             raise ValueError(f"[{workflow_name}] Missing selector 'po_links' for list workflow")
 
-        page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+        self._safe_goto(page, orders_url, label=f"{workflow_name} quickship list")
         _fast = _chain_fast()
         if _fast:
             page.wait_for_timeout(200)
@@ -894,7 +943,7 @@ class LowesTrackingAutomation:
                     return
                 if do_submit and run_until_stopped:
                     page.wait_for_timeout(idle_sleep_seconds * 1000)
-                    page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+                    self._safe_goto(page, orders_url, label=f"{workflow_name} quickship list")
                     continue
                 return
 
@@ -988,8 +1037,9 @@ class LowesTrackingAutomation:
                     page.wait_for_load_state("domcontentloaded")
                 self.stats["orders_submitted"] += processed_for_submit
                 print(f"[{workflow_name}] Submitted page with {processed_for_submit} order(s).")
+                _settle_rithum_page(page, extra_ms=400 if _fast else 1200)
                 if run_until_stopped or run_until_queue_empty:
-                    page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+                    self._safe_goto(page, orders_url, label=f"{workflow_name} quickship list")
                     if _fast:
                         page.wait_for_timeout(200)
                     continue
@@ -1001,7 +1051,7 @@ class LowesTrackingAutomation:
                     f"retrying in {idle_sleep_seconds}s..."
                 )
                 page.wait_for_timeout(idle_sleep_seconds * 1000)
-                page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+                self._safe_goto(page, orders_url, label=f"{workflow_name} quickship list")
                 continue
 
             if do_submit and run_until_queue_empty:
@@ -1036,7 +1086,7 @@ class LowesTrackingAutomation:
             idle_after_submit_ms = min(idle_after_submit_ms, 250)
             delay_autofill_ms = min(delay_autofill_ms, 50)
 
-        page.goto(self._normalize_rithum_url(orders_url), wait_until="domcontentloaded")
+        self._safe_goto(page, orders_url, label=f"{workflow_name} invoice list")
         if _fast:
             page.wait_for_timeout(200)
         step_label = _lowes_step_label(workflow_name)
@@ -1098,7 +1148,7 @@ class LowesTrackingAutomation:
     ) -> None:
         self.stats["orders_seen"] += 1
         print(f"\n[{workflow_name}] Processing order page: {order_url}")
-        page.goto(order_url, wait_until="domcontentloaded")
+        self._safe_goto(page, order_url, label=f"{workflow_name} order")
 
         po_number = page.locator(selectors["po_on_order_page"]).inner_text().strip()
         if not po_number:
@@ -1157,6 +1207,7 @@ class LowesTrackingAutomation:
                     page.wait_for_load_state("domcontentloaded")
             self.stats["orders_submitted"] += 1
             print(f"[{workflow_name}] Submitted successfully.")
+            _settle_rithum_page(page, extra_ms=300 if _chain_fast() else 1000)
         else:
             print(f"[{workflow_name}] Dry run mode: values filled, submit skipped.")
 
@@ -1169,7 +1220,9 @@ class LowesTrackingAutomation:
                 "Check rithum.workflows config."
             )
 
+        prev_workflow: str | None = None
         for workflow_name, workflow_cfg in workflows:
+            self._between_workflows_settle(page, prev_workflow, workflow_name)
             wf_cfg = dict(workflow_cfg)
             if workflow_name == "ship_to_customer" and workflow_filter in (
                 "all",
@@ -1180,37 +1233,42 @@ class LowesTrackingAutomation:
 
             selectors = self.get_effective_selectors(workflow_cfg)
             print(f"\nStarting workflow: {workflow_name}")
-            if bool(wf_cfg.get("process_invoice_list", False)):
-                self.process_invoice_list(
-                    page=page,
-                    workflow_name=workflow_name,
-                    workflow_cfg=wf_cfg,
-                    selectors=selectors,
-                    do_submit=do_submit,
-                )
-            elif bool(wf_cfg.get("process_in_list", False)):
-                self.process_orders_in_list(
-                    page=page,
-                    workflow_name=workflow_name,
-                    workflow_cfg=wf_cfg,
-                    selectors=selectors,
-                    do_submit=do_submit,
-                )
-            else:
-                links = self.get_order_links(page, workflow_name, wf_cfg, selectors)
-                for order_url in links:
-                    try:
-                        self.process_order(
-                            page,
-                            order_url,
-                            selectors=selectors,
-                            workflow_name=workflow_name,
-                            workflow_cfg=wf_cfg,
-                            do_submit=do_submit,
-                        )
-                    except Exception as ex:
-                        self.stats["orders_failed"] += 1
-                        print(f"[{workflow_name}] Failed processing order {order_url}: {ex}")
+            try:
+                if bool(wf_cfg.get("process_invoice_list", False)):
+                    self.process_invoice_list(
+                        page=page,
+                        workflow_name=workflow_name,
+                        workflow_cfg=wf_cfg,
+                        selectors=selectors,
+                        do_submit=do_submit,
+                    )
+                elif bool(wf_cfg.get("process_in_list", False)):
+                    self.process_orders_in_list(
+                        page=page,
+                        workflow_name=workflow_name,
+                        workflow_cfg=wf_cfg,
+                        selectors=selectors,
+                        do_submit=do_submit,
+                    )
+                else:
+                    links = self.get_order_links(page, workflow_name, wf_cfg, selectors)
+                    for order_url in links:
+                        try:
+                            self.process_order(
+                                page,
+                                order_url,
+                                selectors=selectors,
+                                workflow_name=workflow_name,
+                                workflow_cfg=wf_cfg,
+                                do_submit=do_submit,
+                            )
+                        except Exception as ex:
+                            self.stats["orders_failed"] += 1
+                            print(f"[{workflow_name}] Failed processing order {order_url}: {ex}")
+            except Exception as ex:
+                self.stats["orders_failed"] += 1
+                print(f"[{workflow_name}] Workflow failed: {ex}", flush=True)
+            prev_workflow = workflow_name
 
     def run(self, do_submit: bool, workflow_filter: str) -> None:
         self.load_csv_index()

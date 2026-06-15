@@ -6,10 +6,12 @@ Automates [FedEx Shipping Plus batch uploads](https://www.fedex.com/shippingplus
 2. Wait until **Ready to finalize** shows the shipment count
 3. Open the batch and process **REFERENCE** rows (`PO` + `SKU`)
 4. Select consecutive rows per **vendor** (from `vendor_map_lowes.xlsx`)
-5. **Finalize and print manually** → per vendor:
-   - **Warehouse-print vendors** (see below): capture labels and **print on the Zebra** (same printer as SOS tags); PDF is **not** saved to the share.
-   - **Other vendors**: save one PDF:  
+5. **Finalize** → per vendor, save one combined PDF:
+   - **All vendors** (including warehouse-print):  
      `...\3-Lowe's\1-Fedex Shipping Labels\<Vendor>\Lowe's <Vendor> M-D-YYYY.pdf`
+   - **Warehouse-print vendors** also merge into one daily file (same folder as Warehouse Print PDFs):  
+     `...\Order Splitter Output\z- Daily Vendor Orders\Lowe's Fedex Labels M-D-YYYY.pdf`
+   - Optional: set `FEDEX_WAREHOUSE_LABEL_PRINT_MODE=queue` to copy warehouse PDFs to the Zebra print queue, or `edge` for legacy in-browser print.
 6. Skip rows that already have a **Tracking ID** / **Shipment created & printed**
 7. After all vendor labels are saved: **select all** shipments → **DOWNLOAD** → **Shipment report (.xlsx file)** → overwrite **`Lowe's Fedex Master.xlsx`** for Lowe's tracking automation
 
@@ -19,6 +21,7 @@ Automates [FedEx Shipping Plus batch uploads](https://www.fedex.com/shippingplus
 |------|----------------|
 | Upload CSV | `\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\CSV File Output\Lowe's\Lowe's 6-1-2026 Output.csv` |
 | Label PDFs | `\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\3-Lowe's\1-Fedex Shipping Labels\<Vendor>\` |
+| Warehouse FedEx labels (daily combined) | `\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\z- Daily Vendor Orders\Lowe's Fedex Labels M-D-YYYY.pdf` |
 | Shipment report (tracking) | `\\rygarcorp.com\shares\Cornerstone\Dot Com Packing Slips\1-Orders Before Extraction\Order Splitter Output\z - Lowe's Tracking\Lowe's Fedex Master.xlsx` (overwritten each run) |
 | Used-file log | `Inventory Submissions\fedex_upload_state.json` |
 

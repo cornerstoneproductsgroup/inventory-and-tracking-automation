@@ -11,6 +11,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
 from automation.worldship_label_config import (
+    COL_LABEL_PR,
     COL_PO,
     COL_RETAILER,
     COL_SKU,
@@ -35,6 +36,12 @@ RETAILER_HEADER_HINTS = (
     "merchant",
     "retailer",
 )
+LABEL_PR_HEADER_HINTS = (
+    "label_pr",
+    "label_profile",
+    "labelprinter",
+    "label_printer",
+)
 
 
 def _log(msg: str) -> None:
@@ -48,6 +55,28 @@ class CornerstoneOrderRow:
     po: str
     retailer_key: str
     retailer_raw: str
+    label_pr: str = ""
+
+
+def normalize_label_pr(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip()).lower()
+
+
+def is_cornerstone_warehouse_print_row(label_pr: str) -> bool | None:
+    """
+    Return True/False from LABEL_PR (LabelPDF vs Label1), or None when blank
+    so callers can fall back to the warehouse vendor list.
+    """
+    norm = normalize_label_pr(label_pr)
+    if not norm:
+        return None
+    if norm == "labelpdf" or norm.endswith("pdf"):
+        return False
+    if norm == "label1" or norm.startswith("label1"):
+        return True
+    if "print" in norm and "pdf" not in norm:
+        return True
+    return False
 
 
 def _resolve_master_dir() -> Path:
@@ -134,21 +163,30 @@ def _header_index(header: list[str], hints: tuple[str, ...]) -> int | None:
     return None
 
 
-def _column_indices(header: list[str]) -> tuple[int, int, int]:
-    """SKU, PO, retailer column indices (0-based). Prefer named CSV headers."""
+def _label_pr_column_index(header: list[str]) -> int:
+    label_i = _header_index(header, LABEL_PR_HEADER_HINTS)
+    if label_i is not None:
+        return label_i
+    return column_index_from_string(COL_LABEL_PR) - 1
+
+
+def _column_indices(header: list[str]) -> tuple[int, int, int, int]:
+    """SKU, PO, retailer, LABEL_PR column indices (0-based). Prefer named CSV headers."""
     sku_i = _header_index(header, SKU_HEADER_HINTS)
     po_i = _header_index(header, PO_HEADER_HINTS)
     retailer_i = _header_index(header, RETAILER_HEADER_HINTS)
+    label_i = _label_pr_column_index(header)
     if sku_i is not None and po_i is not None and retailer_i is not None:
-        return sku_i, po_i, retailer_i
+        return sku_i, po_i, retailer_i, label_i
     _log(
         "WARN: CornerstoneMaster header names not recognized — "
-        f"using Excel columns {COL_SKU}/{COL_PO}/{COL_RETAILER}."
+        f"using Excel columns {COL_SKU}/{COL_PO}/{COL_RETAILER}/{COL_LABEL_PR}."
     )
     return (
         column_index_from_string(COL_SKU) - 1,
         column_index_from_string(COL_PO) - 1,
         column_index_from_string(COL_RETAILER) - 1,
+        column_index_from_string(COL_LABEL_PR) - 1,
     )
 
 
@@ -199,6 +237,7 @@ def _append_order_row(
     sku_i: int,
     po_i: int,
     retailer_i: int,
+    label_pr_i: int,
 ) -> str:
     """
     Append one order row.
@@ -212,6 +251,7 @@ def _append_order_row(
         return "skip"
     po = _purchase_order_for_label(row[po_i] if len(row) > po_i else "")
     retailer_raw = _cell_str(row[retailer_i] if len(row) > retailer_i else "")
+    label_pr = _cell_str(row[label_pr_i] if len(row) > label_pr_i else "")
     if not po:
         raise ValueError(f"Row {row_idx}: PO is empty (SKU={sku!r}).")
     if not retailer_raw:
@@ -223,6 +263,7 @@ def _append_order_row(
             po=po,
             retailer_key=retailer_merchant_to_key(retailer_raw),
             retailer_raw=retailer_raw,
+            label_pr=label_pr,
         )
     )
     return "added"
@@ -235,12 +276,14 @@ def _load_csv(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
 
     header_idx = _find_header_row_index(all_rows)
     header = [str(c).strip() for c in all_rows[header_idx]]
-    sku_i, po_i, retailer_i = _column_indices(header)
+    sku_i, po_i, retailer_i, label_pr_i = _column_indices(header)
+    label_hdr = header[label_pr_i] if label_pr_i < len(header) else COL_LABEL_PR
     _log(
         "CornerstoneMaster columns: "
         f"SKU={header[sku_i]!r} (col {sku_i + 1}), "
         f"PO={header[po_i]!r} (col {po_i + 1}), "
-        f"retailer={header[retailer_i]!r} (col {retailer_i + 1})"
+        f"retailer={header[retailer_i]!r} (col {retailer_i + 1}), "
+        f"LABEL_PR={label_hdr!r} (col {label_pr_i + 1})"
     )
 
     rows: list[CornerstoneOrderRow] = []
@@ -255,6 +298,7 @@ def _load_csv(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
             sku_i=sku_i,
             po_i=po_i,
             retailer_i=retailer_i,
+            label_pr_i=label_pr_i,
         )
         if result == "stop":
             break
@@ -269,10 +313,10 @@ def _load_xlsx(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
         first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
         header = [str(c or "").strip() for c in (first_row or ())]
         if _header_index(header, SKU_HEADER_HINTS) is not None:
-            sku_i, po_i, retailer_i = _column_indices(header)
+            sku_i, po_i, retailer_i, label_pr_i = _column_indices(header)
             start_row = 2
         else:
-            sku_i, po_i, retailer_i = _column_indices([])
+            sku_i, po_i, retailer_i, label_pr_i = _column_indices([])
             start_row = DATA_START_ROW
 
         for row_idx, row in enumerate(
@@ -288,6 +332,7 @@ def _load_xlsx(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
                 sku_i=sku_i,
                 po_i=po_i,
                 retailer_i=retailer_i,
+                label_pr_i=label_pr_i,
             )
             if result == "stop":
                 break

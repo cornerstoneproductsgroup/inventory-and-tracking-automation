@@ -522,24 +522,20 @@ def click_ribbon(
     """
     emit = log or _log_default
     poll_s = 0.08
+    uia_cap_s = _step_wait_s("WORLDSHIP_RIBBON_UIA_TIMEOUT_S", 2.0)
     deadline = time.monotonic() + timeout_s
+    uia_deadline = time.monotonic() + min(timeout_s, uia_cap_s)
     saw_any = False
-    last_fg = ""
-    emit(f"Ribbon click engine {_RIBBON_VERSION} — target {title!r}")
+    coord_tried = False
+    focus_done = False
 
     try:
         root_hwnd = int(win.handle)
     except Exception:
         root_hwnd = 0
 
-    while time.monotonic() < deadline:
-        focus_main_window(win, log=emit)
-        fg = foreground_window_title()
-        if fg and fg != last_fg:
-            emit(f"Foreground window: {fg!r}")
-            last_fg = fg
-
-        clicked = False
+    def _try_uia_click_once() -> bool:
+        nonlocal saw_any
         for ctrl_type in control_types:
             for target in _matching_controls(
                 win, title=title, control_types=(ctrl_type,)
@@ -554,32 +550,44 @@ def click_ribbon(
                     continue
                 emit(f"Clicking {title!r} ({ctrl_type}) via UIA…")
                 if _try_uia_click(target, win=win, log=emit):
-                    clicked = True
-                    break
-            if clicked:
-                break
-
-        if not clicked and root_hwnd:
+                    return True
+        if root_hwnd:
             for ch in _enum_hwnds_with_text(root_hwnd, title):
                 emit(f"Clicking {title!r} via Win32 hwnd {ch}…")
                 if _click_hwnd(ch, log=emit):
-                    clicked = True
-                    break
+                    return True
+        return False
 
-        if clicked:
+    def _try_coordinate_fallback() -> bool:
+        if _name_matches(title, "import-export") or _name_matches(title, "import export"):
+            emit(f"Coordinate click for Import-Export…")
+            return _click_import_export_by_position(win, log=emit)
+        if _name_matches(title, "batch import"):
+            emit(f"Coordinate click for Batch Import…")
+            return _click_batch_import_by_position(win, log=emit)
+        return False
+
+    while time.monotonic() < deadline:
+        if not focus_done:
+            focus_main_window(win, log=emit)
+            focus_done = True
+
+        if _try_uia_click_once():
             time.sleep(0.25)
             return
+
+        now = time.monotonic()
+        if not coord_tried and now >= uia_deadline:
+            coord_tried = True
+            if _try_coordinate_fallback():
+                time.sleep(0.25)
+                return
+
         time.sleep(poll_s)
 
-    if _name_matches(title, "import-export") or _name_matches(title, "import export"):
-        emit("UIA did not find Import-Export tab — trying coordinate click…")
-        if _click_import_export_by_position(win, log=emit):
-            return
-
-    if _name_matches(title, "batch import"):
-        emit("UIA did not find Batch Import — trying coordinate click…")
-        if _click_batch_import_by_position(win, log=emit):
-            return
+    if not coord_tried and _try_coordinate_fallback():
+        time.sleep(0.25)
+        return
 
     _dump_ribbon_names(win, log=emit)
     hint = "no matching controls found" if not saw_any else "controls not clickable"
@@ -599,8 +607,8 @@ def ensure_import_export_tab(
         emit("Import-Export ribbon already active — skipping tab click.")
         return
 
-    tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 15.0)
-    emit("Clicking Import-Export tab…")
+    tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
+    emit("Opening Import-Export tab…")
     click_ribbon(
         win,
         title="Import-Export",
@@ -609,16 +617,16 @@ def ensure_import_export_tab(
         log=emit,
     )
 
-    verify_s = _step_wait_s("WORLDSHIP_AFTER_TAB_S", 0.5)
-    # wait for ribbon to switch
-    deadline = time.monotonic() + max(verify_s, 3.0)
-    while time.monotonic() < deadline:
-        if ribbon_action_available(
-            win, "Batch Import", ("Button", "MenuItem", "SplitButton")
-        ):
-            emit("Verified: Batch Import visible on ribbon.")
-            return
-        time.sleep(0.12)
+    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 2.0)
+    if after_tab_s > 0:
+        emit(f"Waiting {after_tab_s:.1f}s for Import-Export ribbon…")
+        time.sleep(after_tab_s)
+
+    if ribbon_action_available(
+        win, "Batch Import", ("Button", "MenuItem", "SplitButton")
+    ):
+        emit("Verified: Batch Import visible on ribbon.")
+        return
 
     emit("WARN: Batch Import not visible after tab click — retrying Import-Export…")
     click_ribbon(
@@ -629,14 +637,14 @@ def ensure_import_export_tab(
         log=emit,
     )
 
-    deadline = time.monotonic() + 4.0
-    while time.monotonic() < deadline:
-        if ribbon_action_available(
-            win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
-        ):
-            emit("Verified: Batch Import visible on ribbon (after retry).")
-            return
-        time.sleep(0.12)
+    if after_tab_s > 0:
+        time.sleep(after_tab_s)
+
+    if ribbon_action_available(
+        win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
+    ):
+        emit("Verified: Batch Import visible on ribbon (after retry).")
+        return
 
     _dump_ribbon_names(win, log=emit)
     raise RuntimeError(
@@ -651,9 +659,9 @@ def click_batch_import(
     log: Callable[[str], None] | None = None,
 ) -> None:
     emit = log or _log_default
-    timeout_s = _step_wait_s("WORLDSHIP_BATCH_IMPORT_CLICK_TIMEOUT_S", 20.0)
-    emit("Clicking Batch Import…")
+    timeout_s = _step_wait_s("WORLDSHIP_BATCH_IMPORT_CLICK_TIMEOUT_S", 5.0)
     focus_main_window(win, log=emit)
+    emit("Opening Batch Import…")
     custom = (os.environ.get("WORLDSHIP_BATCH_IMPORT_LABEL") or "").strip()
     labels = [custom] if custom else []
     labels.extend(["Batch Import", "Batch  Import"])

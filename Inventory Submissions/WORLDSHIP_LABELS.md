@@ -6,6 +6,13 @@ After batch import processing, WorldShip shows **Save Print Output As** once per
 
 **All SAVE rows at the top, then all warehouse-print rows at the bottom.** Do not put a print row between save rows.
 
+SAVE vs print is read from the **LABEL_PR** column in CornerstoneMaster (column X by default):
+
+- **LabelPDF** — save label PDF to the share (phase 1)
+- **Label1** — warehouse print, no Save dialog (phase 2)
+
+A warehouse vendor on the SKU map does **not** override LABEL_PR. (Example: Cornerstone SKUs with LabelPDF still save to the share even though Cornerstone is a warehouse vendor.)
+
 WorldShip shows Save dialogs in the same order as the batch file. Mixed rows caused label 2+ to use the wrong PO/folder. If a SAVE row appears after a print row, the run stops immediately with a clear error.
 
 Example (6 shipments):
@@ -56,6 +63,17 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 - Post-save check: correct path, name, and minimum size (`WORLDSHIP_MIN_LABEL_BYTES`, default 800).
 
 ## Env tuning
+
+**Startup wizard pacing** (Import-Export → Batch Import → auto-process → Next → preview Next):
+
+- `WORLDSHIP_AFTER_FOREGROUND_S` — after WorldShip is foreground, before Import-Export tab (default 3)
+- `WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S` — after Import-Export tab, before Batch Import (default 2)
+- `WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S` — after Batch Import, before auto-process checkbox (default 8)
+- `WORLDSHIP_BEFORE_NEXT_WAIT_S` — after checkbox, before first Next (default 2)
+- `WORLDSHIP_PREVIEW_BEFORE_NEXT_S` — on Import/Export Preview, before Next (default 4)
+- `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2; fixes long gap when log mentions a click but nothing happens)
+
+**Label save phase:**
 
 - `WORLDSHIP_SAVE_BETWEEN_LABELS_S` — pause between save dialogs (default 2)
 - `WORLDSHIP_SAVE_AFTER_FOLDER_S` — pause after folder path Enter before typing PO (default 1.0)

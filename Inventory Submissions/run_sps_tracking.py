@@ -1185,6 +1185,206 @@ def ensure_document_type_order(page: Page) -> None:
     raise RuntimeError("Could not set Document Type filter to 'Order'.")
 
 
+def _status_multiselect_roots(page: Page):
+    """Yield visible Status multiselect containers (Advanced Search)."""
+    for ctx in _contexts(page):
+        for sel in (
+            "[data-testid='advancedSearchStatusesMultiselect']",
+            "[data-testid*='StatusesMultiselect']",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                for i in range(min(loc.count(), 3)):
+                    node = loc.nth(i)
+                    if node.is_visible():
+                        yield node
+            except Exception:
+                continue
+
+
+def _status_filter_tags(page: Page) -> list[str]:
+    tags: list[str] = []
+    for root in _status_multiselect_roots(page):
+        for sel in (
+            "[class*='tag']",
+            "[class*='chip']",
+            "[class*='multiselect__selected']",
+        ):
+            try:
+                loc = root.locator(sel)
+                for i in range(min(loc.count(), 12)):
+                    text = (loc.nth(i).inner_text(timeout=500) or "").strip()
+                    if not text:
+                        continue
+                    for part in re.split(r"[\n\r×x]+", text):
+                        part = part.strip()
+                        if part and part not in tags:
+                            tags.append(part)
+            except Exception:
+                continue
+    if tags:
+        return tags
+    for ctx in _contexts(page):
+        for sel in (
+            "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'tag') or contains(@class,'chip')]",
+        ):
+            try:
+                loc = ctx.locator(sel)
+                for i in range(min(loc.count(), 8)):
+                    text = (loc.nth(i).inner_text(timeout=500) or "").strip()
+                    if text and text not in tags:
+                        tags.append(text)
+            except Exception:
+                continue
+    return tags
+
+
+def _status_filter_is_new_only(page: Page) -> bool:
+    tags = [t.lower() for t in _status_filter_tags(page)]
+    if not tags:
+        return False
+    return tags == ["new"]
+
+
+def clear_status_filter(page: Page) -> None:
+    """Remove every Status chip (New, Cancelled, etc.) before applying a single status."""
+    remove_selectors = (
+        "button[aria-label*='Remove']",
+        "button[title*='Remove']",
+        "[role='button'][aria-label*='Remove']",
+        "button:has(.sps-icon-close)",
+        ".sps-icon-close",
+        "[class*='close']",
+    )
+    for _ in range(16):
+        removed = False
+        for root in _status_multiselect_roots(page):
+            for sel in remove_selectors:
+                try:
+                    loc = root.locator(sel)
+                    for i in range(min(loc.count(), 8)):
+                        btn = loc.nth(i)
+                        if not btn.is_visible():
+                            continue
+                        try:
+                            btn.click(timeout=700)
+                        except Exception:
+                            btn.click(timeout=700, force=True)
+                        removed = True
+                        page.wait_for_timeout(100)
+                        break
+                    if removed:
+                        break
+                except Exception:
+                    continue
+            if removed:
+                break
+        if not removed:
+            for ctx in _contexts(page):
+                for sel in (
+                    "xpath=//*[contains(normalize-space(.), 'Status')]/following::button[contains(@aria-label,'Remove') or contains(@title,'Remove')][1]",
+                    "xpath=//*[contains(normalize-space(.), 'Status')]/following::*[contains(@class,'close') or contains(@class,'sps-icon-close')][1]",
+                ):
+                    try:
+                        loc = ctx.locator(sel)
+                        if loc.count() == 0 or not loc.first.is_visible():
+                            continue
+                        loc.first.click(timeout=700, force=True)
+                        removed = True
+                        page.wait_for_timeout(100)
+                        break
+                    except Exception:
+                        continue
+                if removed:
+                    break
+        if not removed:
+            break
+    for ctx in _contexts(page):
+        for sel in _status_input_selectors():
+            try:
+                loc = ctx.locator(sel)
+                if loc.count() == 0:
+                    continue
+                inp = loc.first
+                if not inp.is_visible():
+                    continue
+                try:
+                    inp.click(timeout=600, force=True)
+                except Exception:
+                    pass
+                try:
+                    inp.fill("", timeout=500)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+
+def ensure_status_new(page: Page) -> None:
+    """Set Advanced Search Status filter to New only (no Cancelled chip)."""
+    clear_status_filter(page)
+    for attempt in range(1, 7):
+        clear_click_blockers(page)
+        field = None
+        for ctx in _contexts(page):
+            for sel in _status_input_selectors():
+                try:
+                    loc = ctx.locator(sel)
+                    if loc.count() == 0:
+                        continue
+                    cand = loc.first
+                    cand.wait_for(state="visible", timeout=1_500)
+                    field = cand
+                    break
+                except Exception:
+                    continue
+            if field is not None:
+                break
+        if field is None:
+            page.wait_for_timeout(180)
+            continue
+        try:
+            field.click(timeout=900, force=True)
+        except Exception:
+            pass
+        try:
+            field.fill("", timeout=700)
+        except Exception:
+            pass
+        field.type("New", delay=30)
+        picked = click_first_visible(
+            page,
+            [
+                "xpath=//*[@role='option' and normalize-space(.)='New']",
+                "li[role='option']:has-text('New'):not(:has-text('Renew')):not(:has-text('Cancelled'))",
+                "[role='option']:has-text('New'):not(:has-text('Renew')):not(:has-text('Cancelled'))",
+            ],
+            timeout_ms=2_500,
+        )
+        if not picked:
+            try:
+                field.press("ArrowDown")
+                page.wait_for_timeout(120)
+                field.press("Enter")
+            except Exception:
+                pass
+        page.wait_for_timeout(250)
+        tags = _status_filter_tags(page)
+        if any("cancelled" in t.lower() for t in tags):
+            print(
+                f"WARN: Status still includes Cancelled ({tags!r}); clearing chips and retrying…",
+                flush=True,
+            )
+            clear_status_filter(page)
+            continue
+        if _status_filter_is_new_only(page):
+            print(f"Status filter confirmed as 'New' only on attempt {attempt}.", flush=True)
+            return
+        page.wait_for_timeout(180)
+    tags = _status_filter_tags(page)
+    raise RuntimeError(f"Could not set Status filter to 'New' only (chips: {tags!r}).")
+
+
 def _document_type_filter_is_order(page: Page) -> bool:
     """True when the Document Type chip is exactly Order (not Forwarded Order)."""
     for ctx in _contexts(page):

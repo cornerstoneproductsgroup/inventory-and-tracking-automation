@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from automation.fedex_batch_config import (
     DEFAULT_BROWSER_PROFILE_DIR,
     DEFAULT_LOGIN_URL,
     STORAGE_STATE,
+    LOWES_LABELS_ROOT,
     WAREHOUSE_LABEL_QUEUE_DIR,
     label_save_timeout_s,
     resolve_fedex_warehouse_label_printer,
@@ -36,6 +38,7 @@ from automation.fedex_batch_config import (
     shipment_report_download_timeout_ms,
     upload_poll_interval_s,
     upload_poll_timeout_s,
+    lowes_fedex_warehouse_daily_path,
     vendor_label_pdf_path,
     warehouse_after_print_ms,
     warehouse_label_queue_path,
@@ -2663,20 +2666,62 @@ def _warehouse_labels_use_queue() -> bool:
     return warehouse_label_print_mode() == "queue"
 
 
-def _save_warehouse_label_to_queue(
+def _warehouse_labels_use_edge() -> bool:
+    return warehouse_label_print_mode() == "edge"
+
+
+def _copy_warehouse_pdf_to_queue(share_path: Path, vendor: str, order_date: date | None) -> None:
+    if not _warehouse_labels_use_queue():
+        return
+    queue_dest = warehouse_label_queue_path(vendor, order_date)
+    queue_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(share_path, queue_dest)
+    _log(f"Warehouse label copied to print queue: {queue_dest}")
+
+
+def _save_warehouse_label_to_share(
     label_tab: Page,
     context: BrowserContext,
     cfg: dict[str, Any],
     *,
     vendor: str,
     order_date: date | None,
-) -> bool:
-    """Save label PDF to the print queue; background watcher sends it to the Zebra."""
-    dest = warehouse_label_queue_path(vendor, order_date)
+) -> Path | None:
+    """Save warehouse vendor labels to the share (same layout as non-warehouse vendors)."""
+    dest = vendor_label_pdf_path(vendor, order_date)
     if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
-        return False
-    _log(f"Warehouse label saved to print queue: {dest}")
-    return True
+        return None
+    _log(f"Warehouse label saved to share: {dest}")
+    _copy_warehouse_pdf_to_queue(dest, vendor, order_date)
+    return dest
+
+
+def _write_lowes_fedex_warehouse_daily_pdf(
+    paths: list[Path], order_date: date | None
+) -> Path | None:
+    """Merge today's warehouse FedEx label PDFs into the daily vendor orders folder."""
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path.is_file() or path.stat().st_size < 200:
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    if not unique:
+        return None
+    dest = lowes_fedex_warehouse_daily_path(order_date)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if len(unique) == 1:
+        shutil.copy2(unique[0], dest)
+    else:
+        _merge_pdf_files(unique, dest)
+        if not _wait_label_pdf_on_disk(dest):
+            return None
+    _log(f"Warehouse labels combined for daily vendor orders: {dest}")
+    return dest
 
 
 def _capture_label_from_finalize(
@@ -2720,28 +2765,26 @@ def _finalize_and_save_vendor_group(
         label_tab = _capture_label_from_finalize(page, context, cfg, orders=group)
         try:
             if warehouse:
-                if _warehouse_labels_use_queue():
-                    ok = _save_warehouse_label_to_queue(
-                        label_tab,
-                        context,
-                        cfg,
-                        vendor=vendor,
-                        order_date=order_date,
-                    )
-                    if not ok:
-                        return False, 0
-                    dest = warehouse_label_queue_path(vendor, order_date)
-                    pages = _count_pdf_pages(dest)
-                    return True, pages or len(group)
-                printer = _zebra_label_printer()
-                ok = _print_warehouse_label_with_fallback(
+                share_path = _save_warehouse_label_to_share(
                     label_tab,
                     context,
                     cfg,
-                    printer=printer,
-                    order_ref=refs[0] if len(refs) == 1 else f"{vendor} ({len(group)} labels)",
+                    vendor=vendor,
+                    order_date=order_date,
                 )
-                return ok, len(group) if ok else 0
+                if share_path is None:
+                    return False, 0
+                pages = _count_pdf_pages(share_path)
+                if _warehouse_labels_use_edge():
+                    printer = _zebra_label_printer()
+                    _print_warehouse_label_with_fallback(
+                        label_tab,
+                        context,
+                        cfg,
+                        printer=printer,
+                        order_ref=refs[0] if len(refs) == 1 else f"{vendor} ({len(group)} labels)",
+                    )
+                return True, pages or len(group)
 
             dest = vendor_label_pdf_path(vendor, order_date)
             if not _save_pdf_from_label_tab(label_tab, context, dest, cfg):
@@ -2755,7 +2798,7 @@ def _finalize_and_save_vendor_group(
             return True, pages
         finally:
             _close_label_tabs(page, context, pages_before)
-            if warehouse and not _warehouse_labels_use_queue():
+            if warehouse and _warehouse_labels_use_edge():
                 settle_ms = warehouse_after_print_ms()
             else:
                 settle_ms = 1200
@@ -2794,20 +2837,19 @@ def _process_vendor_group_labels_sequential(
             )
             try:
                 if warehouse:
-                    if _warehouse_labels_use_queue():
-                        fd, tmp_name = tempfile.mkstemp(
-                            suffix=".pdf", prefix=f"fedex_wh_label_{idx}_"
-                        )
-                        os.close(fd)
-                        part = Path(tmp_name)
-                        try:
-                            if _save_pdf_from_label_tab(label_tab, context, part, cfg):
-                                label_parts.append(part)
-                                part = None
-                        finally:
-                            if part is not None:
-                                part.unlink(missing_ok=True)
-                    elif _print_warehouse_label_with_fallback(
+                    fd, tmp_name = tempfile.mkstemp(
+                        suffix=".pdf", prefix=f"fedex_wh_label_{idx}_"
+                    )
+                    os.close(fd)
+                    part = Path(tmp_name)
+                    try:
+                        if _save_pdf_from_label_tab(label_tab, context, part, cfg):
+                            label_parts.append(part)
+                            part = None
+                    finally:
+                        if part is not None:
+                            part.unlink(missing_ok=True)
+                    if _warehouse_labels_use_edge() and _print_warehouse_label_with_fallback(
                         label_tab,
                         context,
                         cfg,
@@ -2835,23 +2877,24 @@ def _process_vendor_group_labels_sequential(
             _log(f"WARN: sequential save failed for {order.reference!r}: {exc}")
 
     if warehouse:
-        if _warehouse_labels_use_queue():
-            if not label_parts:
+        if not label_parts:
+            return (printed_jobs > 0, printed_jobs) if _warehouse_labels_use_edge() else (False, 0)
+        share_dest = vendor_label_pdf_path(vendor, order_date)
+        if len(label_parts) == 1:
+            if not _persist_label_pdf_to_disk(share_dest, label_parts[0].read_bytes()):
                 return False, 0
-            dest = warehouse_label_queue_path(vendor, order_date)
-            if len(label_parts) == 1:
-                if not _persist_label_pdf_to_disk(dest, label_parts[0].read_bytes()):
-                    return False, 0
-            else:
-                _merge_pdf_files(label_parts, dest)
-                if not _wait_label_pdf_on_disk(dest):
-                    return False, 0
-            for part in label_parts:
-                part.unlink(missing_ok=True)
-            pages = _count_pdf_pages(dest)
-            _log(f"Warehouse label saved to print queue: {dest}")
-            return True, pages or len(label_parts)
-        return printed_jobs > 0, printed_jobs
+        else:
+            _merge_pdf_files(label_parts, share_dest)
+            if not _wait_label_pdf_on_disk(share_dest):
+                return False, 0
+        for part in label_parts:
+            part.unlink(missing_ok=True)
+        _log(f"Warehouse label saved to share: {share_dest}")
+        _copy_warehouse_pdf_to_queue(share_dest, vendor, order_date)
+        pages = _count_pdf_pages(share_dest)
+        if _warehouse_labels_use_edge():
+            return printed_jobs > 0, max(printed_jobs, pages or len(label_parts))
+        return True, pages or len(label_parts)
 
     if not label_parts:
         return False, 0
@@ -2933,9 +2976,10 @@ def _process_vendor_groups(
     *,
     order_date: date | None,
     expected_row_count: int = 0,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[Path]]:
     saved_pdfs = 0
     printed_groups = 0
+    warehouse_share_paths: list[Path] = []
     warehouse_vendors = load_warehouse_print_vendors()
     if warehouse_vendors:
         _log(
@@ -2989,16 +3033,19 @@ def _process_vendor_groups(
         skus = ", ".join(o.sku for o in group)
         _log(f"Vendor group {vendor!r}: {len(group)} shipment(s) — SKU(s): {skus}")
         if is_warehouse_print_vendor(vendor):
+            share_dest = vendor_label_pdf_path(vendor, order_date)
+            daily_dest = lowes_fedex_warehouse_daily_path(order_date)
+            _log(f"  → Warehouse vendor — save PDF: {share_dest}")
+            _log(f"  → Also included in daily file: {daily_dest.name}")
             if _warehouse_labels_use_queue():
-                dest = warehouse_label_queue_path(vendor, order_date)
                 _log(
-                    f"  → Warehouse print queue → Zebra {_zebra_label_printer()!r} "
-                    f"({_zebra_label_printer_source()}): save PDF, watcher prints — {dest}"
+                    f"  → Print queue copy → Zebra {_zebra_label_printer()!r} "
+                    f"({_zebra_label_printer_source()}): {warehouse_label_queue_path(vendor, order_date)}"
                 )
-            else:
+            elif _warehouse_labels_use_edge():
                 _log(
-                    f"  → Zebra ({_zebra_label_printer()!r}): warehouse-print vendor — "
-                    "Edge print UI (legacy mode)"
+                    f"  → Legacy Edge print on Zebra ({_zebra_label_printer()!r}) "
+                    f"after saving to share"
                 )
         else:
             dest = vendor_label_pdf_path(vendor, order_date)
@@ -3014,11 +3061,22 @@ def _process_vendor_groups(
         )
         if is_warehouse_print_vendor(vendor):
             if ok:
-                printed_groups += 1
+                saved_pdfs += 1
+                share_dest = vendor_label_pdf_path(vendor, order_date)
+                if share_dest.is_file():
+                    warehouse_share_paths.append(share_dest)
+                if _warehouse_labels_use_queue() or _warehouse_labels_use_edge():
+                    printed_groups += 1
+                _log(
+                    f"Saved {label_count} warehouse label(s) for {vendor!r} "
+                    f"({_count_pdf_pages(share_dest)} page(s) in {share_dest.name})"
+                )
             elif _warehouse_labels_use_queue():
-                _log(f"WARN: could not save warehouse label PDF to print queue for {vendor!r}")
+                _log(f"WARN: could not save warehouse label PDF for {vendor!r}")
+            elif _warehouse_labels_use_edge():
+                _log(f"WARN: could not save/print warehouse labels for {vendor!r}")
             else:
-                _log(f"WARN: could not print all labels on Zebra for {vendor!r}")
+                _log(f"WARN: could not save warehouse label PDF for {vendor!r}")
         elif ok:
             saved_pdfs += 1
             if len(group) > 1:
@@ -3030,7 +3088,7 @@ def _process_vendor_groups(
         else:
             _log(f"WARN: could not save label PDF for {vendor!r}")
 
-    return saved_pdfs, printed_groups
+    return saved_pdfs, printed_groups, warehouse_share_paths
 
 
 def _select_all_checkbox_selectors(cfg: dict[str, Any]) -> list[str]:
@@ -3286,19 +3344,26 @@ def run_fedex_batch(
 
     warehouse_watcher: FedexWarehouseLabelWatcher | None = None
     if warehouse_vendors:
-        try:
-            zebra, zebra_source = resolve_fedex_warehouse_label_printer()
-            _log(f"Warehouse Zebra printer: {zebra!r} (from {zebra_source})")
-        except Exception as exc:
-            raise FedexBatchError(
-                f"Cannot resolve Zebra printer for warehouse labels: {exc}"
-            ) from exc
+        mode = warehouse_label_print_mode()
+        _log(
+            f"Warehouse labels: save to share ({LOWES_LABELS_ROOT}) + "
+            f"daily vendor orders ({lowes_fedex_warehouse_daily_path(d).parent}); "
+            f"mode={mode!r}"
+        )
+        if mode in ("queue", "edge"):
+            try:
+                zebra, zebra_source = resolve_fedex_warehouse_label_printer()
+                _log(f"Warehouse Zebra printer: {zebra!r} (from {zebra_source})")
+            except Exception as exc:
+                raise FedexBatchError(
+                    f"Cannot resolve Zebra printer for warehouse labels: {exc}"
+                ) from exc
         if _warehouse_labels_use_queue():
-            _log(f"Warehouse labels: save to queue at {WAREHOUSE_LABEL_QUEUE_DIR}")
+            _log(f"Warehouse labels: also copy to print queue at {WAREHOUSE_LABEL_QUEUE_DIR}")
             warehouse_watcher = FedexWarehouseLabelWatcher.for_queue_dir(WAREHOUSE_LABEL_QUEUE_DIR)
             warehouse_watcher.start()
-        else:
-            _log("Warehouse labels: legacy Edge print UI (FEDEX_WAREHOUSE_LABEL_PRINT_MODE=edge)")
+        elif _warehouse_labels_use_edge():
+            _log("Warehouse labels: also try legacy Edge print UI after each save")
 
     if manual_login:
         _log("Login mode: manual (browser sign-in, no auto-fill).")
@@ -3343,7 +3408,7 @@ def run_fedex_batch(
                 _open_batch_shipments(
                     page, cfg, csv_basename, expected_ready=ready_count
                 )
-                saved_pdfs, queued_groups = _process_vendor_groups(
+                saved_pdfs, queued_groups, warehouse_paths = _process_vendor_groups(
                     page,
                     context,
                     cfg,
@@ -3351,7 +3416,13 @@ def run_fedex_batch(
                     expected_row_count=ready_count,
                 )
                 _log(f"Saved {saved_pdfs} vendor label PDF(s) to share.")
-                if warehouse_watcher is None and queued_groups:
+                daily_wh = _write_lowes_fedex_warehouse_daily_pdf(warehouse_paths, d)
+                if daily_wh is not None:
+                    _log(
+                        f"Daily warehouse FedEx labels: {daily_wh} "
+                        f"({_count_pdf_pages(daily_wh)} page(s))"
+                    )
+                if warehouse_watcher is None and queued_groups and _warehouse_labels_use_edge():
                     _log(f"Printed {queued_groups} warehouse vendor group(s) on Zebra.")
 
                 if ready_count > 0 and saved_pdfs == 0 and queued_groups == 0:

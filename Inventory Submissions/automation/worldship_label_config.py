@@ -42,6 +42,8 @@ LABEL_ROOTS: dict[str, Path] = {
 COL_SKU = (os.environ.get("WORLDSHIP_COL_SKU") or "L").strip().upper()
 COL_PO = (os.environ.get("WORLDSHIP_COL_PO") or "O").strip().upper()
 COL_RETAILER = (os.environ.get("WORLDSHIP_COL_RETAILER") or "U").strip().upper()
+# LabelPDF = save to share; Label1 = warehouse print (WorldShip direct to printer).
+COL_LABEL_PR = (os.environ.get("WORLDSHIP_COL_LABEL_PR") or "X").strip().upper()
 DATA_START_ROW = int((os.environ.get("WORLDSHIP_DATA_START_ROW") or "2").strip() or "2")
 
 # SKU → vendor folder maps (copies of Order Splitter vendor_map_*.xlsx on the Cornerstone share).

@@ -169,9 +169,9 @@ class FedexWarehouseLabelWatcher:
 
 
 def warehouse_label_print_mode() -> str:
-    """``queue`` (default): save PDFs to queue folder for watcher. ``edge``: legacy in-browser print."""
-    mode = (os.environ.get("FEDEX_WAREHOUSE_LABEL_PRINT_MODE") or "queue").strip().lower()
-    return mode if mode in ("queue", "edge") else "queue"
+    from automation.fedex_batch_config import warehouse_label_print_mode as _mode
+
+    return _mode()
 
 
 def drain_timeout_s() -> float:

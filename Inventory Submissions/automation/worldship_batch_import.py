@@ -396,6 +396,11 @@ def _resolve_main_window(app, *, cold_start: bool):
         else:
             _log("Import-Export tab is ready (no blocking dialogs).")
         return win
+    if not cold_start and not _blocking_dialog_visible():
+        _log("WorldShip is open — proceeding (warm start, skipping UIA ready poll).")
+        win = app.window(title_re=WORLDSHIP_TITLE_RE)
+        _focus_main_window(win)
+        return win
     if not cold_start:
         _log("WorldShip is open but Import-Export is not ready yet — brief wait…")
     return _wait_until_import_export_ready(
@@ -781,7 +786,7 @@ def _click_preview_next(preview: ModalDialog) -> None:
     import win32gui
 
     hwnd = preview.hwnd
-    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 0.25)
+    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 4.0)
     if settle_s > 0:
         _log(f"Waiting {settle_s:.1f}s for preview dialog to finish loading…")
         time.sleep(settle_s)
@@ -1535,20 +1540,29 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     main = _resolve_main_window(app, cold_start=cold_start)
 
     _focus_main_window(main)
-    time.sleep(0.4)
+    after_fg_s = _step_wait_s("WORLDSHIP_AFTER_FOREGROUND_S", 3.0)
+    if after_fg_s > 0:
+        _log(f"Waiting {after_fg_s:.1f}s after foreground before Import-Export tab…")
+        time.sleep(after_fg_s)
+
     _ensure_import_export_tab(main)
 
     from automation.worldship_ribbon_click import click_batch_import
 
     click_batch_import(main, log=_log)
 
-    _log("Waiting for Batch Import wizard…")
-    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=8)
+    after_batch_open_s = _step_wait_s("WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S", 8.0)
+    if after_batch_open_s > 0:
+        _log(f"Waiting {after_batch_open_s:.1f}s for Batch Import wizard…")
+        time.sleep(after_batch_open_s)
+    else:
+        _log("Waiting for Batch Import wizard…")
+    wizard = _wait_for_batch_import_wizard(app, main, timeout_s=8.0)
 
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
     _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=5)
 
-    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 1.5)
+    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 2.0)
     if before_next_s > 0:
         _log(f"Waiting {before_next_s:.1f}s before Next…")
         time.sleep(before_next_s)

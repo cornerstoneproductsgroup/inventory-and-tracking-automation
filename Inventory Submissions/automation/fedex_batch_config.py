@@ -23,6 +23,16 @@ LOWES_LABELS_ROOT = _p(
     str(_PACKING_SLIPS / "3-Lowe's" / "1-Fedex Shipping Labels"),
 )
 
+DAILY_VENDOR_ORDERS_DIR = _p(
+    "PULL_ORDERS_DAILY_VENDOR_DIR",
+    str(
+        _PACKING_SLIPS
+        / "1-Orders Before Extraction"
+        / "Order Splitter Output"
+        / "z- Daily Vendor Orders"
+    ),
+)
+
 WAREHOUSE_LABEL_QUEUE_DIR = _p(
     "FEDEX_WAREHOUSE_LABEL_QUEUE_DIR",
     str(LOWES_LABELS_ROOT / "z - Warehouse Print Queue"),
@@ -106,6 +116,22 @@ def vendor_label_pdf_path(vendor_folder: str, order_date: date | None = None) ->
     """e.g. ...\\Agra Life\\Lowe's Agra Life 6-1-2026.pdf"""
     vendor = (vendor_folder or "Unknown").strip()
     return LOWES_LABELS_ROOT / vendor / _vendor_label_basename(vendor_folder, order_date)
+
+
+def lowes_fedex_warehouse_daily_path(order_date: date | None = None) -> Path:
+    """Combined warehouse FedEx labels — same folder as Warehouse Print PDFs."""
+    d = order_date or date.today()
+    return DAILY_VENDOR_ORDERS_DIR / f"Lowe's Fedex Labels {date_stamp(d)}.pdf"
+
+
+def warehouse_label_print_mode() -> str:
+    """
+    ``share`` (default): save warehouse labels to the share + daily vendor folder.
+    ``queue``: also copy to print queue for Zebra watcher.
+    ``edge``: legacy in-browser Edge print (no share-only path).
+    """
+    mode = (os.environ.get("FEDEX_WAREHOUSE_LABEL_PRINT_MODE") or "share").strip().lower()
+    return mode if mode in ("share", "queue", "edge") else "share"
 
 
 def warehouse_label_queue_path(vendor_folder: str, order_date: date | None = None) -> Path:

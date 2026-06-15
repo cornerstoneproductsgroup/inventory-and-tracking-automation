@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from automation.worldship_cornerstone_master import is_cornerstone_warehouse_print_row
 from automation.warehouse_print_vendors import is_warehouse_print_vendor
 
 if TYPE_CHECKING:
@@ -48,16 +49,31 @@ def partition_worldship_label_rows(
 
     for order in orders:
         vendor = vendor_maps.lookup(order.sku, order.retailer_key)
-        if is_warehouse_print_vendor(vendor):
+        label_action = is_cornerstone_warehouse_print_row(order.label_pr)
+        if label_action is None:
+            warehouse_print = is_warehouse_print_vendor(vendor)
+        else:
+            warehouse_print = label_action
+            if label_action and not is_warehouse_print_vendor(vendor):
+                _log(
+                    f"WARN: row {order.row_number} LABEL_PR={order.label_pr!r} is print "
+                    f"but vendor {vendor!r} is not in the warehouse vendor list."
+                )
+            if not label_action and is_warehouse_print_vendor(vendor):
+                _log(
+                    f"WARN: row {order.row_number} LABEL_PR={order.label_pr!r} is save "
+                    f"but SKU maps to warehouse vendor {vendor!r} — using LABEL_PR."
+                )
+        if warehouse_print:
             in_print_section = True
             print_orders.append(order)
             continue
         if in_print_section:
             raise ValueError(
-                f"CornerstoneMaster row {order.row_number} is a SAVE row but appears "
-                f"after warehouse-print rows. Put all rows that save to the share at the "
-                f"top of the file, then all warehouse-print rows (SKU {order.sku!r}, "
-                f"PO {order.po!r})."
+                f"CornerstoneMaster row {order.row_number} is a SAVE row "
+                f"(LABEL_PR={order.label_pr!r}) but appears after warehouse-print rows. "
+                f"Put all LabelPDF rows at the top, then all Label1 rows at the bottom "
+                f"(SKU {order.sku!r}, PO {order.po!r})."
             )
         save_orders.append(order)
 
@@ -94,7 +110,8 @@ def log_worldship_label_work_plan(
             vendor = vendor_maps.lookup(item.order.sku, item.order.retailer_key)
             _log(
                 f"  save {item.index}/{n_save}: row {item.order.row_number} — "
-                f"{vendor!r} → {item.dest.parent.name}\\{item.dest.name}"
+                f"{vendor!r} (LABEL_PR={item.order.label_pr!r}) → "
+                f"{item.dest.parent.name}\\{item.dest.name}"
             )
     if n_print:
         _log("Phase 2 — warehouse PRINT rows (no Save dialog):")
@@ -102,5 +119,5 @@ def log_worldship_label_work_plan(
             vendor = vendor_maps.lookup(order.sku, order.retailer_key)
             _log(
                 f"  print: row {order.row_number} — {vendor!r} "
-                f"(SKU {order.sku!r}, PO {order.po!r})"
+                f"(LABEL_PR={order.label_pr!r}, SKU {order.sku!r}, PO {order.po!r})"
             )

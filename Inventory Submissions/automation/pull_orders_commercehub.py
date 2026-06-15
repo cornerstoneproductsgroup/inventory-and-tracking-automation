@@ -55,8 +55,16 @@ DOWNLOAD_TIMEOUT_MS = 120_000
 FILE_RESPONSE_TIMEOUT_MS = 90_000
 DIALOG_WAIT_MS = 20_000
 SAVE_AS_WAIT_S = 55.0
-RETAILER_SETTLE_MS = 2_500
-MERCHANT_VERIFY_RETRIES = 2
+def _retailer_settle_ms() -> int:
+    raw = (os.environ.get("PULL_ORDERS_RETAILER_SETTLE_MS") or "5000").strip()
+    try:
+        return max(1_000, int(raw))
+    except ValueError:
+        return 5_000
+
+
+RETAILER_SETTLE_MS = 5_000  # default; _settle_between_retailers uses _retailer_settle_ms()
+MERCHANT_VERIFY_RETRIES = 3
 
 # Export modal confirm (do not use row-level span.download-dialog-info__element here).
 DIALOG_DOWNLOAD_SELECTORS = (
@@ -544,6 +552,72 @@ def _is_file_response(response) -> bool:
     return any(url.endswith(ext) for ext in (".pdf", ".csv", ".neworders", ".zip"))
 
 
+def _suggested_filename_matches_key(name: str, key: str) -> bool:
+    """Reject only when the browser filename clearly names a different retailer."""
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+
+    def _markers(k: str) -> tuple[str, ...]:
+        if k == "lowes":
+            return ("lowe",)
+        if k == "depot":
+            return ("depot", "home depot")
+        if k == "thdso":
+            return ("special", "thdso")
+        return ()
+
+    for other_key in RETAILER_PULL_ORDER:
+        if other_key == key:
+            continue
+        for marker in _markers(other_key):
+            if marker in n:
+                return False
+    return True
+
+
+def _file_content_matches_retailer(path: Path, key: str) -> bool:
+    """Best-effort check that a saved PDF/CSV body matches the row we clicked."""
+    try:
+        blob = path.read_bytes()[:160_000]
+    except Exception:
+        return False
+    low = blob.lower()
+
+    def _has(fragment: bytes) -> bool:
+        return fragment in low
+
+    if key == "lowes":
+        return _has(b"lowe") and not (_has(b"home depot") and not _has(b"lowe"))
+    if key == "depot":
+        return _has(b"home depot") and not _has(b"special order")
+    if key == "thdso":
+        return _has(b"special order") or _has(b"thdso")
+    return True
+
+
+def _verify_saved_file_for_retailer(
+    path: Path, key: str, *, suggested_name: str = ""
+) -> None:
+    label = RETAILERS[key].label
+    if suggested_name and not _suggested_filename_matches_key(suggested_name, key):
+        raise RuntimeError(
+            f"Download filename {suggested_name!r} does not match {label} ({key!r})."
+        )
+    if path.suffix.lower() == ".csv":
+        detected = _read_csv_merchant_key(path)
+        if detected and detected != key:
+            raise RuntimeError(
+                f"CSV merchant {detected!r} does not match {label} ({key!r})."
+            )
+    elif path.suffix.lower() == ".pdf":
+        if not _file_content_matches_retailer(path, key):
+            raise RuntimeError(
+                f"PDF content does not look like {label} ({key!r}). "
+                "Wrong row may have been exported."
+            )
+
+
 def _filename_from_response(response) -> str:
     cd = response.headers.get("content-disposition") or ""
     match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\n]+)', cd, re.I)
@@ -554,15 +628,30 @@ def _filename_from_response(response) -> str:
     return name or "download.bin"
 
 
-def _save_response_body(response, dest: Path) -> Path:
+def _save_response_body(
+    response, dest: Path, *, expected_key: str | None = None
+) -> Path:
+    suggested = _filename_from_response(response)
+    if expected_key and suggested and not _suggested_filename_matches_key(
+        suggested, expected_key
+    ):
+        raise RuntimeError(
+            f"HTTP filename {suggested!r} does not match retailer {expected_key!r}."
+        )
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(response.body())
-    if not dest.is_file() or dest.stat().st_size < 100:
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.write_bytes(response.body())
+    if not part.is_file() or part.stat().st_size < 100:
         raise RuntimeError(f"HTTP response did not save a valid file: {dest}")
+    if expected_key:
+        _verify_saved_file_for_retailer(part, expected_key, suggested_name=suggested)
+    part.replace(dest)
     return dest
 
 
-def _save_download_object(download, dest: Path) -> Path:
+def _save_download_object(
+    download, dest: Path, *, expected_key: str | None = None
+) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     suggested = ""
     try:
@@ -571,19 +660,31 @@ def _save_download_object(download, dest: Path) -> Path:
             _log(f"Browser download filename: {suggested}")
     except Exception:
         pass
-    download.save_as(str(dest))
-    if not dest.is_file() or dest.stat().st_size < 100:
+    if expected_key and suggested and not _suggested_filename_matches_key(
+        suggested, expected_key
+    ):
+        raise RuntimeError(
+            f"Browser offered {suggested!r} but expected {RETAILERS[expected_key].label}."
+        )
+    part = dest.with_suffix(dest.suffix + ".part")
+    download.save_as(str(part))
+    if not part.is_file() or part.stat().st_size < 100:
         raise RuntimeError(f"Download did not save a valid file: {dest}")
+    if expected_key:
+        _verify_saved_file_for_retailer(part, expected_key, suggested_name=suggested)
+    if dest.exists():
+        dest.unlink()
+    part.replace(dest)
     return dest
 
 
 def _settle_between_retailers(page: Page) -> None:
     """Let the prior download finish and close modals before the next retailer row."""
     _dismiss_commercehub_overlays(page)
-    page.wait_for_timeout(RETAILER_SETTLE_MS)
+    page.wait_for_timeout(_retailer_settle_ms())
 
 
-def _try_native_save_as(dest: Path) -> bool:
+def _try_native_save_as(dest: Path, *, expected_key: str | None = None) -> bool:
     try:
         from automation.windows_save_as import fill_save_as_dialog, wait_for_save_as_dialog
     except ImportError:
@@ -592,8 +693,23 @@ def _try_native_save_as(dest: Path) -> bool:
     while time.monotonic() < deadline:
         if wait_for_save_as_dialog(timeout_s=2.0):
             remaining = max(10.0, deadline - time.monotonic())
-            if fill_save_as_dialog(dest, timeout_s=remaining):
-                return dest.is_file() and dest.stat().st_size >= 100
+            part = dest.with_suffix(dest.suffix + ".part")
+            if fill_save_as_dialog(part, timeout_s=remaining):
+                if not part.is_file() or part.stat().st_size < 100:
+                    continue
+                try:
+                    if expected_key:
+                        _verify_saved_file_for_retailer(part, expected_key)
+                except Exception:
+                    try:
+                        part.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise
+                if dest.exists():
+                    dest.unlink()
+                part.replace(dest)
+                return True
         time.sleep(0.35)
     return False
 
@@ -659,6 +775,7 @@ def _click_row_and_capture(
     dest: Path,
     *,
     retailer_label: str = "",
+    expected_key: str | None = None,
 ) -> Path:
     """
     Click row export, then confirm the export dialog Download, then save to dest.
@@ -692,10 +809,12 @@ def _click_row_and_capture(
         try:
             with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
                 _perform_click(export_btn)
-            return _save_download_object(dl_info.value, dest)
+            return _save_download_object(
+                dl_info.value, dest, expected_key=expected_key
+            )
         except PlaywrightTimeout:
             _log(f"{label}: form-export-button did not start browser download; trying Save As…")
-            if _try_native_save_as(dest):
+            if _try_native_save_as(dest, expected_key=expected_key):
                 _log(f"{label}: saved via Save As after form-export-button.")
                 return dest
 
@@ -706,7 +825,9 @@ def _click_row_and_capture(
             try:
                 with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as dl_info:
                     _perform_click(dialog)
-                return _save_download_object(dl_info.value, dest)
+                return _save_download_object(
+                    dl_info.value, dest, expected_key=expected_key
+                )
             except PlaywrightTimeout:
                 _log(
                     f"{label}: Download in modal did not start a browser download "
@@ -715,10 +836,12 @@ def _click_row_and_capture(
                 try:
                     with page.expect_download(timeout=25_000) as dl_info:
                         page.keyboard.press("Enter")
-                    return _save_download_object(dl_info.value, dest)
+                    return _save_download_object(
+                        dl_info.value, dest, expected_key=expected_key
+                    )
                 except PlaywrightTimeout:
                     pass
-            if _try_native_save_as(dest):
+            if _try_native_save_as(dest, expected_key=expected_key):
                 _log(f"{label}: saved via Save As after modal Download.")
                 return dest
         else:
@@ -735,7 +858,7 @@ def _click_row_and_capture(
             _click_dialog_if_open()
         resp = resp_info.value
         _log(f"Saved from HTTP response ({resp.status}): {dest.name}")
-        return _save_response_body(resp, dest)
+        return _save_response_body(resp, dest, expected_key=expected_key)
     except PlaywrightTimeout:
         pass
 
@@ -743,7 +866,9 @@ def _click_row_and_capture(
     try:
         with page.expect_download(timeout=25_000) as dl_info:
             _click_target()
-        return _save_download_object(dl_info.value, dest)
+        return _save_download_object(
+            dl_info.value, dest, expected_key=expected_key
+        )
     except PlaywrightTimeout:
         pass
 
@@ -766,7 +891,9 @@ def _click_row_and_capture(
                     except Exception:
                         btn.click(timeout=30_000, force=True)
                         break
-        return _save_download_object(dl_info.value, dest)
+        return _save_download_object(
+            dl_info.value, dest, expected_key=expected_key
+        )
     except PlaywrightTimeout:
         pass
 
@@ -776,7 +903,7 @@ def _click_row_and_capture(
     page.wait_for_timeout(700)
     _click_dialog_if_open()
     page.wait_for_timeout(500)
-    if _try_native_save_as(dest):
+    if _try_native_save_as(dest, expected_key=expected_key):
         _log(f"{label}: saved via Save As dialog.")
         return dest
 
@@ -796,9 +923,16 @@ def _download_retailer_file(
     dest: Path,
     *,
     retailer_label: str,
+    expected_key: str,
 ) -> Path:
     return _click_row_and_capture(
-        page, frame, row, target, dest, retailer_label=retailer_label
+        page,
+        frame,
+        row,
+        target,
+        dest,
+        retailer_label=retailer_label,
+        expected_key=expected_key,
     )
 
 
@@ -838,6 +972,7 @@ def _download_one_retailer_from_table(
                 click_target,
                 dest,
                 retailer_label=retailer_label,
+                expected_key=key,
             )
             if not path.is_file() or path.stat().st_size < 100:
                 raise RuntimeError(f"Download did not produce a valid file at {path}")
@@ -860,6 +995,12 @@ def _download_one_retailer_from_table(
         except Exception as exc:
             last_err = exc
             _log(f"WARN: {retailer_label} download attempt {attempt} failed: {exc}")
+            for stray in (dest, dest.with_suffix(dest.suffix + ".part")):
+                try:
+                    if stray.is_file():
+                        stray.unlink()
+                except Exception:
+                    pass
             _settle_between_retailers(page)
     if last_err is not None:
         raise last_err
