@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v7"
+_RIBBON_VERSION = "ribbon-click-v8"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -432,6 +432,21 @@ def _click_import_export_by_position(
     """Click Import-Export tab by offset from Home tab (when UIA names fail)."""
     from pywinauto import mouse
 
+    abs_coords = _env_screen_coords(
+        "WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"
+    )
+    if abs_coords is not None:
+        x, y = abs_coords
+        log(f"Coordinate click for Import-Export at ({x}, {y}) [calibrated ABS]…")
+        try:
+            focus_main_window(win, log=log)
+            mouse.click(button="left", coords=(x, y))
+            time.sleep(0.4)
+            return True
+        except Exception as exc:
+            log(f"WARN: coordinate Import-Export click: {exc}")
+            return False
+
     home_rect = None
     for el in _descendant_controls(win, "Home", ("TabItem", "Button")):
         try:
@@ -539,6 +554,18 @@ def _step_wait_s(env_key: str, default: float) -> float:
         return max(0.0, float(raw))
     except ValueError:
         return default
+
+
+def _env_screen_coords(x_key: str, y_key: str) -> tuple[int, int] | None:
+    """Optional absolute screen coords from .env (calibrated Remote Workstation)."""
+    x_raw = (os.environ.get(x_key) or "").strip()
+    y_raw = (os.environ.get(y_key) or "").strip()
+    if not x_raw or not y_raw:
+        return None
+    try:
+        return int(float(x_raw)), int(float(y_raw))
+    except ValueError:
+        return None
 
 
 def _batch_import_attempts() -> int:
@@ -734,9 +761,10 @@ def _click_batch_import_coordinate_grid(win, *, log: Callable[[str], None]) -> b
     anchor_x, anchor_y = anchor
 
     # Batch Import is the 2nd large button (after Keyed Import) on the left.
-    base_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 130.0)
+    # Calibrated Remote Workstation: ~95px right of left ribbon edge, 42px below tab strip.
+    base_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 95.0)
     base_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
-    x_deltas = (0.0, -35.0, -70.0, 35.0, 70.0, 105.0)
+    x_deltas = (0.0, -20.0, 20.0, -40.0, 40.0)
     y_deltas = (0.0, 10.0, -8.0, 18.0)
 
     focus_main_window(win, log=log)
@@ -771,12 +799,27 @@ def _click_batch_import_by_position(
     """
     from pywinauto import mouse
 
+    abs_coords = _env_screen_coords(
+        "WORLDSHIP_BATCH_IMPORT_ABS_X", "WORLDSHIP_BATCH_IMPORT_ABS_Y"
+    )
+    if abs_coords is not None:
+        x, y = abs_coords
+        log(f"Coordinate click for Batch Import at ({x}, {y}) [calibrated ABS]…")
+        try:
+            focus_main_window(win, log=log)
+            mouse.click(button="left", coords=(x, y))
+            time.sleep(0.35)
+            return True
+        except Exception as exc:
+            log(f"WARN: coordinate Batch Import click: {exc}")
+            return False
+
     anchor = _ribbon_content_anchor(win)
     if anchor is None:
         return False
     anchor_x, anchor_y = anchor
 
-    offset_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 130.0)
+    offset_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 95.0)
     offset_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
     x = int(anchor_x + offset_x)
     y = int(anchor_y + offset_y)
@@ -1018,11 +1061,11 @@ def click_batch_import(
         ensure_import_export_tab(win, log=emit)
 
     coordinate_strategies: list[tuple[str, Callable[[], bool]]] = [
-        ("coordinate grid", lambda: _click_batch_import_coordinate_grid(win, log=emit)),
         (
             "coordinate default",
             lambda: _click_batch_import_by_position(win, log=emit),
         ),
+        ("coordinate grid", lambda: _click_batch_import_coordinate_grid(win, log=emit)),
     ]
     uia_strategies: list[tuple[str, Callable[[], bool]]] = [
         ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),

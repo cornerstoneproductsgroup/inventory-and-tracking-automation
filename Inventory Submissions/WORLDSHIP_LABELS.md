@@ -74,7 +74,9 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 - `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2; fixes long gap when log mentions a click but nothing happens)
 - `WORLDSHIP_BATCH_IMPORT_ATTEMPTS` — full strategy rounds for Batch Import (default 6)
 - `WORLDSHIP_BATCH_IMPORT_VERIFY_S` — seconds to wait for wizard after each click try (default 3)
-- `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — offset from the **left ribbon edge** (Home tab) to Batch Import (2nd button; defaults 130 / 42). Not relative to the Import-Export tab on the right.
+- `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — offset from the **left ribbon edge** (Home tab) to Batch Import (defaults **95** / **42**, calibrated to screen point 1276, 232 on Remote Workstation)
+- `WORLDSHIP_IMPORT_EXPORT_ABS_X` / `WORLDSHIP_IMPORT_EXPORT_ABS_Y` — optional fixed screen click for Import-Export tab (e.g. 1464 / 182)
+- `WORLDSHIP_BATCH_IMPORT_ABS_X` / `WORLDSHIP_BATCH_IMPORT_ABS_Y` — optional fixed screen click for Batch Import (e.g. 1276 / 232)
 - `WORLDSHIP_REMOTE_WORKSTATION` — set to `1` to force coordinate-first ribbon clicks (auto-detected when window title contains "Remote Workstation")
 
 **Label save phase:**
