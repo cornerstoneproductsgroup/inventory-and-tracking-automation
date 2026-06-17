@@ -41,7 +41,7 @@ Example (6 shipments):
 2. **Phase 2** — Warehouse-print rows: WorldShip prints (may take many minutes); wait for **100%** and **Close**.
 3. **Phase 3** — Click **Close** on Automatic Processing Progress when enabled.
 4. **Phase 4** — **End of Day** → **Yes** → wait for processing.
-5. **Phase 5** — **Import-Export** → **Batch Export** → today’s date → **Next** → preview **Next** → **Save** on summary.
+5. **Phase 5** — **Import-Export** → **Batch Export** → check **All records on or after** → type today’s date manually (`18-May-2026` format) → **Next** → preview **Next** → **Save** on summary.
 
 ## Automatic Processing Progress — do not click Stop
 
@@ -66,14 +66,19 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 
 **Startup wizard pacing** (Import-Export → Batch Import → auto-process → Next → preview Next):
 
-- `WORLDSHIP_AFTER_FOREGROUND_S` — after WorldShip is foreground, before Import-Export tab (default 3)
-- `WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S` — after Import-Export tab, before Batch Import (default 2)
-- `WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S` — after Batch Import, before auto-process checkbox (default 8)
-- `WORLDSHIP_BEFORE_NEXT_WAIT_S` — after checkbox, before first Next (default 2)
-- `WORLDSHIP_PREVIEW_BEFORE_NEXT_S` — on Import/Export Preview, before Next (default 4)
-- `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2; fixes long gap when log mentions a click but nothing happens)
-- `WORLDSHIP_BATCH_IMPORT_ATTEMPTS` — full strategy rounds for Batch Import (default 6)
-- `WORLDSHIP_BATCH_IMPORT_VERIFY_S` — seconds to wait for wizard after each click try (default 3)
+On **Remote Workstation** (or when `WORLDSHIP_BATCH_IMPORT_ABS_X/Y` are set), **fast import** mode runs automatically — one coordinate click per ribbon button, shorter pauses. Override with `WORLDSHIP_FAST_IMPORT=0` or `=1`.
+
+| Setting | Standard default | Fast default (calibrated RDP) |
+|---------|------------------|-------------------------------|
+| `WORLDSHIP_AFTER_FOREGROUND_S` | 1.5 | 0.4 |
+| `WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S` | 0.75 | 0.3 |
+| `WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S` | 2.5 | 0 (poll wizard) |
+| `WORLDSHIP_BEFORE_NEXT_WAIT_S` | 0.75 | 0.35 |
+| `WORLDSHIP_PREVIEW_BEFORE_NEXT_S` | 2 | 1 |
+| `WORLDSHIP_BATCH_IMPORT_VERIFY_S` | 1.5 | 0.7 |
+| `WORLDSHIP_BATCH_IMPORT_ATTEMPTS` | 6 | 1 |
+
+- `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2)
 - `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — offset from the **left ribbon edge** (Home tab) to Batch Import (defaults **95** / **42**, calibrated to screen point 1276, 232 on Remote Workstation)
 - `WORLDSHIP_IMPORT_EXPORT_ABS_X` / `WORLDSHIP_IMPORT_EXPORT_ABS_Y` — optional fixed screen click for Import-Export tab (e.g. 1464 / 182)
 - `WORLDSHIP_BATCH_IMPORT_ABS_X` / `WORLDSHIP_BATCH_IMPORT_ABS_Y` — optional fixed screen click for Batch Import (e.g. 1276 / 232)

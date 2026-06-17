@@ -694,12 +694,158 @@ def _run_end_of_day(main) -> None:
 
 
 def _worldship_date_display(d: date) -> str:
-    return f"{d.day:02d}-{d.strftime('%b')}-{d.year}"
+    """WorldShip export field format, e.g. 18-May-2026 (day not zero-padded)."""
+    return f"{d.day}-{d.strftime('%b')}-{d.year}"
 
 
-def _batch_export_uia_date(dlg, today: date) -> None:
-    """Check 'All records on or after' and pick today's date from the calendar."""
+def _normalize_export_date(text: str) -> str:
+    return re.sub(r"\s+", "", (text or "").strip().lower())
+
+
+def _export_date_matches(field_text: str, want: str) -> bool:
+    norm_field = _normalize_export_date(field_text)
+    norm_want = _normalize_export_date(want)
+    if norm_field == norm_want:
+        return True
+    # Accept same calendar day if month/day/year tokens match loosely.
+    return norm_want in norm_field or norm_field.endswith(norm_want.split("-", 1)[-1])
+
+
+def _enum_visible_edit_hwnds(parent_hwnd: int) -> list[int]:
+    import win32gui
+
+    edits: list[int] = []
+
+    def _cb(child, _):
+        try:
+            if win32gui.GetClassName(child) == "Edit" and win32gui.IsWindowVisible(child):
+                edits.append(child)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(parent_hwnd, _cb, None)
+    except Exception:
+        pass
+    return edits
+
+
+def _read_edit_hwnd_text(edit_hwnd: int) -> str:
+    import win32con
+    import win32gui
+
+    try:
+        n = win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXTLENGTH, 0, 0)
+        if n <= 0:
+            return ""
+        buf = __import__("ctypes").create_unicode_buffer(n + 2)
+        win32gui.SendMessage(edit_hwnd, win32con.WM_GETTEXT, n + 1, buf)
+        return buf.value.strip()
+    except Exception:
+        return ""
+
+
+def _notify_edit_changed(edit_hwnd: int) -> None:
+    import win32con
+    import win32gui
+
+    try:
+        parent = win32gui.GetParent(edit_hwnd)
+        ctrl_id = win32gui.GetDlgCtrlID(edit_hwnd)
+        if parent and ctrl_id:
+            win32gui.SendMessage(
+                parent,
+                win32con.WM_COMMAND,
+                (win32con.EN_CHANGE << 16) | (ctrl_id & 0xFFFF),
+                edit_hwnd,
+            )
+    except Exception:
+        pass
+
+
+def _pick_batch_export_date_edit_hwnd(export_hwnd: int) -> int:
+    import win32gui
+
+    enabled: list[int] = []
+    for edit in _enum_visible_edit_hwnds(export_hwnd):
+        try:
+            if win32gui.IsWindowEnabled(edit):
+                enabled.append(edit)
+        except Exception:
+            continue
+    if not enabled:
+        return 0
+    for edit in enabled:
+        if re.search(r"-\w{3}-", _read_edit_hwnd_text(edit)):
+            return edit
+    return enabled[0]
+
+
+def _type_date_into_edit_hwnd(edit_hwnd: int, want: str, *, export_hwnd: int) -> bool:
+    """Focus the date field and type today's date (no calendar picker)."""
+    import win32con
+    import win32gui
+    from pywinauto import keyboard
+
+    try:
+        win32gui.SetForegroundWindow(export_hwnd)
+    except Exception:
+        pass
+    try:
+        win32gui.SetFocus(edit_hwnd)
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+    try:
+        win32gui.SendMessage(edit_hwnd, win32con.EM_SETSEL, 0, -1)
+        win32gui.SendMessage(edit_hwnd, win32con.WM_SETTEXT, 0, want)
+        _notify_edit_changed(edit_hwnd)
+        time.sleep(0.2)
+        if _export_date_matches(_read_edit_hwnd_text(edit_hwnd), want):
+            return True
+    except Exception:
+        pass
+
+    try:
+        win32gui.SetFocus(edit_hwnd)
+        keyboard.send_keys("^a", pause=0.05)
+        keyboard.send_keys(want, with_spaces=True, pause=0.03)
+        time.sleep(0.15)
+        keyboard.send_keys("{TAB}", pause=0.05)
+        time.sleep(0.2)
+        return _export_date_matches(_read_edit_hwnd_text(edit_hwnd), want)
+    except Exception:
+        return False
+
+
+def _type_date_into_edit_uia(edit, want: str) -> bool:
+    from pywinauto import keyboard
+
+    try:
+        edit.set_focus()
+        edit.click_input()
+        time.sleep(0.15)
+        keyboard.send_keys("^a", pause=0.05)
+        keyboard.send_keys(want, with_spaces=True, pause=0.03)
+        time.sleep(0.15)
+        keyboard.send_keys("{TAB}", pause=0.05)
+        time.sleep(0.2)
+        try:
+            current = (edit.window_text() or "").strip()
+        except Exception:
+            current = ""
+        return _export_date_matches(current, want)
+    except Exception:
+        return False
+
+
+def _batch_export_set_date(app, export_hwnd: int, today: date) -> None:
+    """Check 'All records on or after' and type today's date into the field (no calendar)."""
     want = _worldship_date_display(today)
+    dlg = app.window(handle=export_hwnd)
+
     checkboxes = []
     for cb in dlg.descendants(control_type="CheckBox"):
         try:
@@ -715,44 +861,41 @@ def _batch_export_uia_date(dlg, today: date) -> None:
         time.sleep(0.35)
     _log("Checked 'All records on or after'.")
 
-    for btn in dlg.descendants(control_type="Button"):
-        try:
-            if not btn.is_visible():
-                continue
-            r = btn.rectangle()
-            if r.width() < 45 and r.height() < 35 and r.width() > 10:
-                btn.click_input()
-                time.sleep(0.5)
-                break
-        except Exception:
-            continue
+    time.sleep(_step_wait_s("WORLDSHIP_BATCH_EXPORT_AFTER_CHECK_S", 0.4))
+    _log(f"Typing export date manually: {want!r}")
 
-    try:
-        today_btn = dlg.child_window(title_re=r".*Today.*")
-        if today_btn.exists(timeout=2.0):
-            today_btn.click_input()
-            time.sleep(0.35)
-            _log("Selected today from calendar.")
-            return
-    except Exception:
-        pass
+    edit_hwnd = _pick_batch_export_date_edit_hwnd(export_hwnd)
+    if edit_hwnd and _type_date_into_edit_hwnd(
+        edit_hwnd, want, export_hwnd=export_hwnd
+    ):
+        current = _read_edit_hwnd_text(edit_hwnd)
+        _log(f"Export date field set to {current!r} (Win32/keyboard).")
+        return
 
     for edit in dlg.descendants(control_type="Edit"):
         try:
-            if edit.is_visible():
-                edit.set_edit_text(want)
-                time.sleep(0.25)
-                _log(f"Set export date field to {want!r}.")
-                return
+            if not edit.is_visible() or not edit.is_enabled():
+                continue
         except Exception:
             continue
+        if _type_date_into_edit_uia(edit, want):
+            try:
+                current = (edit.window_text() or "").strip()
+            except Exception:
+                current = want
+            _log(f"Export date field set to {current!r} (UIA/keyboard).")
+            return
+
+    raise RuntimeError(
+        f"Could not set batch export date to {want!r}. "
+        "The date field may not be enabled or visible over RDP."
+    )
 
 
 def _check_all_records_on_or_after_uia(app, export_hwnd: int, today: date) -> None:
     want = _worldship_date_display(today)
     _log(f"Batch export: check 'All records on or after' and set date to {want!r}")
-    dlg = app.window(handle=export_hwnd)
-    _batch_export_uia_date(dlg, today)
+    _batch_export_set_date(app, export_hwnd, today)
     time.sleep(_step_wait_s("WORLDSHIP_BATCH_EXPORT_AFTER_DATE_S", 0.8))
     _log("Batch export date option set (today).")
 

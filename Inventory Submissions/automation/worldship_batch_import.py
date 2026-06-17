@@ -785,8 +785,10 @@ def _click_preview_next(preview: ModalDialog) -> None:
     import win32con
     import win32gui
 
+    from automation.worldship_ribbon_click import _import_pacing_s
+
     hwnd = preview.hwnd
-    settle_s = _step_wait_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 4.0)
+    settle_s = _import_pacing_s("WORLDSHIP_PREVIEW_BEFORE_NEXT_S", 2.0, 1.0)
     if settle_s > 0:
         _log(f"Waiting {settle_s:.1f}s for preview dialog to finish loading…")
         time.sleep(settle_s)
@@ -1540,18 +1542,24 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     main = _resolve_main_window(app, cold_start=cold_start)
 
     _focus_main_window(main)
-    after_fg_s = _step_wait_s("WORLDSHIP_AFTER_FOREGROUND_S", 3.0)
+    from automation.worldship_ribbon_click import (
+        _fast_ribbon_clicks_enabled,
+        _import_pacing_s,
+    )
+
+    if _fast_ribbon_clicks_enabled(main):
+        _log("Fast import pacing enabled (calibrated ribbon / Remote Workstation).")
+
+    after_fg_s = _import_pacing_s("WORLDSHIP_AFTER_FOREGROUND_S", 1.5, 0.4, main)
     if after_fg_s > 0:
         _log(f"Waiting {after_fg_s:.1f}s after foreground before Import-Export tab…")
         time.sleep(after_fg_s)
-
-    _ensure_import_export_tab(main)
 
     from automation.worldship_ribbon_click import click_batch_import
 
     click_batch_import(main, log=_log, app=app)
 
-    after_batch_open_s = _step_wait_s("WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S", 8.0)
+    after_batch_open_s = _import_pacing_s("WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S", 2.5, 0.0, main)
     if after_batch_open_s > 0:
         _log(f"Waiting {after_batch_open_s:.1f}s for Batch Import wizard…")
         time.sleep(after_batch_open_s)
@@ -1562,7 +1570,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
     _log(f"Ensuring {AUTO_PROCESS_LABEL!r} is checked…")
     _ensure_checkbox_checked(wizard, AUTO_PROCESS_LABEL, timeout_s=5)
 
-    before_next_s = _step_wait_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 2.0)
+    before_next_s = _import_pacing_s("WORLDSHIP_BEFORE_NEXT_WAIT_S", 0.75, 0.35, main)
     if before_next_s > 0:
         _log(f"Waiting {before_next_s:.1f}s before Next…")
         time.sleep(before_next_s)

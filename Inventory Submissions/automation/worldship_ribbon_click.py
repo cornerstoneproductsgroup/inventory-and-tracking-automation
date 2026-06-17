@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v8"
+_RIBBON_VERSION = "ribbon-click-v9"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -568,12 +568,44 @@ def _env_screen_coords(x_key: str, y_key: str) -> tuple[int, int] | None:
         return None
 
 
-def _batch_import_attempts() -> int:
-    raw = (os.environ.get("WORLDSHIP_BATCH_IMPORT_ATTEMPTS") or "6").strip()
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 6
+def _fast_ribbon_clicks_enabled(win=None) -> bool:
+    """True when calibrated coordinate clicks are in use (shorter pauses, fewer retries)."""
+    flag = (os.environ.get("WORLDSHIP_FAST_IMPORT") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if _env_screen_coords("WORLDSHIP_BATCH_IMPORT_ABS_X", "WORLDSHIP_BATCH_IMPORT_ABS_Y"):
+        return True
+    if _env_screen_coords("WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"):
+        return True
+    if win is not None and _running_over_rdp(win):
+        return True
+    return False
+
+
+def _import_pacing_s(
+    env_key: str,
+    slow_default: float,
+    fast_default: float,
+    win=None,
+) -> float:
+    default = fast_default if _fast_ribbon_clicks_enabled(win) else slow_default
+    return _step_wait_s(env_key, default)
+
+
+def _click_settle_s(win=None, *, slow: float = 0.35, fast: float = 0.12) -> float:
+    return fast if _fast_ribbon_clicks_enabled(win) else slow
+
+
+def _batch_import_attempts(win=None) -> int:
+    raw = (os.environ.get("WORLDSHIP_BATCH_IMPORT_ATTEMPTS") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 1 if _fast_ribbon_clicks_enabled(win) else 6
 
 
 def _visible_top_level_windows_with_text(needle: str) -> list[str]:
@@ -830,7 +862,7 @@ def _click_batch_import_by_position(
     try:
         focus_main_window(win, log=log)
         mouse.click(button="left", coords=(x, y))
-        time.sleep(0.35)
+        time.sleep(_click_settle_s(win))
         return True
     except Exception as exc:
         log(f"WARN: coordinate Batch Import click: {exc}")
@@ -950,7 +982,7 @@ def _click_import_export_tab_rect(
                 if _click_point_in_rect(
                     rect, control_type="TabItem", win=win, log=log
                 ):
-                    time.sleep(0.35)
+                    time.sleep(_click_settle_s(win))
                     return True
             except Exception:
                 continue
@@ -959,13 +991,28 @@ def _click_import_export_tab_rect(
 
 def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
     """Try several ways to select Import-Export; return True if Batch Import is visible to UIA."""
+    fast = _fast_ribbon_clicks_enabled(win)
     tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
-    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 2.0)
+    after_tab_s = _import_pacing_s(
+        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.3, win
+    )
 
     def _batch_visible() -> bool:
         return ribbon_action_available(
             win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
         )
+
+    if fast:
+        log("Fast ribbon: single Import-Export tab click…")
+        if _env_screen_coords(
+            "WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"
+        ):
+            _click_import_export_by_position(win, log=log)
+        else:
+            _click_import_export_tab_rect(win, log=log)
+        if after_tab_s > 0:
+            time.sleep(after_tab_s)
+        return _batch_visible()
 
     attempts = (
         ("Import-Export tab rect", lambda: _click_import_export_tab_rect(win, log=log)),
@@ -1044,21 +1091,21 @@ def click_batch_import(
     Open Batch Import using several strategies; each attempt is verified by wizard UI.
     """
     emit = log or _log_default
-    verify_s = _step_wait_s("WORLDSHIP_BATCH_IMPORT_VERIFY_S", 3.0)
-    attempts = _batch_import_attempts()
+    fast = _fast_ribbon_clicks_enabled(win)
+    verify_s = _import_pacing_s("WORLDSHIP_BATCH_IMPORT_VERIFY_S", 1.5, 0.7, win)
+    attempts = _batch_import_attempts(win)
+    poll_s = 0.06 if fast else 0.12
 
     focus_main_window(win, log=emit)
-    emit(f"Ribbon click engine {_RIBBON_VERSION} — opening Batch Import")
+    mode = "fast calibrated" if fast else "standard"
+    emit(f"Ribbon click engine {_RIBBON_VERSION} ({mode}) — opening Batch Import")
 
     if batch_import_wizard_open(win, app=app):
         emit("Batch Import wizard is already open.")
         return
 
-    if not ribbon_action_available(
-        win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
-    ):
-        emit("Batch Import not visible on ribbon — ensuring Import-Export tab is active…")
-        ensure_import_export_tab(win, log=emit)
+    emit("Ensuring Import-Export tab is active…")
+    ensure_import_export_tab(win, log=emit)
 
     coordinate_strategies: list[tuple[str, Callable[[], bool]]] = [
         (
@@ -1072,7 +1119,9 @@ def click_batch_import(
         ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
         ("Win32 child", lambda: _click_batch_import_win32(win, log=emit)),
     ]
-    if _running_over_rdp(win):
+    if fast:
+        strategies = coordinate_strategies[:1]
+    elif _running_over_rdp(win):
         strategies = coordinate_strategies + uia_strategies
     else:
         strategies = uia_strategies + coordinate_strategies
@@ -1098,7 +1147,17 @@ def click_batch_import(
                 if batch_import_wizard_open(win, app=app):
                     emit(f"Batch Import wizard open (strategy: {strategy_name}).")
                     return
-                time.sleep(0.12)
+                time.sleep(poll_s)
+
+    titles = _visible_top_level_windows_with_text("import")
+    if titles:
+        emit(f"Visible import-related windows: {titles[:6]}")
+    _dump_ribbon_names(win, log=emit)
+    raise RuntimeError(
+        "Could not open the Batch Import wizard after "
+        f"{attempts} round(s) of ribbon strategies (last: {last_strategy!r}). "
+        "Set WORLDSHIP_BATCH_IMPORT_OFFSET_X/Y in .env if coordinate clicks miss the button."
+    )
 
     titles = _visible_top_level_windows_with_text("import")
     if titles:
