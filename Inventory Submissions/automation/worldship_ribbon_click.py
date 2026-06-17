@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v5"
+_RIBBON_VERSION = "ribbon-click-v6"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -832,12 +832,89 @@ def click_ribbon(
     raise RuntimeError(f"Could not click {title!r}: {hint}")
 
 
+def _running_over_rdp(win) -> bool:
+    if (os.environ.get("WORLDSHIP_REMOTE_WORKSTATION") or "").strip() == "1":
+        return True
+    try:
+        title = (win.window_text() or "").lower()
+    except Exception:
+        return False
+    return "remote workstation" in title
+
+
+def _click_import_export_tab_rect(
+    win,
+    *,
+    log: Callable[[str], None],
+) -> bool:
+    """Click the Import-Export tab itself (not an offset from Home)."""
+    for label in ("Import-Export", "Import Export"):
+        for el in _descendant_controls(win, label, ("TabItem", "Button")):
+            try:
+                if not el.is_visible():
+                    continue
+                rect = el.rectangle()
+                log(f"Mouse click on Import-Export tab ({label!r})…")
+                if _click_point_in_rect(
+                    rect, control_type="TabItem", win=win, log=log
+                ):
+                    time.sleep(0.35)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
+    """Try several ways to select Import-Export; return True if Batch Import is visible to UIA."""
+    tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
+    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 2.0)
+
+    def _batch_visible() -> bool:
+        return ribbon_action_available(
+            win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
+        )
+
+    attempts = (
+        ("Import-Export tab rect", lambda: _click_import_export_tab_rect(win, log=log)),
+        (
+            "UIA Import-Export",
+            lambda: click_ribbon(
+                win,
+                title="Import-Export",
+                control_types=("TabItem", "Button"),
+                timeout_s=tab_timeout,
+                log=log,
+            )
+            or True,
+        ),
+        ("coordinate from Home", lambda: _click_import_export_by_position(win, log=log)),
+        ("Import-Export tab rect (retry)", lambda: _click_import_export_tab_rect(win, log=log)),
+    )
+
+    for name, fn in attempts:
+        if _batch_visible():
+            log("Verified: Batch Import visible on ribbon.")
+            return True
+        log(f"Import-Export activate via {name}…")
+        try:
+            fn()
+        except Exception as exc:
+            log(f"WARN: {name} failed: {exc}")
+        if after_tab_s > 0:
+            time.sleep(after_tab_s)
+        if _batch_visible():
+            log(f"Verified: Batch Import visible after {name}.")
+            return True
+    return _batch_visible()
+
+
 def ensure_import_export_tab(
     win,
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Open Import-Export ribbon; only skip when Batch Import is already visible."""
+    """Open Import-Export ribbon; on RDP, UIA may not see panel buttons — still continue."""
     emit = log or _log_default
     if ribbon_action_available(
         win, "Batch Import", ("Button", "MenuItem", "SplitButton")
@@ -845,50 +922,23 @@ def ensure_import_export_tab(
         emit("Import-Export ribbon already active — skipping tab click.")
         return
 
-    tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
     emit("Opening Import-Export tab…")
-    click_ribbon(
-        win,
-        title="Import-Export",
-        control_types=("TabItem", "Button"),
-        timeout_s=tab_timeout,
-        log=emit,
-    )
-
-    after_tab_s = _step_wait_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 2.0)
-    if after_tab_s > 0:
-        emit(f"Waiting {after_tab_s:.1f}s for Import-Export ribbon…")
-        time.sleep(after_tab_s)
-
-    if ribbon_action_available(
-        win, "Batch Import", ("Button", "MenuItem", "SplitButton")
-    ):
-        emit("Verified: Batch Import visible on ribbon.")
-        return
-
-    emit("WARN: Batch Import not visible after tab click — retrying Import-Export…")
-    if not _click_import_export_by_position(win, log=emit):
-        click_ribbon(
-            win,
-            title="Import-Export",
-            control_types=("TabItem", "Button"),
-            timeout_s=tab_timeout,
-            log=emit,
-        )
-
-    if after_tab_s > 0:
-        time.sleep(after_tab_s)
-
-    if ribbon_action_available(
-        win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
-    ):
-        emit("Verified: Batch Import visible on ribbon (after retry).")
+    focus_main_window(win, log=emit)
+    if _activate_import_export_tab(win, log=emit):
         return
 
     _dump_ribbon_names(win, log=emit)
-    raise RuntimeError(
-        "Import-Export tab did not expose Batch Import on the ribbon. "
-        "WorldShip may still be on Home, or UIA cannot see the ribbon over RDP."
+    if _running_over_rdp(win):
+        emit(
+            "WARN: Running on WorldShip Remote Workstation — UIA often cannot see "
+            "Batch Import on the ribbon. Tab activation was attempted; continuing with "
+            "coordinate Batch Import clicks."
+        )
+        return
+
+    emit(
+        "WARN: Batch Import is not visible to UIA after Import-Export tab clicks. "
+        "Continuing with coordinate / Win32 Batch Import strategies anyway."
     )
 
 
@@ -918,16 +968,22 @@ def click_batch_import(
         emit("Batch Import not visible on ribbon — ensuring Import-Export tab is active…")
         ensure_import_export_tab(win, log=emit)
 
-    strategies: list[tuple[str, Callable[[], bool]]] = [
-        ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),
-        ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
-        ("Win32 child", lambda: _click_batch_import_win32(win, log=emit)),
+    coordinate_strategies: list[tuple[str, Callable[[], bool]]] = [
         ("coordinate grid", lambda: _click_batch_import_coordinate_grid(win, log=emit)),
         (
             "coordinate default",
             lambda: _click_batch_import_by_position(win, log=emit),
         ),
     ]
+    uia_strategies: list[tuple[str, Callable[[], bool]]] = [
+        ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),
+        ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
+        ("Win32 child", lambda: _click_batch_import_win32(win, log=emit)),
+    ]
+    if _running_over_rdp(win):
+        strategies = coordinate_strategies + uia_strategies
+    else:
+        strategies = uia_strategies + coordinate_strategies
 
     last_strategy = ""
     for attempt in range(1, attempts + 1):

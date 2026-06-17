@@ -75,6 +75,7 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 - `WORLDSHIP_BATCH_IMPORT_ATTEMPTS` — full strategy rounds for Batch Import (default 6)
 - `WORLDSHIP_BATCH_IMPORT_VERIFY_S` — seconds to wait for wizard after each click try (default 3)
 - `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — anchor for coordinate grid when UIA cannot see the ribbon (defaults 60 / 42)
+- `WORLDSHIP_REMOTE_WORKSTATION` — set to `1` to force coordinate-first ribbon clicks (auto-detected when window title contains "Remote Workstation")
 
 **Label save phase:**
 
