@@ -1549,7 +1549,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
 
     from automation.worldship_ribbon_click import click_batch_import
 
-    click_batch_import(main, log=_log)
+    click_batch_import(main, log=_log, app=app)
 
     after_batch_open_s = _step_wait_s("WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S", 8.0)
     if after_batch_open_s > 0:

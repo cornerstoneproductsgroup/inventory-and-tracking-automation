@@ -7,7 +7,9 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v4"
+_RIBBON_VERSION = "ribbon-click-v5"
+_AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
+_BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
 
 def _log_default(msg: str) -> None:
@@ -473,6 +475,242 @@ def _import_export_tab_rect(win):
     return None
 
 
+def _step_wait_s(env_key: str, default: float) -> float:
+    raw = (os.environ.get(env_key) or str(default)).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _batch_import_attempts() -> int:
+    raw = (os.environ.get("WORLDSHIP_BATCH_IMPORT_ATTEMPTS") or "6").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 6
+
+
+def _visible_top_level_windows_with_text(needle: str) -> list[str]:
+    import win32gui
+
+    needle_low = needle.lower()
+    titles: list[str] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = (win32gui.GetWindowText(hwnd) or "").strip()
+            if needle_low in title.lower():
+                titles.append(title)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    return titles
+
+
+def batch_import_wizard_open(win, app=None) -> bool:
+    """True when the Batch Import wizard (auto-process checkbox or dialog) is visible."""
+    for el in _descendant_controls(
+        win,
+        "Process shipments automatically after import",
+        ("CheckBox", "RadioButton"),
+    ):
+        try:
+            if el.is_visible():
+                return True
+        except Exception:
+            continue
+
+    try:
+        for el in win.descendants():
+            try:
+                if not el.is_visible():
+                    continue
+            except Exception:
+                continue
+            name = _control_name(el).lower()
+            if _AUTO_PROCESS_LABEL_SNIPPET in name:
+                return True
+            ctype = _control_type(el)
+            if ctype == "CheckBox" and "automatic" in name and "import" in name:
+                return True
+    except Exception:
+        pass
+
+    if app is not None:
+        try:
+            for title_re in (".*Batch Import.*", ".*Import.*Export.*"):
+                cand = app.window(title_re=title_re)
+                if cand.exists(timeout=0.05):
+                    for box in _descendant_controls(
+                        cand,
+                        "Process shipments automatically after import",
+                        ("CheckBox",),
+                    ):
+                        try:
+                            if box.is_visible():
+                                return True
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+    return bool(_visible_top_level_windows_with_text(_BATCH_IMPORT_TITLE_SNIPPET))
+
+
+def _find_ribbon_controls_by_substrings(
+    win,
+    *parts: str,
+    control_types: tuple[str, ...] = (
+        "Button",
+        "SplitButton",
+        "MenuItem",
+        "Hyperlink",
+        "Text",
+    ),
+) -> list:
+    parts_low = [p.lower() for p in parts if p]
+    hits: list = []
+    try:
+        elements = win.descendants()
+    except Exception:
+        return hits
+    for el in elements:
+        try:
+            ctype = _control_type(el)
+            if control_types and ctype and ctype not in control_types:
+                continue
+            if not el.is_visible():
+                continue
+            if not el.is_enabled():
+                continue
+        except Exception:
+            continue
+        name = _control_name(el).lower()
+        if not name:
+            continue
+        if parts_low and not all(p in name for p in parts_low):
+            continue
+        hits.append(el)
+    return hits
+
+
+def _click_first_matching_control(
+    controls: list,
+    *,
+    win,
+    log: Callable[[str], None],
+    tag: str,
+) -> bool:
+    for el in controls:
+        name = _control_name(el)
+        log(f"Clicking {tag}: {name!r} ({_control_type(el)})…")
+        if _try_uia_click(el, win=win, log=log):
+            return True
+    return False
+
+
+def _click_batch_import_exact(win, *, log: Callable[[str], None]) -> bool:
+    custom = (os.environ.get("WORLDSHIP_BATCH_IMPORT_LABEL") or "").strip()
+    labels = [custom] if custom else []
+    labels.extend(["Batch Import", "Batch  Import", "BatchImport"])
+    for label in labels:
+        for ctrl_type in ("Button", "SplitButton", "MenuItem", "Hyperlink", "Text"):
+            for target in _matching_controls(
+                win, title=label, control_types=(ctrl_type,)
+            ):
+                try:
+                    if not target.is_visible() or not target.is_enabled():
+                        continue
+                except Exception:
+                    continue
+                if _try_uia_click(target, win=win, log=log):
+                    return True
+    try:
+        root_hwnd = int(win.handle)
+    except Exception:
+        root_hwnd = 0
+    if root_hwnd:
+        for ch in _enum_hwnds_with_text(root_hwnd, "Batch Import"):
+            if _click_hwnd(ch, log=log):
+                return True
+    return False
+
+
+def _click_batch_import_fuzzy(win, *, log: Callable[[str], None]) -> bool:
+    hits = _find_ribbon_controls_by_substrings(win, "batch", "import")
+    if _click_first_matching_control(hits, win=win, log=log, tag="fuzzy Batch Import"):
+        return True
+    hits = _find_ribbon_controls_by_substrings(win, "batch")
+    return _click_first_matching_control(hits, win=win, log=log, tag="fuzzy Batch*")
+
+
+def _click_batch_import_win32(win, *, log: Callable[[str], None]) -> bool:
+    try:
+        root_hwnd = int(win.handle)
+    except Exception:
+        return False
+    needles = ("Batch Import", "Batch  Import", "BatchImport")
+    for needle in needles:
+        for ch in _enum_hwnds_with_text(root_hwnd, needle):
+            log(f"Win32 click hwnd {ch} for {needle!r}…")
+            if _click_hwnd(ch, log=log):
+                return True
+    return False
+
+
+def _click_batch_import_coordinate_grid(win, *, log: Callable[[str], None]) -> bool:
+    """Try several offsets below the Import-Export tab (RDP-safe fallback)."""
+    from pywinauto import mouse
+
+    tab_rect = _import_export_tab_rect(win)
+    if tab_rect is None:
+        for el in _descendant_controls(win, "Home", ("TabItem", "Button")):
+            try:
+                if el.is_visible():
+                    tab_rect = el.rectangle()
+                    break
+            except Exception:
+                continue
+    if tab_rect is None:
+        return False
+
+    try:
+        win_rect = win.rectangle()
+    except Exception:
+        return False
+
+    base_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 60.0)
+    base_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
+    x_deltas = (0.0, -25.0, 25.0, -50.0, 50.0, 80.0)
+    y_deltas = (0.0, 10.0, -8.0, 18.0)
+
+    focus_main_window(win, log=log)
+    anchor_x = max(win_rect.left + 80, tab_rect.left - 40)
+    anchor_y = tab_rect.bottom
+
+    for dy in y_deltas:
+        for dx in x_deltas:
+            x = int(anchor_x + base_x + dx)
+            y = int(anchor_y + base_y + dy)
+            log(f"Coordinate grid click for Batch Import at ({x}, {y})…")
+            try:
+                mouse.click(button="left", coords=(x, y))
+                time.sleep(0.2)
+                if batch_import_wizard_open(win):
+                    return True
+            except Exception as exc:
+                log(f"WARN: coordinate grid click ({x}, {y}): {exc}")
+    return False
+
+
 def _click_batch_import_by_position(
     win,
     *,
@@ -629,13 +867,14 @@ def ensure_import_export_tab(
         return
 
     emit("WARN: Batch Import not visible after tab click — retrying Import-Export…")
-    click_ribbon(
-        win,
-        title="Import-Export",
-        control_types=("TabItem", "Button"),
-        timeout_s=tab_timeout,
-        log=emit,
-    )
+    if not _click_import_export_by_position(win, log=emit):
+        click_ribbon(
+            win,
+            title="Import-Export",
+            control_types=("TabItem", "Button"),
+            timeout_s=tab_timeout,
+            log=emit,
+        )
 
     if after_tab_s > 0:
         time.sleep(after_tab_s)
@@ -657,45 +896,68 @@ def click_batch_import(
     win,
     *,
     log: Callable[[str], None] | None = None,
+    app=None,
 ) -> None:
+    """
+    Open Batch Import using several strategies; each attempt is verified by wizard UI.
+    """
     emit = log or _log_default
-    timeout_s = _step_wait_s("WORLDSHIP_BATCH_IMPORT_CLICK_TIMEOUT_S", 5.0)
+    verify_s = _step_wait_s("WORLDSHIP_BATCH_IMPORT_VERIFY_S", 3.0)
+    attempts = _batch_import_attempts()
+
     focus_main_window(win, log=emit)
-    emit("Opening Batch Import…")
-    custom = (os.environ.get("WORLDSHIP_BATCH_IMPORT_LABEL") or "").strip()
-    labels = [custom] if custom else []
-    labels.extend(["Batch Import", "Batch  Import"])
-    deadline = time.monotonic() + timeout_s
-    last_err: Exception | None = None
-    for label in labels:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.5:
-            break
-        try:
-            click_ribbon(
-                win,
-                title=label,
-                control_types=(
-                    "Button",
-                    "MenuItem",
-                    "SplitButton",
-                    "Hyperlink",
-                    "Text",
-                ),
-                timeout_s=remaining,
-                log=emit,
-            )
-            return
-        except RuntimeError as exc:
-            last_err = exc
-    if last_err:
-        raise last_err
-    raise RuntimeError("Could not click 'Batch Import': timed out")
+    emit(f"Ribbon click engine {_RIBBON_VERSION} — opening Batch Import")
 
+    if batch_import_wizard_open(win, app=app):
+        emit("Batch Import wizard is already open.")
+        return
 
-def _step_wait_s(env_key: str, default: float) -> float:
-    raw = (os.environ.get(env_key) or str(default)).strip()
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return default
+    if not ribbon_action_available(
+        win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
+    ):
+        emit("Batch Import not visible on ribbon — ensuring Import-Export tab is active…")
+        ensure_import_export_tab(win, log=emit)
+
+    strategies: list[tuple[str, Callable[[], bool]]] = [
+        ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),
+        ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
+        ("Win32 child", lambda: _click_batch_import_win32(win, log=emit)),
+        ("coordinate grid", lambda: _click_batch_import_coordinate_grid(win, log=emit)),
+        (
+            "coordinate default",
+            lambda: _click_batch_import_by_position(win, log=emit),
+        ),
+    ]
+
+    last_strategy = ""
+    for attempt in range(1, attempts + 1):
+        for strategy_name, fn in strategies:
+            if batch_import_wizard_open(win, app=app):
+                emit("Batch Import wizard is open.")
+                return
+            emit(f"Batch Import try {attempt}/{attempts}: {strategy_name}…")
+            last_strategy = strategy_name
+            try:
+                clicked = fn()
+            except Exception as exc:
+                emit(f"WARN: {strategy_name} raised {exc}")
+                clicked = False
+            if not clicked and strategy_name.startswith("coordinate"):
+                # grid / default may still have opened wizard via mouse
+                pass
+            deadline = time.monotonic() + verify_s
+            while time.monotonic() < deadline:
+                if batch_import_wizard_open(win, app=app):
+                    emit(f"Batch Import wizard open (strategy: {strategy_name}).")
+                    return
+                time.sleep(0.12)
+
+    titles = _visible_top_level_windows_with_text("import")
+    if titles:
+        emit(f"Visible import-related windows: {titles[:6]}")
+    _dump_ribbon_names(win, log=emit)
+    raise RuntimeError(
+        "Could not open the Batch Import wizard after "
+        f"{attempts} round(s) of ribbon strategies (last: {last_strategy!r}). "
+        "Set WORLDSHIP_BATCH_IMPORT_OFFSET_X/Y in .env if coordinate clicks miss the button."
+    )

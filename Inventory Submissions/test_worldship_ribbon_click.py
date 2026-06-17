@@ -44,7 +44,7 @@ def main() -> int:
         f"Batch Import visible after tab: "
         f"{ribbon_action_available(main_win, 'Batch Import', ('Button', 'MenuItem', 'SplitButton'))}"
     )
-    click_batch_import(main_win, log=_log)
+    click_batch_import(main_win, log=_log, app=app)
     _log("Ribbon click test finished — check WorldShip for Batch Import wizard.")
     return 0
 

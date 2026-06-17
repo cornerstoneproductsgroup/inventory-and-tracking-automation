@@ -72,6 +72,9 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 - `WORLDSHIP_BEFORE_NEXT_WAIT_S` — after checkbox, before first Next (default 2)
 - `WORLDSHIP_PREVIEW_BEFORE_NEXT_S` — on Import/Export Preview, before Next (default 4)
 - `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2; fixes long gap when log mentions a click but nothing happens)
+- `WORLDSHIP_BATCH_IMPORT_ATTEMPTS` — full strategy rounds for Batch Import (default 6)
+- `WORLDSHIP_BATCH_IMPORT_VERIFY_S` — seconds to wait for wizard after each click try (default 3)
+- `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — anchor for coordinate grid when UIA cannot see the ribbon (defaults 60 / 42)
 
 **Label save phase:**
 
