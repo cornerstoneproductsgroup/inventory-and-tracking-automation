@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v6"
+_RIBBON_VERSION = "ribbon-click-v7"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -475,6 +475,64 @@ def _import_export_tab_rect(win):
     return None
 
 
+def _left_ribbon_tab_rect(win):
+    """Home/Ship tab on the left — Import-Export panel buttons align under this edge."""
+    for label in ("Home", "Ship"):
+        for el in _descendant_controls(win, label, ("TabItem", "Button")):
+            try:
+                if el.is_visible():
+                    return el.rectangle()
+            except Exception:
+                continue
+    leftmost = None
+    left_x = None
+    try:
+        for el in win.descendants():
+            try:
+                if _control_type(el) != "TabItem" or not el.is_visible():
+                    continue
+                r = el.rectangle()
+            except Exception:
+                continue
+            if left_x is None or r.left < left_x:
+                left_x = r.left
+                leftmost = r
+    except Exception:
+        pass
+    return leftmost
+
+
+def _ribbon_content_anchor(win) -> tuple[int, int] | None:
+    """
+    Anchor for clicking buttons in the active tab's content row.
+    X = left edge of the ribbon panel (Home tab), not the Import-Export tab on the right.
+    Y = bottom of the tab strip.
+    """
+    left_tab = _left_ribbon_tab_rect(win)
+    ie_tab = _import_export_tab_rect(win)
+
+    tab_strip_bottom = None
+    for rect in (ie_tab, left_tab):
+        if rect is not None:
+            tab_strip_bottom = rect.bottom
+            break
+
+    if left_tab is not None:
+        anchor_x = left_tab.left
+    else:
+        try:
+            win_rect = win.rectangle()
+        except Exception:
+            return None
+        anchor_x = win_rect.left + 24
+        if tab_strip_bottom is None:
+            tab_strip_bottom = win_rect.top + 95
+
+    if tab_strip_bottom is None:
+        return None
+    return (anchor_x, tab_strip_bottom)
+
+
 def _step_wait_s(env_key: str, default: float) -> float:
     raw = (os.environ.get(env_key) or str(default)).strip()
     try:
@@ -667,34 +725,25 @@ def _click_batch_import_win32(win, *, log: Callable[[str], None]) -> bool:
 
 
 def _click_batch_import_coordinate_grid(win, *, log: Callable[[str], None]) -> bool:
-    """Try several offsets below the Import-Export tab (RDP-safe fallback)."""
+    """Try several offsets below the tab strip, anchored from the left ribbon edge."""
     from pywinauto import mouse
 
-    tab_rect = _import_export_tab_rect(win)
-    if tab_rect is None:
-        for el in _descendant_controls(win, "Home", ("TabItem", "Button")):
-            try:
-                if el.is_visible():
-                    tab_rect = el.rectangle()
-                    break
-            except Exception:
-                continue
-    if tab_rect is None:
+    anchor = _ribbon_content_anchor(win)
+    if anchor is None:
         return False
+    anchor_x, anchor_y = anchor
 
-    try:
-        win_rect = win.rectangle()
-    except Exception:
-        return False
-
-    base_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 60.0)
+    # Batch Import is the 2nd large button (after Keyed Import) on the left.
+    base_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 130.0)
     base_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
-    x_deltas = (0.0, -25.0, 25.0, -50.0, 50.0, 80.0)
+    x_deltas = (0.0, -35.0, -70.0, 35.0, 70.0, 105.0)
     y_deltas = (0.0, 10.0, -8.0, 18.0)
 
     focus_main_window(win, log=log)
-    anchor_x = max(win_rect.left + 80, tab_rect.left - 40)
-    anchor_y = tab_rect.bottom
+    log(
+        f"Batch Import grid anchor (left ribbon edge): ({anchor_x}, {anchor_y}) "
+        f"+ offset ({int(base_x)}, {int(base_y)})"
+    )
 
     for dy in y_deltas:
         for dx in x_deltas:
@@ -717,24 +766,24 @@ def _click_batch_import_by_position(
     log: Callable[[str], None],
 ) -> bool:
     """
-    When UIA cannot name ribbon buttons (common over RDP), click the first large
-    button in the ribbon content row below the Import-Export tab.
+    When UIA cannot name ribbon buttons (common over RDP), click Batch Import
+    below the tab strip, offset from the left ribbon edge (Home tab).
     """
     from pywinauto import mouse
 
-    tab_rect = _import_export_tab_rect(win)
-    if tab_rect is None:
+    anchor = _ribbon_content_anchor(win)
+    if anchor is None:
         return False
-    try:
-        win_rect = win.rectangle()
-    except Exception:
-        return False
+    anchor_x, anchor_y = anchor
 
-    offset_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 60.0)
+    offset_x = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_X", 130.0)
     offset_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
-    x = int(max(win_rect.left + 80, tab_rect.left - 40 + offset_x))
-    y = int(tab_rect.bottom + offset_y)
-    log(f"Coordinate click for Batch Import at ({x}, {y})…")
+    x = int(anchor_x + offset_x)
+    y = int(anchor_y + offset_y)
+    log(
+        f"Coordinate click for Batch Import at ({x}, {y}) "
+        f"(anchor left edge {anchor_x}, tab strip bottom {anchor_y})…"
+    )
     try:
         focus_main_window(win, log=log)
         mouse.click(button="left", coords=(x, y))
