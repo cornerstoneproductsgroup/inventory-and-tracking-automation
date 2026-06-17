@@ -635,13 +635,31 @@ def _click_when_ready(
 
 def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 8.0):
     """Return the wizard host as soon as the auto-process checkbox appears."""
+    from automation.worldship_ribbon_click import (
+        _fast_ribbon_clicks_enabled,
+        batch_import_wizard_open,
+    )
+
+    fast = _fast_ribbon_clicks_enabled(main)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if batch_import_wizard_open(main, app=app):
+            for title_re in (".*Batch Import.*", ".*Import.*Export.*"):
+                try:
+                    cand = app.window(title_re=title_re)
+                    if cand.exists(timeout=0.05):
+                        return cand
+                except Exception:
+                    continue
+            return main
+
         for title_re in (".*Batch Import.*", ".*Import.*Export.*"):
             try:
                 cand = app.window(title_re=title_re)
                 if not cand.exists(timeout=0.03):
                     continue
+                if fast:
+                    return cand
                 for box in _matching_controls(
                     cand, title=AUTO_PROCESS_LABEL, control_types=("CheckBox",)
                 ):
@@ -649,14 +667,16 @@ def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 8.0):
                         return cand
             except Exception:
                 continue
-        for box in _matching_controls(
-            main, title=AUTO_PROCESS_LABEL, control_types=("CheckBox",)
-        ):
-            try:
-                if box.is_visible():
-                    return main
-            except Exception:
-                continue
+
+        if not fast:
+            for box in _matching_controls(
+                main, title=AUTO_PROCESS_LABEL, control_types=("CheckBox",)
+            ):
+                try:
+                    if box.is_visible():
+                        return main
+                except Exception:
+                    continue
         time.sleep(_RIBBON_POLL_S)
     return main
 

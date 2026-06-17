@@ -66,7 +66,7 @@ If you already clicked Stop, close the import, re-run the batch, and let process
 
 **Startup wizard pacing** (Import-Export → Batch Import → auto-process → Next → preview Next):
 
-On **Remote Workstation** (or when `WORLDSHIP_BATCH_IMPORT_ABS_X/Y` are set), **fast import** mode runs automatically — one coordinate click per ribbon button, shorter pauses. Override with `WORLDSHIP_FAST_IMPORT=0` or `=1`.
+On **Remote Workstation**, fast import mode skips slow full-window UIA tree scans (they can take minutes over RDP). Coordinate clicks run immediately after each log line.
 
 | Setting | Standard default | Fast default (calibrated RDP) |
 |---------|------------------|-------------------------------|

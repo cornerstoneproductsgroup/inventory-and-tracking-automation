@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v9"
+_RIBBON_VERSION = "ribbon-click-v10"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -634,6 +634,21 @@ def _visible_top_level_windows_with_text(needle: str) -> list[str]:
 
 def batch_import_wizard_open(win, app=None) -> bool:
     """True when the Batch Import wizard (auto-process checkbox or dialog) is visible."""
+    if _visible_top_level_windows_with_text(_BATCH_IMPORT_TITLE_SNIPPET):
+        return True
+
+    if app is not None:
+        try:
+            cand = app.window(title_re=r".*Batch Import.*")
+            if cand.exists(timeout=0.1):
+                return True
+        except Exception:
+            pass
+
+    # Full UIA tree walks are very slow over RDP — skip when using coordinate clicks.
+    if _fast_ribbon_clicks_enabled(win):
+        return False
+
     for el in _descendant_controls(
         win,
         "Process shipments automatically after import",
@@ -679,7 +694,7 @@ def batch_import_wizard_open(win, app=None) -> bool:
         except Exception:
             pass
 
-    return bool(_visible_top_level_windows_with_text(_BATCH_IMPORT_TITLE_SNIPPET))
+    return False
 
 
 def _find_ribbon_controls_by_substrings(
@@ -1055,6 +1070,13 @@ def ensure_import_export_tab(
 ) -> None:
     """Open Import-Export ribbon; on RDP, UIA may not see panel buttons — still continue."""
     emit = log or _log_default
+
+    if _fast_ribbon_clicks_enabled(win):
+        emit("Fast ribbon: clicking Import-Export tab…")
+        focus_main_window(win, log=emit)
+        _activate_import_export_tab(win, log=emit)
+        return
+
     if ribbon_action_available(
         win, "Batch Import", ("Button", "MenuItem", "SplitButton")
     ):
@@ -1129,11 +1151,11 @@ def click_batch_import(
     last_strategy = ""
     for attempt in range(1, attempts + 1):
         for strategy_name, fn in strategies:
+            emit(f"Batch Import try {attempt}/{attempts}: {strategy_name}…")
+            last_strategy = strategy_name
             if batch_import_wizard_open(win, app=app):
                 emit("Batch Import wizard is open.")
                 return
-            emit(f"Batch Import try {attempt}/{attempts}: {strategy_name}…")
-            last_strategy = strategy_name
             try:
                 clicked = fn()
             except Exception as exc:
