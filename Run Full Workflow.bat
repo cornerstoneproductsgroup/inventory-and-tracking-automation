@@ -57,14 +57,20 @@ echo   WorldShip / UPS shipping
 echo ============================================================
 echo   1  WorldShip Batch Import ^(CornerstoneMaster — default^)
 echo   2  UPS.com Online Batch ^(Depot / Special Order / Tractor^)
+echo   3  Export Tracking ^(Batch Export — Depot Shipments CSV^)
 echo   0  Back to main menu
 echo.
-choice /C 012 /N /M "Press 0-2: "
-REM 0=1 1=2 2=3
+choice /C 0123 /N /M "Press 0-3: "
+REM 0=1 1=2 2=3 3=4
+if errorlevel 4 goto WORLDSHIP_EXPORT
 if errorlevel 3 goto SUBMENU_UPS
 if errorlevel 2 goto WORLDSHIP_IMPORT
 if errorlevel 1 goto MAIN_MENU
 goto SUBMENU_W
+
+:WORLDSHIP_EXPORT
+set "EXTRA_ARGS=--worldship-export-only"
+goto RUN
 
 :WORLDSHIP_IMPORT
 set "EXTRA_ARGS=--worldship-import-only"

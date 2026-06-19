@@ -782,6 +782,22 @@ def _pick_batch_export_date_edit_hwnd(export_hwnd: int) -> int:
     return enabled[0]
 
 
+def _focus_edit_hwnd_click(edit_hwnd: int, export_hwnd: int) -> None:
+    """Mouse-click the center of a date edit field (commits better than WM_SETTEXT alone)."""
+    import win32gui
+    from pywinauto import mouse
+
+    try:
+        win32gui.SetForegroundWindow(export_hwnd)
+        left, top, right, bottom = win32gui.GetWindowRect(edit_hwnd)
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        mouse.click(button="left", coords=(x, y))
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+
 def _type_date_into_edit_hwnd(edit_hwnd: int, want: str, *, export_hwnd: int) -> bool:
     """Focus the date field and type today's date (no calendar picker)."""
     import win32con
@@ -792,11 +808,13 @@ def _type_date_into_edit_hwnd(edit_hwnd: int, want: str, *, export_hwnd: int) ->
         win32gui.SetForegroundWindow(export_hwnd)
     except Exception:
         pass
+    _focus_edit_hwnd_click(edit_hwnd, export_hwnd)
+
     try:
         win32gui.SetFocus(edit_hwnd)
     except Exception:
         pass
-    time.sleep(0.2)
+    time.sleep(0.15)
 
     try:
         win32gui.SendMessage(edit_hwnd, win32con.EM_SETSEL, 0, -1)
@@ -809,8 +827,9 @@ def _type_date_into_edit_hwnd(edit_hwnd: int, want: str, *, export_hwnd: int) ->
         pass
 
     try:
-        win32gui.SetFocus(edit_hwnd)
+        _focus_edit_hwnd_click(edit_hwnd, export_hwnd)
         keyboard.send_keys("^a", pause=0.05)
+        keyboard.send_keys("{BACKSPACE}", pause=0.03)
         keyboard.send_keys(want, with_spaces=True, pause=0.03)
         time.sleep(0.15)
         keyboard.send_keys("{TAB}", pause=0.05)
@@ -843,22 +862,25 @@ def _type_date_into_edit_uia(edit, want: str) -> bool:
 
 def _batch_export_set_date(app, export_hwnd: int, today: date) -> None:
     """Check 'All records on or after' and type today's date into the field (no calendar)."""
-    want = _worldship_date_display(today)
-    dlg = app.window(handle=export_hwnd)
+    from automation.worldship_batch_import import _ensure_checkbox_checked_win32
 
-    checkboxes = []
-    for cb in dlg.descendants(control_type="CheckBox"):
-        try:
-            if cb.is_visible():
-                checkboxes.append(cb)
-        except Exception:
-            continue
-    if not checkboxes:
-        raise RuntimeError("No checkboxes found on Batch export data dialog.")
-    box = checkboxes[0]
-    if box.get_toggle_state() != 1:
-        box.click_input()
-        time.sleep(0.35)
+    want = _worldship_date_display(today)
+
+    if not _ensure_checkbox_checked_win32(export_hwnd, "on or after"):
+        dlg = app.window(handle=export_hwnd)
+        checkboxes = []
+        for cb in dlg.descendants(control_type="CheckBox"):
+            try:
+                if cb.is_visible():
+                    checkboxes.append(cb)
+            except Exception:
+                continue
+        if not checkboxes:
+            raise RuntimeError("No checkboxes found on Batch export data dialog.")
+        box = checkboxes[0]
+        if box.get_toggle_state() != 1:
+            box.click_input()
+            time.sleep(0.35)
     _log("Checked 'All records on or after'.")
 
     time.sleep(_step_wait_s("WORLDSHIP_BATCH_EXPORT_AFTER_CHECK_S", 0.4))
@@ -870,8 +892,13 @@ def _batch_export_set_date(app, export_hwnd: int, today: date) -> None:
     ):
         current = _read_edit_hwnd_text(edit_hwnd)
         _log(f"Export date field set to {current!r} (Win32/keyboard).")
+        if not _export_date_matches(current, want):
+            raise RuntimeError(
+                f"Export date field shows {current!r} but expected {want!r}."
+            )
         return
 
+    dlg = app.window(handle=export_hwnd)
     for edit in dlg.descendants(control_type="Edit"):
         try:
             if not edit.is_visible() or not edit.is_enabled():
@@ -884,6 +911,10 @@ def _batch_export_set_date(app, export_hwnd: int, today: date) -> None:
             except Exception:
                 current = want
             _log(f"Export date field set to {current!r} (UIA/keyboard).")
+            if not _export_date_matches(current, want):
+                raise RuntimeError(
+                    f"Export date field shows {current!r} but expected {want!r}."
+                )
             return
 
     raise RuntimeError(
@@ -900,36 +931,50 @@ def _check_all_records_on_or_after_uia(app, export_hwnd: int, today: date) -> No
     _log("Batch export date option set (today).")
 
 
-def _run_batch_export(app, main, *, today: date) -> None:
+def _open_batch_export_dialog(app, main) -> int:
+    """Import-Export tab → Batch Export → wait for export data dialog."""
+    from automation.worldship_ribbon_click import (
+        _fast_ribbon_clicks_enabled,
+        click_batch_export,
+        ensure_import_export_tab,
+        focus_main_window,
+    )
+
     attempts = _step_retry_attempts()
     ready_timeout = _step_wait_s("WORLDSHIP_APP_READY_TIMEOUT_S", 180.0)
 
-    export_hwnd = 0
     for attempt in range(1, attempts + 1):
         _log(f"Batch Export attempt {attempt}/{attempts}…")
         try:
-            _wait_worldship_app_ready(
-                main, timeout_s=ready_timeout, step_label="Before Batch Export"
-            )
-            _ensure_import_export_tab(main)
-            if not _import_export_tab_active(main):
-                raise RuntimeError("Import-Export tab not verified before Batch Export.")
-            _log('Clicking "Batch Export"…')
-            _click_ribbon(main, "Batch Export", timeout_s=30.0)
+            if not _fast_ribbon_clicks_enabled(main):
+                _wait_worldship_app_ready(
+                    main, timeout_s=ready_timeout, step_label="Before Batch Export"
+                )
+            focus_main_window(main, log=_log)
+            ensure_import_export_tab(main, log=_log)
+            click_batch_export(main, log=_log)
             export_hwnd = _wait_for_dialog("Batch export", timeout_s=45.0)
             _log("Verified: Batch export dialog opened.")
-            break
+            return export_hwnd
         except Exception as exc:
             _log(f"Batch Export open failed (attempt {attempt}): {exc}")
             if attempt >= attempts:
                 raise
             time.sleep(_step_retry_pause_s())
-    if not export_hwnd:
-        raise RuntimeError("Batch Export dialog could not be opened.")
+    raise RuntimeError("Batch Export dialog could not be opened.")
 
+
+def run_batch_export_workflow(app, main, *, today: date | None = None) -> None:
+    """Import-Export → Batch Export → today's date → preview → Save (tracking CSV)."""
+    export_day = today or date.today()
+    _log(f"=== WorldShip Batch Export (Depot Shipments, {export_day.isoformat()}) ===")
+    export_hwnd = _open_batch_export_dialog(app, main)
     _log("Depot Shipments map should be selected at top (default).")
-    _check_all_records_on_or_after_uia(app, export_hwnd, today)
+    _check_all_records_on_or_after_uia(app, export_hwnd, export_day)
+    _complete_batch_export_dialogs(export_hwnd)
 
+
+def _complete_batch_export_dialogs(export_hwnd: int) -> None:
     if not _click_button_win32(export_hwnd, "Next"):
         raise RuntimeError('Could not click Next on "Batch export data".')
     _log("Clicked Next on Batch export data.")
@@ -965,6 +1010,27 @@ def _run_batch_export(app, main, *, today: date) -> None:
     if not _click_button_win32(summary_hwnd, "Save"):
         raise RuntimeError('Could not click Save on "Import/Export Summary".')
     _log("Clicked Save on Import/Export Summary — batch export complete.")
+
+
+def run_worldship_batch_export(*, export_date: date | None = None) -> None:
+    """Standalone entry: connect to WorldShip and run batch export only."""
+    from automation.worldship_batch_import import (
+        _connect_or_start,
+        _focus_main_window,
+        _require_pywinauto,
+        _resolve_main_window,
+        _startup_timeout_s,
+    )
+
+    Application, _ = _require_pywinauto()
+    app, cold = _connect_or_start(Application, startup_timeout_s=_startup_timeout_s())
+    main = _resolve_main_window(app, cold_start=cold)
+    _focus_main_window(main)
+    run_batch_export_workflow(app, main, today=export_date)
+
+
+def _run_batch_export(app, main, *, today: date) -> None:
+    run_batch_export_workflow(app, main, today=today)
 
 
 def _dialog_visible(hwnd: int) -> bool:
@@ -1015,5 +1081,5 @@ def run_after_print_workflow(app, main, *, print_label_count: int) -> None:
     _run_end_of_day(main)
 
     _log("=== Phase 5: Batch Export (Depot Shipments, today) ===")
-    _run_batch_export(app, main, today=date.today())
+    run_batch_export_workflow(app, main, today=date.today())
     _log("WorldShip batch import + export workflow complete.")

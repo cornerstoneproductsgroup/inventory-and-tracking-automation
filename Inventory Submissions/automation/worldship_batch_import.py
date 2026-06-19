@@ -678,10 +678,72 @@ def _wait_for_batch_import_wizard(app, main, *, timeout_s: float = 8.0):
                 except Exception:
                     continue
         time.sleep(_RIBBON_POLL_S)
+    if fast:
+        raise RuntimeError(
+            f"Batch Import wizard did not appear within {timeout_s:.0f}s"
+        )
     return main
 
 
+def _ensure_checkbox_checked_win32(hwnd: int, label: str) -> bool:
+    """Check a dialog checkbox via Win32 (fast over RDP; no UIA tree walk)."""
+    import win32con
+    import win32gui
+
+    hint = label.lower().replace("&", "")
+    bs_checkbox = 0x00000003
+    target_hwnd = 0
+    first_checkbox = 0
+
+    def _cb(child, _):
+        nonlocal target_hwnd, first_checkbox
+        try:
+            if win32gui.GetClassName(child) != "Button":
+                return True
+            style = win32gui.GetWindowLong(child, win32con.GWL_STYLE)
+            if not (style & bs_checkbox):
+                return True
+            if not first_checkbox:
+                first_checkbox = child
+            text = (win32gui.GetWindowText(child) or "").strip().lower().replace("&", "")
+            if hint and hint in text:
+                target_hwnd = child
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+    except Exception:
+        return False
+
+    box = target_hwnd or first_checkbox
+    if not box:
+        return False
+    try:
+        checked = win32gui.SendMessage(box, win32con.BM_GETCHECK, 0, 0)
+        if checked != win32con.BST_CHECKED:
+            win32gui.PostMessage(box, win32con.BM_CLICK, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
 def _ensure_checkbox_checked(dlg, label: str, *, timeout_s: float = 5.0) -> None:
+    from automation.worldship_ribbon_click import _fast_ribbon_clicks_enabled
+
+    dlg_hwnd = 0
+    try:
+        dlg_hwnd = int(dlg.handle)
+    except Exception:
+        pass
+
+    if dlg_hwnd and _fast_ribbon_clicks_enabled():
+        if _ensure_checkbox_checked_win32(dlg_hwnd, label):
+            _log(f"Checked {label!r} (Win32).")
+            return
+
     deadline = time.monotonic() + timeout_s
     last_err: Exception | None = None
     while time.monotonic() < deadline:

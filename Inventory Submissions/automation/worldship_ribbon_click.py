@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v10"
+_RIBBON_VERSION = "ribbon-click-v11"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -523,6 +523,10 @@ def _ribbon_content_anchor(win) -> tuple[int, int] | None:
     X = left edge of the ribbon panel (Home tab), not the Import-Export tab on the right.
     Y = bottom of the tab strip.
     """
+    if _fast_ribbon_clicks_enabled(win):
+        # Calibrated Remote Workstation — avoid win.descendants() (minutes over RDP).
+        return 1181, 190
+
     left_tab = _left_ribbon_tab_rect(win)
     ie_tab = _import_export_tab_rect(win)
 
@@ -566,6 +570,99 @@ def _env_screen_coords(x_key: str, y_key: str) -> tuple[int, int] | None:
         return int(float(x_raw)), int(float(y_raw))
     except ValueError:
         return None
+
+
+def _calibrated_import_export_coords(win) -> tuple[int, int] | None:
+    coords = _env_screen_coords(
+        "WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"
+    )
+    if coords is not None:
+        return coords
+    if _fast_ribbon_clicks_enabled(win):
+        return 1464, 182
+    return None
+
+
+def _calibrated_batch_import_coords(win) -> tuple[int, int] | None:
+    coords = _env_screen_coords(
+        "WORLDSHIP_BATCH_IMPORT_ABS_X", "WORLDSHIP_BATCH_IMPORT_ABS_Y"
+    )
+    if coords is not None:
+        return coords
+    if _fast_ribbon_clicks_enabled(win):
+        return 1276, 232
+    return None
+
+
+def _click_screen_coords(
+    x: int,
+    y: int,
+    *,
+    win,
+    log: Callable[[str], None],
+    label: str,
+) -> bool:
+    from pywinauto import mouse
+
+    log(f"{label} at ({x}, {y})…")
+    try:
+        focus_main_window(win, log=log)
+        mouse.click(button="left", coords=(x, y))
+        time.sleep(_click_settle_s(win))
+        return True
+    except Exception as exc:
+        log(f"WARN: {label} failed: {exc}")
+        return False
+
+
+def _click_import_export_tab_fast(win, *, log: Callable[[str], None]) -> bool:
+    """Direct screen click — no UIA tree walk (RDP-safe)."""
+    coords = _calibrated_import_export_coords(win)
+    if coords is not None:
+        x, y = coords
+        return _click_screen_coords(
+            x, y, win=win, log=log, label="Import-Export click"
+        )
+    return _click_import_export_tab_rect(win, log=log)
+
+
+def _calibrated_batch_export_coords(win) -> tuple[int, int] | None:
+    coords = _env_screen_coords(
+        "WORLDSHIP_BATCH_EXPORT_ABS_X", "WORLDSHIP_BATCH_EXPORT_ABS_Y"
+    )
+    if coords is not None:
+        return coords
+    if _fast_ribbon_clicks_enabled(win):
+        anchor = _ribbon_content_anchor(win)
+        if anchor is not None:
+            ox = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_X", 285.0)
+            oy = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_Y", 42.0)
+            return int(anchor[0] + ox), int(anchor[1] + oy)
+    return None
+
+
+def click_batch_export(
+    win,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Open Batch Export from the Import-Export ribbon (coordinate-first on RDP)."""
+    emit = log or _log_default
+    focus_main_window(win, log=emit)
+    coords = _calibrated_batch_export_coords(win)
+    if coords is not None:
+        x, y = coords
+        emit("Fast ribbon: clicking Batch Export…")
+        _click_screen_coords(x, y, win=win, log=emit, label="Batch Export click")
+        return
+    emit('Clicking "Batch Export" (UIA)…')
+    click_ribbon(
+        win,
+        title="Batch Export",
+        control_types=("Button", "SplitButton", "MenuItem"),
+        timeout_s=8.0,
+        log=emit,
+    )
 
 
 def _fast_ribbon_clicks_enabled(win=None) -> bool:
@@ -844,22 +941,12 @@ def _click_batch_import_by_position(
     When UIA cannot name ribbon buttons (common over RDP), click Batch Import
     below the tab strip, offset from the left ribbon edge (Home tab).
     """
-    from pywinauto import mouse
-
-    abs_coords = _env_screen_coords(
-        "WORLDSHIP_BATCH_IMPORT_ABS_X", "WORLDSHIP_BATCH_IMPORT_ABS_Y"
-    )
-    if abs_coords is not None:
-        x, y = abs_coords
-        log(f"Coordinate click for Batch Import at ({x}, {y}) [calibrated ABS]…")
-        try:
-            focus_main_window(win, log=log)
-            mouse.click(button="left", coords=(x, y))
-            time.sleep(0.35)
-            return True
-        except Exception as exc:
-            log(f"WARN: coordinate Batch Import click: {exc}")
-            return False
+    calibrated = _calibrated_batch_import_coords(win)
+    if calibrated is not None:
+        x, y = calibrated
+        return _click_screen_coords(
+            x, y, win=win, log=log, label="Batch Import click"
+        )
 
     anchor = _ribbon_content_anchor(win)
     if anchor is None:
@@ -870,18 +957,13 @@ def _click_batch_import_by_position(
     offset_y = _step_wait_s("WORLDSHIP_BATCH_IMPORT_OFFSET_Y", 42.0)
     x = int(anchor_x + offset_x)
     y = int(anchor_y + offset_y)
-    log(
-        f"Coordinate click for Batch Import at ({x}, {y}) "
-        f"(anchor left edge {anchor_x}, tab strip bottom {anchor_y})…"
+    return _click_screen_coords(
+        x,
+        y,
+        win=win,
+        log=log,
+        label=f"Batch Import click (anchor {anchor_x}, {anchor_y})",
     )
-    try:
-        focus_main_window(win, log=log)
-        mouse.click(button="left", coords=(x, y))
-        time.sleep(_click_settle_s(win))
-        return True
-    except Exception as exc:
-        log(f"WARN: coordinate Batch Import click: {exc}")
-        return False
 
 
 def click_ribbon(
@@ -1009,7 +1091,7 @@ def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
     fast = _fast_ribbon_clicks_enabled(win)
     tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
     after_tab_s = _import_pacing_s(
-        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.3, win
+        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win
     )
 
     def _batch_visible() -> bool:
@@ -1019,15 +1101,10 @@ def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
 
     if fast:
         log("Fast ribbon: single Import-Export tab click…")
-        if _env_screen_coords(
-            "WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"
-        ):
-            _click_import_export_by_position(win, log=log)
-        else:
-            _click_import_export_tab_rect(win, log=log)
+        _click_import_export_tab_fast(win, log=log)
         if after_tab_s > 0:
             time.sleep(after_tab_s)
-        return _batch_visible()
+        return True
 
     attempts = (
         ("Import-Export tab rect", lambda: _click_import_export_tab_rect(win, log=log)),

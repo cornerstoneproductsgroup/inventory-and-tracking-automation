@@ -43,6 +43,8 @@ Example (6 shipments):
 4. **Phase 4** — **End of Day** → **Yes** → wait for processing.
 5. **Phase 5** — **Import-Export** → **Batch Export** → check **All records on or after** → type today’s date manually (`18-May-2026` format) → **Next** → preview **Next** → **Save** on summary.
 
+**Standalone export:** Menu **W → 3 Export Tracking**, or `Run WorldShip Export.bat`, or `run_worldship_export.py` — same export steps without import/labels/End of Day.
+
 ## Automatic Processing Progress — do not click Stop
 
 While WorldShip shows **Automatic Processing Progress**, the batch runs shipment-by-shipment. After you save one label, WorldShip must **keep processing** so the next **Save Print Output As** dialog appears.
@@ -71,7 +73,7 @@ On **Remote Workstation**, fast import mode skips slow full-window UIA tree scan
 | Setting | Standard default | Fast default (calibrated RDP) |
 |---------|------------------|-------------------------------|
 | `WORLDSHIP_AFTER_FOREGROUND_S` | 1.5 | 0.4 |
-| `WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S` | 0.75 | 0.3 |
+| `WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S` | 0.75 | 0.15 |
 | `WORLDSHIP_AFTER_BATCH_IMPORT_OPEN_S` | 2.5 | 0 (poll wizard) |
 | `WORLDSHIP_BEFORE_NEXT_WAIT_S` | 0.75 | 0.35 |
 | `WORLDSHIP_PREVIEW_BEFORE_NEXT_S` | 2 | 1 |
@@ -80,8 +82,10 @@ On **Remote Workstation**, fast import mode skips slow full-window UIA tree scan
 
 - `WORLDSHIP_RIBBON_UIA_TIMEOUT_S` — seconds to try UIA before coordinate click fallback (default 2)
 - `WORLDSHIP_BATCH_IMPORT_OFFSET_X` / `WORLDSHIP_BATCH_IMPORT_OFFSET_Y` — offset from the **left ribbon edge** (Home tab) to Batch Import (defaults **95** / **42**, calibrated to screen point 1276, 232 on Remote Workstation)
-- `WORLDSHIP_IMPORT_EXPORT_ABS_X` / `WORLDSHIP_IMPORT_EXPORT_ABS_Y` — optional fixed screen click for Import-Export tab (e.g. 1464 / 182)
-- `WORLDSHIP_BATCH_IMPORT_ABS_X` / `WORLDSHIP_BATCH_IMPORT_ABS_Y` — optional fixed screen click for Batch Import (e.g. 1276 / 232)
+- `WORLDSHIP_IMPORT_EXPORT_ABS_X` / `WORLDSHIP_IMPORT_EXPORT_ABS_Y` — optional fixed screen click for Import-Export tab (fast mode default **1464 / 182** on Remote Workstation)
+- `WORLDSHIP_BATCH_IMPORT_ABS_X` / `WORLDSHIP_BATCH_IMPORT_ABS_Y` — optional fixed screen click for Batch Import (fast mode default **1276 / 232** on Remote Workstation)
+- `WORLDSHIP_BATCH_EXPORT_OFFSET_X` / `WORLDSHIP_BATCH_EXPORT_OFFSET_Y` — offset from left ribbon edge to Batch Export button (defaults **285 / 42**; 4th ribbon button)
+- `WORLDSHIP_BATCH_EXPORT_ABS_X` / `WORLDSHIP_BATCH_EXPORT_ABS_Y` — optional fixed screen click for Batch Export if offset misses
 - `WORLDSHIP_REMOTE_WORKSTATION` — set to `1` to force coordinate-first ribbon clicks (auto-detected when window title contains "Remote Workstation")
 
 **Label save phase:**
