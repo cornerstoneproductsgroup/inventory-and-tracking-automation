@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v11"
+_RIBBON_VERSION = "ribbon-click-v12"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -638,7 +638,70 @@ def _calibrated_batch_export_coords(win) -> tuple[int, int] | None:
             ox = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_X", 285.0)
             oy = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_Y", 42.0)
             return int(anchor[0] + ox), int(anchor[1] + oy)
+        return 1466, 232
     return None
+
+
+def _resolve_import_export_coords(win) -> tuple[int, int]:
+    """Screen point for Import-Export tab (env → fast/RDP default → fallback)."""
+    coords = _env_screen_coords(
+        "WORLDSHIP_IMPORT_EXPORT_ABS_X", "WORLDSHIP_IMPORT_EXPORT_ABS_Y"
+    )
+    if coords is not None:
+        return coords
+    if _fast_ribbon_clicks_enabled(win):
+        return 1464, 182
+    return 1464, 182
+
+
+def _resolve_batch_export_coords(win) -> tuple[int, int]:
+    """Screen point for Batch Export button (env → offset → fallback)."""
+    coords = _env_screen_coords(
+        "WORLDSHIP_BATCH_EXPORT_ABS_X", "WORLDSHIP_BATCH_EXPORT_ABS_Y"
+    )
+    if coords is not None:
+        return coords
+    if _fast_ribbon_clicks_enabled(win):
+        anchor = _ribbon_content_anchor(win)
+        if anchor is not None:
+            ox = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_X", 285.0)
+            oy = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_Y", 42.0)
+            return int(anchor[0] + ox), int(anchor[1] + oy)
+        return 1466, 232
+    return 1466, 232
+
+
+def ensure_import_export_tab_for_export(
+    win,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Always click Import-Export via coordinates — never skip (export workflow)."""
+    emit = log or _log_default
+    x, y = _resolve_import_export_coords(win)
+    emit(f"Export: clicking Import-Export tab at ({x}, {y})…")
+    focus_main_window(win, log=emit)
+    if not _click_screen_coords(
+        x, y, win=win, log=emit, label="Import-Export tab"
+    ):
+        raise RuntimeError(f"Import-Export tab click failed at ({x}, {y})")
+    after_s = _import_pacing_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win)
+    if after_s > 0:
+        time.sleep(after_s)
+
+
+def click_batch_export_for_export(
+    win,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Always click Batch Export via coordinates — never UIA-only (export workflow)."""
+    emit = log or _log_default
+    x, y = _resolve_batch_export_coords(win)
+    emit(f"Export: clicking Batch Export at ({x}, {y})…")
+    focus_main_window(win, log=emit)
+    if not _click_screen_coords(x, y, win=win, log=emit, label="Batch Export"):
+        raise RuntimeError(f"Batch Export click failed at ({x}, {y})")
 
 
 def click_batch_export(
@@ -646,16 +709,13 @@ def click_batch_export(
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Open Batch Export from the Import-Export ribbon (coordinate-first on RDP)."""
-    emit = log or _log_default
-    focus_main_window(win, log=emit)
-    coords = _calibrated_batch_export_coords(win)
-    if coords is not None:
-        x, y = coords
-        emit("Fast ribbon: clicking Batch Export…")
-        _click_screen_coords(x, y, win=win, log=emit, label="Batch Export click")
+    """Open Batch Export — export workflow uses coordinates; else UIA fallback."""
+    if _calibrated_batch_export_coords(win) is not None or _fast_ribbon_clicks_enabled(win):
+        click_batch_export_for_export(win, log=log)
         return
+    emit = log or _log_default
     emit('Clicking "Batch Export" (UIA)…')
+    focus_main_window(win, log=emit)
     click_ribbon(
         win,
         title="Batch Export",

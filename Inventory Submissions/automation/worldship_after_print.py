@@ -934,25 +934,24 @@ def _check_all_records_on_or_after_uia(app, export_hwnd: int, today: date) -> No
 def _open_batch_export_dialog(app, main) -> int:
     """Import-Export tab → Batch Export → wait for export data dialog."""
     from automation.worldship_ribbon_click import (
-        _fast_ribbon_clicks_enabled,
-        click_batch_export,
-        ensure_import_export_tab,
+        _import_pacing_s,
+        click_batch_export_for_export,
+        ensure_import_export_tab_for_export,
         focus_main_window,
     )
 
     attempts = _step_retry_attempts()
-    ready_timeout = _step_wait_s("WORLDSHIP_APP_READY_TIMEOUT_S", 180.0)
 
     for attempt in range(1, attempts + 1):
         _log(f"Batch Export attempt {attempt}/{attempts}…")
         try:
-            if not _fast_ribbon_clicks_enabled(main):
-                _wait_worldship_app_ready(
-                    main, timeout_s=ready_timeout, step_label="Before Batch Export"
-                )
             focus_main_window(main, log=_log)
-            ensure_import_export_tab(main, log=_log)
-            click_batch_export(main, log=_log)
+            after_fg_s = _import_pacing_s("WORLDSHIP_AFTER_FOREGROUND_S", 1.5, 0.4, main)
+            if after_fg_s > 0:
+                _log(f"Waiting {after_fg_s:.1f}s after foreground…")
+                time.sleep(after_fg_s)
+            ensure_import_export_tab_for_export(main, log=_log)
+            click_batch_export_for_export(main, log=_log)
             export_hwnd = _wait_for_dialog("Batch export", timeout_s=45.0)
             _log("Verified: Batch export dialog opened.")
             return export_hwnd
@@ -1021,11 +1020,14 @@ def run_worldship_batch_export(*, export_date: date | None = None) -> None:
         _resolve_main_window,
         _startup_timeout_s,
     )
+    from automation.worldship_ribbon_click import _running_over_rdp
 
     Application, _ = _require_pywinauto()
     app, cold = _connect_or_start(Application, startup_timeout_s=_startup_timeout_s())
     main = _resolve_main_window(app, cold_start=cold)
     _focus_main_window(main)
+    if _running_over_rdp(main):
+        _log("Export: using calibrated screen coordinates (Remote Workstation).")
     run_batch_export_workflow(app, main, today=export_date)
 
 
