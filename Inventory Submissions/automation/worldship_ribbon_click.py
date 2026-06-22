@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v12"
+_RIBBON_VERSION = "ribbon-click-v13"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -176,8 +176,6 @@ def _click_point_in_rect(
     Click inside a control rect. TabItem rects from UIA often include the window
     top border; center clicks land on the move/resize zone (four-arrow cursor).
     """
-    from pywinauto import mouse
-
     emit = log or _log_default
     try:
         left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
@@ -199,8 +197,9 @@ def _click_point_in_rect(
             y = top + max(6, h // 2)
 
         emit(f"Mouse click at ({x}, {y}) [{control_type or 'control'}]")
-        mouse.click(button="left", coords=(x, y))
-        return True
+        return _physical_screen_click(
+            x, y, win=win, log=emit, label=control_type or "control"
+        )
     except Exception as exc:
         emit(f"WARN: mouse click in rect: {exc}")
         return False
@@ -594,6 +593,48 @@ def _calibrated_batch_import_coords(win) -> tuple[int, int] | None:
     return None
 
 
+def _physical_screen_click(
+    x: int,
+    y: int,
+    *,
+    win,
+    log: Callable[[str], None],
+    label: str,
+) -> bool:
+    """
+    Move the real mouse and click (works over RDP; pywinauto.mouse.click alone often does not).
+    """
+    import win32api
+    import win32con
+
+    ix, iy = int(x), int(y)
+    log(f"{label} at ({ix}, {iy}) [physical mouse]…")
+    focus_main_window(win, log=log)
+    time.sleep(0.15)
+
+    try:
+        win32api.SetCursorPos((ix, iy))
+        time.sleep(0.08)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(_click_settle_s(win))
+        return True
+    except Exception as exc:
+        log(f"WARN: physical mouse click failed: {exc}")
+
+    try:
+        from pywinauto import mouse
+
+        mouse.click(button="left", coords=(ix, iy))
+        time.sleep(_click_settle_s(win))
+        log(f"{label} at ({ix}, {iy}) [pywinauto fallback]…")
+        return True
+    except Exception as exc:
+        log(f"WARN: pywinauto click failed: {exc}")
+        return False
+
+
 def _click_screen_coords(
     x: int,
     y: int,
@@ -602,17 +643,7 @@ def _click_screen_coords(
     log: Callable[[str], None],
     label: str,
 ) -> bool:
-    from pywinauto import mouse
-
-    log(f"{label} at ({x}, {y})…")
-    try:
-        focus_main_window(win, log=log)
-        mouse.click(button="left", coords=(x, y))
-        time.sleep(_click_settle_s(win))
-        return True
-    except Exception as exc:
-        log(f"WARN: {label} failed: {exc}")
-        return False
+    return _physical_screen_click(x, y, win=win, log=log, label=label)
 
 
 def _click_import_export_tab_fast(win, *, log: Callable[[str], None]) -> bool:
@@ -676,16 +707,23 @@ def ensure_import_export_tab_for_export(
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Always click Import-Export via coordinates — never skip (export workflow)."""
+    """Always activate Import-Export — tab rect click first, then calibrated coordinates."""
     emit = log or _log_default
-    x, y = _resolve_import_export_coords(win)
-    emit(f"Export: clicking Import-Export tab at ({x}, {y})…")
     focus_main_window(win, log=emit)
-    if not _click_screen_coords(
+    after_s = _import_pacing_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win)
+
+    emit("Export: clicking Import-Export tab…")
+    if _click_import_export_tab_rect(win, log=emit):
+        if after_s > 0:
+            time.sleep(after_s)
+        return
+
+    x, y = _resolve_import_export_coords(win)
+    emit(f"Export: Import-Export coordinate fallback at ({x}, {y})…")
+    if not _physical_screen_click(
         x, y, win=win, log=emit, label="Import-Export tab"
     ):
         raise RuntimeError(f"Import-Export tab click failed at ({x}, {y})")
-    after_s = _import_pacing_s("WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win)
     if after_s > 0:
         time.sleep(after_s)
 
@@ -695,13 +733,43 @@ def click_batch_export_for_export(
     *,
     log: Callable[[str], None] | None = None,
 ) -> None:
-    """Always click Batch Export via coordinates — never UIA-only (export workflow)."""
+    """Click Batch Export — try several X offsets (4th ribbon button; calibrate via .env)."""
     emit = log or _log_default
-    x, y = _resolve_batch_export_coords(win)
-    emit(f"Export: clicking Batch Export at ({x}, {y})…")
     focus_main_window(win, log=emit)
-    if not _click_screen_coords(x, y, win=win, log=emit, label="Batch Export"):
-        raise RuntimeError(f"Batch Export click failed at ({x}, {y})")
+
+    anchor = _ribbon_content_anchor(win)
+    base_y = (
+        int(anchor[1] + _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_Y", 42.0))
+        if anchor
+        else 232
+    )
+    base_x = _step_wait_s("WORLDSHIP_BATCH_EXPORT_OFFSET_X", 285.0)
+    abs_coords = _env_screen_coords(
+        "WORLDSHIP_BATCH_EXPORT_ABS_X", "WORLDSHIP_BATCH_EXPORT_ABS_Y"
+    )
+    if abs_coords is not None:
+        candidates = [abs_coords]
+    elif anchor is not None:
+        ax = int(anchor[0])
+        candidates = [
+            (int(ax + base_x + dx), base_y)
+            for dx in (0.0, -30.0, 30.0, 60.0, -60.0, 90.0)
+        ]
+    else:
+        candidates = [_resolve_batch_export_coords(win)]
+
+    emit(f"Export: trying Batch Export click(s) at Y={base_y}…")
+    for x, y in candidates:
+        if not _physical_screen_click(x, y, win=win, log=emit, label="Batch Export"):
+            continue
+        time.sleep(0.35)
+        if _visible_top_level_windows_with_text("batch export"):
+            emit("Batch export dialog detected.")
+            return
+    raise RuntimeError(
+        f"Batch Export click failed (tried {len(candidates)} point(s)). "
+        "Set WORLDSHIP_BATCH_EXPORT_ABS_X/Y in .env."
+    )
 
 
 def click_batch_export(

@@ -952,7 +952,7 @@ def _open_batch_export_dialog(app, main) -> int:
                 time.sleep(after_fg_s)
             ensure_import_export_tab_for_export(main, log=_log)
             click_batch_export_for_export(main, log=_log)
-            export_hwnd = _wait_for_dialog("Batch export", timeout_s=45.0)
+            export_hwnd = _wait_for_dialog("Batch export", timeout_s=8.0)
             _log("Verified: Batch export dialog opened.")
             return export_hwnd
         except Exception as exc:
