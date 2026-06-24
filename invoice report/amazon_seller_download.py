@@ -343,21 +343,31 @@ def _has_seller_central_access(page: Page, cfg: dict[str, Any]) -> bool:
     return False
 
 
-def _open_seller_central_home(page: Page, cfg: dict[str, Any]) -> None:
+def _open_seller_central_home(page: Page, cfg: dict[str, Any]) -> Page:
     home_url = (cfg.get("amazon", {}).get("home_url") or "").strip()
     if not home_url:
         home_url = "https://sellercentral.amazon.com/home"
-    _log(f"Opening Seller Central home: {home_url}")
-    page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-    page.wait_for_timeout(2000)
+    from amazon_chrome_launch import (
+        _is_blank_tab_url,
+        _is_seller_central_url,
+        _page_url,
+        bootstrap_seller_central_page,
+    )
+
+    current = _page_url(page)
+    if _is_blank_tab_url(current) or not _is_seller_central_url(current):
+        _log(f"Navigating to Seller Central (was {current!r})…")
+        return bootstrap_seller_central_page(page.context, home_url)
+    _log(f"Already on Seller Central: {current}")
+    return page
 
 
-def _ensure_authenticated(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> None:
-    _open_seller_central_home(page, cfg)
+def _ensure_authenticated(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> Page:
+    page = _open_seller_central_home(page, cfg)
 
     if _has_seller_central_access(page, cfg):
         _log("Already signed in to Seller Central (Chrome session).")
-        return
+        return page
 
     if _is_sign_in_page(page, cfg):
         if creds is None:
@@ -369,7 +379,7 @@ def _ensure_authenticated(page: Page, cfg: dict[str, Any], creds: AmazonSellerCr
         _log("Sign-in page — logging in with credentials from .env.")
         _perform_amazon_login(page, cfg, creds)
         _wait_for_logged_in(page, cfg)
-        return
+        return page
 
     reports_url = (cfg.get("amazon", {}).get("reports_url") or "").strip()
     if reports_url:
@@ -377,25 +387,25 @@ def _ensure_authenticated(page: Page, cfg: dict[str, Any], creds: AmazonSellerCr
         page.goto(reports_url, wait_until="domcontentloaded", timeout=120_000)
         page.wait_for_timeout(2000)
         if _has_seller_central_access(page, cfg) or _is_reports_page(page):
-            return
+            return page
 
     if _is_sign_in_page(page, cfg):
         if creds is None:
             raise AmazonSellerDownloadError("Amazon sign-in required — configure credentials or Chrome profile.")
         _perform_amazon_login(page, cfg, creds)
         _wait_for_logged_in(page, cfg)
-        return
+        return page
 
     if not _has_seller_central_access(page, cfg):
         raise AmazonSellerDownloadError(
             f"Could not confirm Seller Central login (URL: {page.url})."
         )
+    return page
 
 
-def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> None:
+def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> Page:
     if uses_chrome_session():
-        _ensure_authenticated(page, cfg, creds)
-        return
+        return _ensure_authenticated(page, cfg, creds)
 
     if creds is None:
         raise AmazonSellerDownloadError("Amazon credentials are required when not using Chrome session reuse.")
@@ -407,7 +417,7 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredent
 
     if _has_reports_access(page, cfg):
         _log("Already logged in — Reports Repository form is ready.")
-        return
+        return page
 
     if _is_sign_in_page(page, cfg):
         _log("Sign-in page open — logging in on current page.")
@@ -416,7 +426,7 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredent
         if not _has_reports_access(page, cfg) and reports_url:
             page.goto(reports_url, wait_until="domcontentloaded", timeout=120_000)
             page.wait_for_timeout(2000)
-        return
+        return page
 
     _open_sign_in_page(page, cfg)
     _perform_amazon_login(page, cfg, creds)
@@ -430,6 +440,7 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredent
         raise AmazonSellerDownloadError(
             f"Could not reach Reports Repository after login (URL: {page.url})."
         )
+    return page
 
 
 def _reports_ui_ready(page: Page, cfg: dict[str, Any]) -> bool:
@@ -707,16 +718,15 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
 
     profile_dir = chrome_user_data_dir()
     if profile_dir:
+        from amazon_chrome_launch import launch_persistent_chrome
+
         profile_dir.mkdir(parents=True, exist_ok=True)
         _log(f"Launching Chrome with profile: {profile_dir}")
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            channel=chrome_channel(),
-            headless=use_headless,
-            slow_mo=slow_mo,
-            accept_downloads=True,
+        context, page = launch_persistent_chrome(
+            p,
+            user_data_dir=profile_dir,
+            home_url=home_url,
         )
-        page = context.pages[0] if context.pages else context.new_page()
         page.set_default_timeout(default_timeout)
         return page, context.close
 
@@ -758,7 +768,7 @@ def run_amazon_seller_download(
     with sync_playwright() as p:
         page, cleanup = _launch_page(p, cfg)
         try:
-            _login_if_needed(page, cfg, creds)
+            page = _login_if_needed(page, cfg, creds)
             _open_reports_repository(page, cfg)
             _select_deferred_transaction(page, cfg)
             _request_report(page, cfg)

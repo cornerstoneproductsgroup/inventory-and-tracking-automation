@@ -74,6 +74,23 @@ def chrome_profile_directory() -> str:
     )
 
 
+def resolve_chrome_persistent_dir() -> tuple[Path, list[str]]:
+    """
+    Playwright user_data_dir for Chrome.
+
+    Use the profile subfolder (e.g. User Data\\Default) when it exists — the parent
+    User Data path often leaves the first tab stuck on about:blank.
+    """
+    user_data = chrome_user_data_dir()
+    if user_data is None:
+        raise RuntimeError("Chrome User Data folder not found.")
+    profile = chrome_profile_directory()
+    profile_path = user_data / profile
+    if profile_path.is_dir():
+        return profile_path, []
+    return user_data, [f"--profile-directory={profile}"]
+
+
 def kill_chrome_before_launch() -> bool:
     _load_env()
     raw = (os.environ.get("AMAZON_KILL_CHROME") or os.environ.get("UPS_KILL_CHROME") or "1").strip().lower()
@@ -277,42 +294,93 @@ def ensure_chrome_closed_for_launch() -> None:
         )
 
 
+def launch_persistent_chrome(
+    playwright,
+    *,
+    user_data_dir: Path,
+    home_url: str,
+    extra_args: list[str] | None = None,
+):
+    """Playwright direct control — no remote debugging."""
+    exe = chrome_executable()
+    profile = chrome_profile_directory()
+    _log(f"Chrome profile dir: {user_data_dir}")
+    if exe:
+        _log(f"Chrome exe: {exe}")
+
+    launch_args = [
+        "--disable-session-crashed-bubble",
+        "--disable-restore-session-state",
+        "--no-first-run",
+        "--no-default-browser-check",
+        home_url,
+    ]
+    if extra_args:
+        launch_args = extra_args + launch_args
+
+    launch_kwargs: dict[str, Any] = {
+        "headless": False,
+        "accept_downloads": True,
+        "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+        "args": launch_args,
+        "channel": "chrome",
+    }
+    if exe is not None:
+        launch_kwargs["executable_path"] = str(exe)
+
+    context = playwright.chromium.launch_persistent_context(
+        str(user_data_dir),
+        **launch_kwargs,
+    )
+
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if context.pages:
+            break
+        time.sleep(0.2)
+
+    for pg in context.pages:
+        if _is_seller_central_url(_page_url(pg)) and not _is_blank_tab_url(_page_url(pg)):
+            _log(f"Chrome opened Seller Central tab: {_page_url(pg)!r}")
+            pg.bring_to_front()
+            page = bootstrap_seller_central_page(context, home_url)
+            assert_chrome_context(context)
+            return context, page
+
+    for pg in list(context.pages):
+        try:
+            pg.close()
+        except Exception:
+            pass
+
+    page = context.new_page()
+    page.bring_to_front()
+    page = bootstrap_seller_central_page(context, home_url)
+    assert_chrome_context(context)
+    return context, page
+
+
 def launch_persistent_system_chrome(playwright, *, home_url: str):
     """
     Open installed Chrome with the normal User Data profile.
     Playwright controls the browser directly (no debug port required).
     """
-    exe = chrome_executable()
-    user_data = chrome_user_data_dir()
-    if exe is None:
+    if chrome_executable() is None:
         raise RuntimeError("Google Chrome not found. Set AMAZON_CHROME_EXE in .env.")
-    if user_data is None:
-        raise RuntimeError("Chrome User Data folder not found.")
 
+    user_data, extra_args = resolve_chrome_persistent_dir()
     profile = chrome_profile_directory()
-    _log(f"Chrome exe: {exe}")
-    _log(f"Chrome profile: {user_data} \\ {profile}")
+    _log(f"Chrome profile name: {profile}")
     ensure_chrome_closed_for_launch()
+    time.sleep(2.0)
 
     _log("Opening Chrome with your normal profile (direct automation control)…")
-    context = playwright.chromium.launch_persistent_context(
-        str(user_data),
-        channel="chrome",
-        headless=False,
-        accept_downloads=True,
-        ignore_default_args=["--enable-automation"],
-        args=[
-            f"--profile-directory={profile}",
-            "--disable-session-crashed-bubble",
-            "--disable-restore-session-state",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
+    return launch_persistent_chrome(
+        playwright,
+        user_data_dir=user_data,
+        home_url=home_url,
+        extra_args=extra_args,
     )
-    page = context.pages[0] if context.pages else context.new_page()
-    page = bootstrap_seller_central_page(context, home_url)
-    assert_chrome_context(context)
-    return context, page
 
 
 def launch_chrome_for_cdp(
@@ -581,8 +649,22 @@ def pick_seller_central_page(context, *, home_url: str):
 def bootstrap_seller_central_page(context, home_url: str):
     """Fix about:blank startup tab — call right after opening the browser."""
     _log_browser_tabs(context)
-    driver = pick_seller_central_page(context, home_url=home_url)
-    driver.bring_to_front()
+
+    if not context.pages or all(_is_blank_tab_url(_page_url(pg)) for pg in context.pages):
+        _log("Startup tab is blank — opening a fresh tab for Seller Central…")
+        driver = context.new_page()
+        driver.bring_to_front()
+        for pg in list(context.pages):
+            if pg is driver:
+                continue
+            try:
+                pg.close()
+            except Exception:
+                pass
+    else:
+        driver = pick_seller_central_page(context, home_url=home_url)
+        driver.bring_to_front()
+
     current = _page_url(driver).lower()
     if _is_blank_tab_url(current) or not _is_seller_central_url(current):
         driver = _load_seller_central_in_tab(driver, home_url)
