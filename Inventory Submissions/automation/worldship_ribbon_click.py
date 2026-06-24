@@ -7,7 +7,7 @@ import re
 import time
 from typing import Callable
 
-_RIBBON_VERSION = "ribbon-click-v15"
+_RIBBON_VERSION = "ribbon-click-v16"
 _AUTO_PROCESS_LABEL_SNIPPET = "process shipments automatically"
 _BATCH_IMPORT_TITLE_SNIPPET = "batch import"
 
@@ -116,7 +116,7 @@ def focus_main_window(win, *, log: Callable[[str], None] | None = None) -> None:
 
 
 def _click_hwnd(hwnd: int, *, log: Callable[[str], None] | None = None) -> bool:
-    """BM_CLICK then mouse at control center."""
+    """BM_CLICK then physical mouse at control center."""
     import win32api
     import win32con
     import win32gui
@@ -129,6 +129,16 @@ def _click_hwnd(hwnd: int, *, log: Callable[[str], None] | None = None) -> bool:
     except Exception as exc:
         emit(f"WARN: BM_CLICK on hwnd {hwnd}: {exc}")
 
+    return _click_hwnd_physical(hwnd, log=emit)
+
+
+def _click_hwnd_physical(hwnd: int, *, log: Callable[[str], None] | None = None) -> bool:
+    """Move mouse to hwnd center and click (works over RDP)."""
+    import win32api
+    import win32con
+    import win32gui
+
+    emit = log or _log_default
     try:
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         if right - left < 2 or bottom - top < 2:
@@ -136,12 +146,15 @@ def _click_hwnd(hwnd: int, *, log: Callable[[str], None] | None = None) -> bool:
         x = (left + right) // 2
         y = (top + bottom) // 2
         win32api.SetCursorPos((x, y))
+        time.sleep(0.05)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.04)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         return True
     except Exception as exc:
-        emit(f"WARN: mouse click on hwnd {hwnd}: {exc}")
+        emit(f"WARN: physical click on hwnd {hwnd}: {exc}")
         return False
+
 
 
 def _control_type(target) -> str:
@@ -844,7 +857,7 @@ def _batch_import_attempts(win=None) -> int:
             return max(1, int(raw))
         except ValueError:
             pass
-    return 1 if _fast_ribbon_clicks_enabled(win) else 6
+    return 2 if _fast_ribbon_clicks_enabled(win) else 6
 
 
 def _modal_dialog_titles(*needles: str) -> list[str]:
@@ -1088,8 +1101,22 @@ def _click_batch_import_win32(win, *, log: Callable[[str], None]) -> bool:
     for needle in needles:
         for ch in _enum_hwnds_with_text(root_hwnd, needle):
             log(f"Win32 click hwnd {ch} for {needle!r}…")
-            if _click_hwnd(ch, log=log):
+            if _click_hwnd_physical(ch, log=log):
                 return True
+    return False
+
+
+def _click_batch_import_child_window(win, *, log: Callable[[str], None]) -> bool:
+    for ctype in ("Button", "SplitButton", "MenuItem", "Hyperlink"):
+        try:
+            btn = win.child_window(title="Batch Import", control_type=ctype)
+            if not btn.exists(timeout=0.25):
+                continue
+            log(f"Batch Import via child_window ({ctype})…")
+            if _try_uia_click(btn, win=win, log=log):
+                return True
+        except Exception:
+            continue
     return False
 
 
@@ -1290,26 +1317,133 @@ def _click_import_export_tab_rect(
     return False
 
 
+def _batch_import_on_ribbon(win) -> bool:
+    """True when Batch Import is visible (Import-Export panel is active, not Home)."""
+    try:
+        root = int(win.handle)
+    except Exception:
+        return False
+    for needle in ("Batch Import", "Batch  Import", "BatchImport"):
+        if _enum_hwnds_with_text(root, needle):
+            return True
+    for ctype in ("Button", "SplitButton", "MenuItem", "Hyperlink"):
+        try:
+            btn = win.child_window(title="Batch Import", control_type=ctype)
+            if btn.exists(timeout=0.2):
+                try:
+                    return btn.is_visible()
+                except Exception:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_import_export_tab_child_window(win, *, log: Callable[[str], None]) -> bool:
+    for label in ("Import-Export", "Import Export"):
+        for ctype in ("TabItem", "Button"):
+            try:
+                tab = win.child_window(title=label, control_type=ctype)
+                if not tab.exists(timeout=0.25):
+                    continue
+                log(f"Import-Export tab via child_window ({label!r}, {ctype})…")
+                if _try_uia_click(tab, win=win, log=log):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _click_import_export_tab_win32(win, *, log: Callable[[str], None]) -> bool:
+    try:
+        root = int(win.handle)
+    except Exception:
+        return False
+    for needle in ("Import-Export", "Import Export", "Import&-Export"):
+        for ch in _enum_hwnds_with_text(root, needle):
+            log(f"Import-Export Win32 hwnd {ch} ({needle!r})…")
+            if _click_hwnd_physical(ch, log=log):
+                return True
+    return False
+
+
+def _click_import_export_tab_coords(win, *, log: Callable[[str], None]) -> bool:
+    x, y = _resolve_import_export_coords(win)
+    return _physical_screen_click(
+        x, y, win=win, log=log, label="Import-Export tab"
+    )
+
+
+def _activate_import_export_tab_fast(
+    win,
+    *,
+    log: Callable[[str], None],
+    after_tab_s: float,
+) -> bool:
+    """
+    Select Import-Export without slow UIA tree walks; verify Batch Import appears.
+    """
+    focus_main_window(win, log=log)
+
+    if _batch_import_on_ribbon(win):
+        log("Import-Export panel already active (Batch Import on ribbon).")
+        return True
+
+    steps: list[tuple[str, Callable[[], bool]]] = [
+        ("Import-Export child_window", lambda: _click_import_export_tab_child_window(win, log=log)),
+        ("Import-Export Win32", lambda: _click_import_export_tab_win32(win, log=log)),
+        ("Import-Export coordinates", lambda: _click_import_export_tab_coords(win, log=log)),
+    ]
+
+    for name, fn in steps:
+        if _batch_import_on_ribbon(win):
+            log(f"Import-Export active — {name} not needed.")
+            return True
+        log(f"Fast ribbon: {name}…")
+        try:
+            fn()
+        except Exception as exc:
+            log(f"WARN: {name} failed: {exc}")
+        if after_tab_s > 0:
+            time.sleep(after_tab_s)
+        if _batch_import_on_ribbon(win):
+            log(f"Import-Export active after {name}.")
+            return True
+
+    x, y = _resolve_import_export_coords(win)
+    log(f"Fast ribbon: Import-Export coordinate retry (2 clicks) at ({x}, {y})…")
+    _physical_screen_click(x, y, win=win, log=log, label="Import-Export tab")
+    time.sleep(0.1)
+    _physical_screen_click(x, y, win=win, log=log, label="Import-Export tab retry")
+    if after_tab_s > 0:
+        time.sleep(after_tab_s)
+
+    if _batch_import_on_ribbon(win):
+        log("Import-Export active after coordinate retry.")
+        return True
+
+    log(
+        "WARN: Batch Import still not on ribbon — Home tab may still be active. "
+        "Check WORLDSHIP_IMPORT_EXPORT_ABS_X/Y if coordinates drifted."
+    )
+    return False
+
+
 def _activate_import_export_tab(win, *, log: Callable[[str], None]) -> bool:
-    """Try several ways to select Import-Export; return True if Batch Import is visible to UIA."""
+    """Try several ways to select Import-Export; return True if Batch Import is on ribbon."""
     fast = _fast_ribbon_clicks_enabled(win)
     tab_timeout = _step_wait_s("WORLDSHIP_IMPORT_EXPORT_TAB_TIMEOUT_S", 5.0)
     after_tab_s = _import_pacing_s(
-        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.15, win
+        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.4, win
     )
 
+    if fast:
+        return _activate_import_export_tab_fast(win, log=log, after_tab_s=after_tab_s)
+
     def _batch_visible() -> bool:
-        return ribbon_action_available(
+        return _batch_import_on_ribbon(win) or ribbon_action_available(
             win, "Batch Import", ("Button", "MenuItem", "SplitButton", "Hyperlink")
         )
-
-    if fast:
-        log("Fast ribbon: Import-Export tab click (coordinates)…")
-        focus_main_window(win, log=log)
-        _click_import_export_tab_fast(win, log=log)
-        if after_tab_s > 0:
-            time.sleep(after_tab_s)
-        return True
 
     attempts = (
         ("Import-Export tab rect", lambda: _click_import_export_tab_rect(win, log=log)),
@@ -1411,6 +1545,12 @@ def click_batch_import(
     emit("Ensuring Import-Export tab is active…")
     ensure_import_export_tab(win, log=emit)
 
+    if fast and not _batch_import_on_ribbon(win):
+        emit(
+            "WARN: Batch Import not on ribbon after tab click — "
+            "Import-Export may not have activated."
+        )
+
     coordinate_strategies: list[tuple[str, Callable[[], bool]]] = [
         (
             "coordinate default",
@@ -1423,19 +1563,29 @@ def click_batch_import(
     ]
     uia_strategies: list[tuple[str, Callable[[], bool]]] = [
         ("Win32 child", lambda: _click_batch_import_win32(win, log=emit)),
+        ("UIA child_window", lambda: _click_batch_import_child_window(win, log=emit)),
         ("UIA exact", lambda: _click_batch_import_exact(win, log=emit)),
         ("UIA fuzzy", lambda: _click_batch_import_fuzzy(win, log=emit)),
     ]
     if fast:
-        emit("Fast ribbon: calibrated coordinates first (no slow UIA tree scans).")
-        strategies = coordinate_strategies[:1] + uia_strategies[:2] + coordinate_strategies[1:]
+        emit(
+            "Fast ribbon: Win32/child_window first, then coordinates "
+            "(Import-Export tab must be active)."
+        )
+        strategies = uia_strategies[:2] + coordinate_strategies
     elif _running_over_rdp(win):
         strategies = coordinate_strategies + uia_strategies
     else:
         strategies = uia_strategies + coordinate_strategies
 
     last_strategy = ""
+    after_tab_s = _import_pacing_s(
+        "WORLDSHIP_AFTER_IMPORT_EXPORT_TAB_S", 0.75, 0.4, win
+    )
     for attempt in range(1, attempts + 1):
+        if fast and (attempt > 1 or not _batch_import_on_ribbon(win)):
+            emit(f"Batch Import try {attempt}/{attempts}: re-activate Import-Export tab…")
+            _activate_import_export_tab_fast(win, log=emit, after_tab_s=after_tab_s)
         for strategy_name, fn in strategies:
             emit(f"Batch Import try {attempt}/{attempts}: {strategy_name}…")
             last_strategy = strategy_name
