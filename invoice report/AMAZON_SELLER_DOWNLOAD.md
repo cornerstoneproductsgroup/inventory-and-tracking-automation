@@ -1,46 +1,59 @@
-# Amazon Seller Central download
+# Amazon Seller Central download (Deferred Transaction CSV → Input share; watcher formats + prints)
 
 Downloads **Deferred Transaction** CSV from Payments → Reports Repository and saves to:
 
 `\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Amazon\Input`
 
-Filename: **`Amazon Invoice M-D-YYYY.csv`** (today’s date, e.g. `Amazon Invoice 6-24-2026.csv`).
+Filename: **`Amazon Invoice M-D-YYYY.csv`** (today’s date).
 
-Your **Amazon Invoice Watcher** picks up the file from Input, formats, and prints.
+## Use your normal Chrome login (default)
 
-## Chrome session (recommended)
+By default the script uses **your installed Chrome profile** (same cookies as when you open Chrome yourself). It does **not** use the empty `.amazon-chrome-profile` folder anymore.
 
-By default Playwright launches **Google Chrome** with a persistent profile at:
+**First run:** Chrome closes briefly, reopens with Seller Central, and automation continues while you stay logged in.
 
-`invoice report/.amazon-chrome-profile`
-
-1. First run: Chrome opens → sign in to Seller Central once (including 2FA if prompted).
-2. Later runs: session is reused — no login each time.
-
-### Reuse employee Chrome already open
-
-Start Chrome with remote debugging, then set in `invoice report/.env`:
+Add to `Inventory Submissions\.env` (optional):
 
 ```
-AMAZON_CHROME_CDP_URL=http://127.0.0.1:9222
+UPS_KILL_CHROME=1
+UPS_BROWSER_CHANNEL=chrome
 ```
 
-Example shortcut target:
+`UPS_KILL_CHROME=1` lets automation close Chrome before reopening with your profile. Without it, close all Chrome windows manually before running.
+
+### Option A — Let the script launch Chrome (easiest)
+
+1. Close Chrome (or set `UPS_KILL_CHROME=1`)
+2. Run `Run Amazon Seller Download.bat` or menu **R → 6**
+3. Chrome reopens already logged in if you use it daily for Seller Central
+
+### Option B — Keep Chrome open yourself
+
+1. Run **`Run Amazon Chrome Debug.bat`** once (starts Chrome with debug port 9222)
+2. Sign in to Seller Central in that window if needed
+3. Add to `.env`:
+   ```
+   AMAZON_CHROME_CDP_URL=http://127.0.0.1:9222
+   ```
+4. Run the download — attaches to that Chrome without closing it
+
+## Credentials (fallback)
+
+If sign-in is required:
 
 ```
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+AMAZON_USERNAME=you@company.com
+AMAZON_PASSWORD=...
 ```
 
-The script attaches to the open browser (employee must already be on Seller Central).
+(Read from `Inventory Submissions\.env` or `invoice report\.env`.)
 
-### Disable Chrome profile (fallback)
+## Disable system Chrome profile
 
-Use Playwright Chromium + credentials in `.env`:
+Use an isolated automation profile instead:
 
 ```
-AMAZON_CHROME_USER_DATA_DIR=disabled
-AMAZON_SELLER_EMAIL=...
-AMAZON_SELLER_PASSWORD=...
+AMAZON_CHROME_USE_SYSTEM_PROFILE=false
 ```
 
 ## Run
@@ -49,22 +62,4 @@ AMAZON_SELLER_PASSWORD=...
 Run Amazon Seller Download.bat
 ```
 
-or
-
-```
-python run_amazon_seller_download.py
-```
-
-Post-process after download is **off** by default (`AMAZON_DOWNLOAD_AUTO_POSTPROCESS=false`) — use the watcher.
-
-## Env
-
-| Variable | Default |
-|----------|---------|
-| `AMAZON_CHROME_USER_DATA_DIR` | `invoice report/.amazon-chrome-profile` |
-| `AMAZON_CHROME_CDP_URL` | (empty — attach to running Chrome) |
-| `AMAZON_REQUEST_REPORT_SETTLE_S` | 10 (wait after Request Report before Refresh) |
-| `AMAZON_REPORT_POLL_INTERVAL_S` | 8 |
-| `AMAZON_REPORT_MAX_REFRESH` | 20 |
-| `AMAZON_DOWNLOAD_AUTO_POSTPROCESS` | false |
-| `AMAZON_INVOICE_INPUT_DIR` | `...\Amazon\Input` |
+Post-process after download is **off** by default — use `Run Amazon Invoice Watcher.bat`.

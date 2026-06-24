@@ -58,7 +58,7 @@ def main() -> int:
     parser.add_argument(
         "--check-credentials",
         action="store_true",
-        help="Verify AMAZON_SELLER_EMAIL/PASSWORD in .env (no browser).",
+        help="Verify Amazon login vars in .env (no browser).",
     )
     args = parser.parse_args()
 

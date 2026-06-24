@@ -25,18 +25,37 @@ def resolve_input_dir() -> Path:
     return Path(raw).expanduser()
 
 
+def use_system_chrome_profile() -> bool:
+    """Use installed Chrome User Data (Default profile) via CDP — same login as daily Chrome."""
+    raw = (os.environ.get("AMAZON_CHROME_USE_SYSTEM_PROFILE") or "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def amazon_browser_cdp_port() -> int:
+    raw = (
+        os.environ.get("AMAZON_CHROME_CDP_PORT")
+        or os.environ.get("AMAZON_BROWSER_CDP_PORT")
+        or "9222"
+    ).strip()
+    try:
+        return max(1024, int(raw))
+    except ValueError:
+        return 9222
+
+
 def chrome_user_data_dir() -> Path | None:
     """
-    Chrome profile for Playwright persistent context (channel=chrome).
+    Optional isolated Playwright profile (only when AMAZON_CHROME_USE_SYSTEM_PROFILE=false).
 
-    Default: invoice report/.amazon-chrome-profile (log in once; session persists).
-    Set AMAZON_CHROME_USER_DATA_DIR=disabled to use Playwright Chromium + .env credentials.
-    """
+    Default: None — automation uses your installed Chrome profile via CDP instead.
+  """
     raw = (os.environ.get("AMAZON_CHROME_USER_DATA_DIR") or "").strip()
     if raw.lower() in ("0", "false", "no", "off", "none", "disable", "disabled"):
         return None
     if raw:
         return Path(raw).expanduser()
+    if use_system_chrome_profile():
+        return None
     return _SCRIPT_DIR / ".amazon-chrome-profile"
 
 
@@ -50,7 +69,7 @@ def chrome_cdp_url() -> str:
 
 
 def uses_chrome_session() -> bool:
-    return bool(chrome_cdp_url() or chrome_user_data_dir())
+    return bool(chrome_cdp_url() or use_system_chrome_profile() or chrome_user_data_dir())
 
 
 def amazon_input_filename(report_day: date) -> str:
