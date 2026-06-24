@@ -157,12 +157,21 @@ def label_save_gap_s() -> float:
 
 
 def warehouse_print_wait_s() -> float:
-    """How long to wait for a Save dialog on warehouse-print rows (usually none)."""
-    raw = (os.environ.get("WORLDSHIP_PRINT_WAIT_S") or "15").strip()
+    """Deprecated alias — use warehouse_print_advance_timeout_s()."""
+    return warehouse_print_advance_timeout_s()
+
+
+def warehouse_print_advance_timeout_s() -> float:
+    """Max seconds to wait for one warehouse-print shipment to finish."""
+    raw = (
+        os.environ.get("WORLDSHIP_PRINT_ADVANCE_TIMEOUT_S")
+        or os.environ.get("WORLDSHIP_PRINT_WAIT_S")
+        or "180"
+    ).strip()
     try:
-        return max(3.0, float(raw))
+        return max(30.0, float(raw))
     except ValueError:
-        return 15.0
+        return 180.0
 
 
 def retailer_merchant_to_key(merchant: str) -> str:
@@ -201,7 +210,7 @@ def daily_vendor_label_pdf_path(
 
 
 def label_postprocess_retailer_keys() -> frozenset[str]:
-    raw = (os.environ.get("WORLDSHIP_LABEL_POSTPROCESS_RETAILERS") or "dfc").strip()
+    raw = (os.environ.get("WORLDSHIP_LABEL_POSTPROCESS_RETAILERS") or "").strip()
     if not raw:
         return frozenset()
     return frozenset(k.strip().lower() for k in raw.split(",") if k.strip())

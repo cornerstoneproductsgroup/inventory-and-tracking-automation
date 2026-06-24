@@ -950,6 +950,20 @@ def _find_processing_progress() -> tuple[int, dict[str, int]] | None:
     return None
 
 
+def _parse_progress_percent(hwnd: int) -> int | None:
+    import re
+
+    for part in _safe_enum_child_text(hwnd):
+        m = re.search(r"(\d{1,3})\s*%", part)
+        if m:
+            return min(100, int(m.group(1)))
+    blob = " ".join(_safe_enum_child_text(hwnd))
+    m = re.search(r"(\d{1,3})\s*%", blob)
+    if m:
+        return min(100, int(m.group(1)))
+    return None
+
+
 def _try_resume_batch_processing(progress_hwnd: int) -> bool:
     """If the batch was paused (e.g. after Stop), try Process/Continue when offered."""
     for label in ("Process", "Continue", "Resume"):
@@ -972,14 +986,21 @@ def _wait_for_shipment_advance(
     """
     from automation.windows_save_as import find_save_as_dialog_hwnd
 
-    _log(f"{step_label}: waiting for warehouse print to finish…")
-    prog = _find_processing_progress()
-    prev_remaining = prog[1].get("remaining") if prog else None
-    prev_success = prog[1].get("successful") if prog else None
+    _log(
+        f"{step_label}: waiting for warehouse print to finish "
+        f"(up to {timeout_s:.0f}s)…"
+    )
+    baseline_remaining: int | None = None
+    baseline_successful: int | None = None
+    last_remaining: int | None = None
+    last_successful: int | None = None
 
     deadline = time.monotonic() + timeout_s
     stalled_at: float | None = None
     resume_attempted = False
+    last_log = 0.0
+    seen_progress = False
+    progress_log_interval_s = 8.0
 
     while time.monotonic() < deadline:
         if find_save_as_dialog_hwnd(log=False):
@@ -991,22 +1012,60 @@ def _wait_for_shipment_advance(
 
         prog = _find_processing_progress()
         if prog:
+            seen_progress = True
             hwnd, stats = prog
             remaining = stats.get("remaining")
             successful = stats.get("successful")
+            total = stats.get("total")
+            pct = _parse_progress_percent(hwnd)
 
-            if prev_remaining is not None and remaining is not None and remaining < prev_remaining:
-                _log(f"{step_label}: next shipment (remaining {prev_remaining} → {remaining}).")
+            if baseline_remaining is None and remaining is not None:
+                baseline_remaining = remaining
+            if baseline_successful is None and successful is not None:
+                baseline_successful = successful
+
+            if time.monotonic() - last_log >= progress_log_interval_s:
+                pct_s = f"{pct}%" if pct is not None else "?"
+                parts = [f"{step_label}: printing… {pct_s}"]
+                if remaining is not None:
+                    parts.append(f"remaining={remaining}")
+                if total is not None:
+                    parts.append(f"of {total}")
+                if successful is not None:
+                    parts.append(f"successful={successful}")
+                _log(", ".join(parts))
+                last_log = time.monotonic()
+
+            if (
+                baseline_remaining is not None
+                and remaining is not None
+                and remaining < baseline_remaining
+            ):
+                _log(
+                    f"{step_label}: shipment done "
+                    f"(remaining {baseline_remaining} → {remaining})."
+                )
                 return True
-            if prev_success is not None and successful is not None and successful > prev_success:
-                _log(f"{step_label}: next shipment (successful {prev_success} → {successful}).")
+            if (
+                baseline_successful is not None
+                and successful is not None
+                and successful > baseline_successful
+            ):
+                _log(
+                    f"{step_label}: shipment done "
+                    f"(successful {baseline_successful} → {successful})."
+                )
                 return True
 
-            if remaining is not None and remaining == prev_remaining:
+            if (
+                remaining is not None
+                and last_remaining is not None
+                and remaining == last_remaining
+            ):
                 now = time.monotonic()
                 if stalled_at is None:
                     stalled_at = now
-                elif now - stalled_at >= 18.0:
+                elif now - stalled_at >= 90.0:
                     if not resume_attempted and _try_resume_batch_processing(hwnd):
                         resume_attempted = True
                         stalled_at = None
@@ -1018,13 +1077,28 @@ def _wait_for_shipment_advance(
                     )
             else:
                 stalled_at = None
+
+            last_remaining = remaining
+            last_successful = successful
         else:
+            if not seen_progress and time.monotonic() - last_log >= progress_log_interval_s:
+                _log(
+                    f"{step_label}: waiting for Automatic Processing Progress window…"
+                )
+                last_log = time.monotonic()
             stalled_at = None
 
         time.sleep(0.4)
 
+    if seen_progress:
+        raise TimeoutError(
+            f"{step_label}: timed out after {timeout_s:.0f}s waiting for warehouse "
+            f"print to finish (remaining={last_remaining}). "
+            "Increase WORLDSHIP_PRINT_ADVANCE_TIMEOUT_S if labels are slow."
+        )
     raise TimeoutError(
-        f"{step_label}: timed out waiting for warehouse print to finish."
+        f"{step_label}: Automatic Processing Progress never appeared within "
+        f"{timeout_s:.0f}s."
     )
 
 
@@ -1158,9 +1232,12 @@ def _wait_for_automatic_processing(*, timeout_s: float) -> None:
             remaining = stats.get("remaining")
             total = stats.get("total")
             if time.monotonic() - last_log > 8.0 and remaining is not None:
+                pct = _parse_progress_percent(hwnd)
+                pct_s = f", {pct}%" if pct is not None else ""
                 _log(
                     f"Processing… remaining={remaining}"
                     + (f" of {total}" if total is not None else "")
+                    + pct_s
                 )
                 last_log = time.monotonic()
             if remaining == 0 and total is not None and total > 0:
@@ -1539,7 +1616,10 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
         wait_for_next_save_dialog,
         wait_for_save_as_dialog,
     )
-    from automation.worldship_label_config import save_dialog_timeout_s, warehouse_print_wait_s
+    from automation.worldship_label_config import (
+        save_dialog_timeout_s,
+        warehouse_print_advance_timeout_s,
+    )
     from automation.worldship_label_work_plan import LabelWorkStep
 
     steps = plan.steps
@@ -1613,7 +1693,7 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
                     )
                 continue
 
-            advance_timeout = warehouse_print_wait_s()
+            advance_timeout = warehouse_print_advance_timeout_s()
             advanced = _wait_for_shipment_advance(
                 timeout_s=advance_timeout,
                 step_label=f"Print step {step.step_index}",
@@ -1777,10 +1857,6 @@ def _save_shipping_labels(app, main) -> int:
         _log(
             f"Continuing WorldShip batch with {len(failed_labels)} label(s) to re-print later."
         )
-
-    from automation.worldship_label_postprocess import postprocess_worldship_labels
-
-    postprocess_worldship_labels(plan, vendor_maps)
 
     from automation.worldship_after_print import run_after_print_workflow
 

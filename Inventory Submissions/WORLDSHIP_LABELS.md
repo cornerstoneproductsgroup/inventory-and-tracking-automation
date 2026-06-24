@@ -91,6 +91,7 @@ On **Remote Workstation**, fast import mode skips slow full-window UIA tree scan
 **Label save phase:**
 
 - `WORLDSHIP_SAVE_BETWEEN_LABELS_S` — pause between save dialogs (default 2)
+- `WORLDSHIP_PRINT_ADVANCE_TIMEOUT_S` — max seconds per warehouse-print shipment while waiting for remaining/successful to advance (default **180**; old default 15s was too short)
 - `WORLDSHIP_SAVE_AFTER_FOLDER_S` — pause after folder path Enter before typing PO (default 1.0)
 - `WORLDSHIP_SAVE_FILENAME_ATTEMPTS` — tries to enter PO if field empty (default 3)
 - `WORLDSHIP_SAVE_FOLDER_NAV_S` — max wait for folder to load (default 1.2)
