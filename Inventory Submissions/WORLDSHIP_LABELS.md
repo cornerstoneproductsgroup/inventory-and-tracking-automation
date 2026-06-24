@@ -11,7 +11,7 @@ SAVE vs print is read from the **LABEL_PR** column in CornerstoneMaster (column 
 - **LabelPDF** — save label PDF to the share (phase 1)
 - **Label1** — warehouse print, no Save dialog (phase 2)
 
-A warehouse vendor on the SKU map does **not** override LABEL_PR. (Example: Cornerstone SKUs with LabelPDF still save to the share even though Cornerstone is a warehouse vendor.)
+A warehouse vendor on the SKU map does **not** override LABEL_PR when that vendor has a label folder on the share (e.g. Zaca with LabelPDF still saves). If LABEL_PR says save but the vendor is on the warehouse list **and** has no folder under the retailer label root (e.g. Cornerstone), the row is treated as **warehouse PRINT** instead of failing.
 
 WorldShip shows Save dialogs in the same order as the batch file. Mixed rows caused label 2+ to use the wrong PO/folder. If a SAVE row appears after a print row, the run stops immediately with a clear error.
 

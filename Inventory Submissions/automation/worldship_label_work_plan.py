@@ -87,12 +87,11 @@ def partition_worldship_label_rows(
 
         if warehouse_print:
             saw_print = True
-            dest = build_destination(order, vendor_maps)
             steps.append(
                 LabelWorkStep(
                     order=order,
                     action="print",
-                    dest=dest,
+                    dest=None,
                     save_index=None,
                     step_index=len(steps) + 1,
                 )
@@ -106,7 +105,28 @@ def partition_worldship_label_rows(
             )
 
         save_n += 1
-        dest = build_destination(order, vendor_maps)
+        try:
+            dest = build_destination(order, vendor_maps)
+        except FileNotFoundError:
+            if is_warehouse_print_vendor(vendor):
+                save_n -= 1
+                saw_print = True
+                _log(
+                    f"NOTE: row {order.row_number} LABEL_PR={order.label_pr!r} is save "
+                    f"but vendor {vendor!r} has no label folder on the share — "
+                    f"warehouse PRINT instead (SKU {order.sku!r})."
+                )
+                steps.append(
+                    LabelWorkStep(
+                        order=order,
+                        action="print",
+                        dest=None,
+                        save_index=None,
+                        step_index=len(steps) + 1,
+                    )
+                )
+                continue
+            raise
         steps.append(
             LabelWorkStep(
                 order=order,

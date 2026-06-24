@@ -1540,6 +1540,7 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
         wait_for_save_as_dialog,
     )
     from automation.worldship_label_config import save_dialog_timeout_s, warehouse_print_wait_s
+    from automation.worldship_label_work_plan import LabelWorkStep
 
     steps = plan.steps
     if not steps:
@@ -1569,15 +1570,36 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
                 f"--- Print step {step.step_index}/{len(steps)}: row {step.order.row_number}, "
                 f"PO {step.order.po!r}, SKU {step.order.sku!r} ---"
             )
-            assert step.dest is not None
             dialog_hwnd = find_save_as_dialog_hwnd(log=False)
             if dialog_hwnd:
                 _log(
                     "WARN: Save dialog open on a PRINT step — saving this row to share "
                     f"(row {step.order.row_number}, PO {step.order.po!r})."
                 )
+                save_dest = step.dest
+                if save_dest is None:
+                    from automation.worldship_vendor_map import VendorMapRegistry
+
+                    try:
+                        save_dest = _build_label_destination(
+                            step.order, VendorMapRegistry()
+                        )
+                    except FileNotFoundError as exc:
+                        raise RuntimeError(
+                            f"PRINT step row {step.order.row_number} showed a Save dialog "
+                            f"but no vendor label folder exists: {exc}"
+                        ) from exc
+                print_step = step
+                if save_dest is not step.dest:
+                    print_step = LabelWorkStep(
+                        order=step.order,
+                        action=step.action,
+                        dest=save_dest,
+                        save_index=step.save_index,
+                        step_index=step.step_index,
+                    )
                 ok, last_hwnd, step_failed = _save_one_label_step(
-                    step,
+                    print_step,
                     save_total=save_total,
                     dialog_hwnd=dialog_hwnd,
                     save_index=saved + 1,
@@ -1585,8 +1607,10 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
                 failed.extend(step_failed)
                 if ok:
                     saved += 1
-                if step.step_index < len(steps):
-                    _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=step.dest)
+                if step.step_index < len(steps) and print_step.dest is not None:
+                    _pause_between_labels(
+                        previous_hwnd=last_hwnd, saved_dest=print_step.dest
+                    )
                 continue
 
             advance_timeout = warehouse_print_wait_s()
@@ -1603,8 +1627,30 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
                         f"Save dialog expected after print step {step.step_index} "
                         f"(row {step.order.row_number})."
                     )
+                save_dest = step.dest
+                if save_dest is None:
+                    from automation.worldship_vendor_map import VendorMapRegistry
+
+                    try:
+                        save_dest = _build_label_destination(
+                            step.order, VendorMapRegistry()
+                        )
+                    except FileNotFoundError as exc:
+                        raise RuntimeError(
+                            f"PRINT step row {step.order.row_number} showed a Save dialog "
+                            f"but no vendor label folder exists: {exc}"
+                        ) from exc
+                print_step = step
+                if save_dest is not step.dest:
+                    print_step = LabelWorkStep(
+                        order=step.order,
+                        action=step.action,
+                        dest=save_dest,
+                        save_index=step.save_index,
+                        step_index=step.step_index,
+                    )
                 ok, last_hwnd, step_failed = _save_one_label_step(
-                    step,
+                    print_step,
                     save_total=save_total,
                     dialog_hwnd=dialog_hwnd,
                     save_index=saved + 1,
@@ -1612,8 +1658,10 @@ def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
                 failed.extend(step_failed)
                 if ok:
                     saved += 1
-                if step.step_index < len(steps):
-                    _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=step.dest)
+                if step.step_index < len(steps) and print_step.dest is not None:
+                    _pause_between_labels(
+                        previous_hwnd=last_hwnd, saved_dest=print_step.dest
+                    )
                 continue
 
             printed += 1
