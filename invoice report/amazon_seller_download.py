@@ -689,15 +689,15 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
         from amazon_chrome_launch import connect_system_chrome
 
         port = amazon_browser_cdp_port()
-        _log(f"Using installed Chrome profile (CDP port {port}) — same login as your daily browser.")
-        _browser, page = connect_system_chrome(
+        _log("Using installed Chrome profile (direct Playwright control).")
+        page, cleanup = connect_system_chrome(
             p,
             home_url=home_url,
             port=port,
             log_dir=Path(__file__).resolve().parent,
         )
         page.set_default_timeout(default_timeout)
-        return page, lambda: None
+        return page, cleanup
 
     profile_dir = chrome_user_data_dir()
     if profile_dir:
