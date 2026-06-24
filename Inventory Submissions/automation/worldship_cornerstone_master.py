@@ -170,6 +170,77 @@ def _label_pr_column_index(header: list[str]) -> int:
     return column_index_from_string(COL_LABEL_PR) - 1
 
 
+def _looks_like_label_pr_value(value: str) -> bool:
+    norm = normalize_label_pr(value)
+    if not norm:
+        return False
+    if norm in ("labelpdf", "label1"):
+        return True
+    if norm.endswith("pdf") or norm.startswith("label1"):
+        return True
+    return "print" in norm and "pdf" not in norm
+
+
+def _label_pr_column_score(data_rows: list[list[str]], col_i: int) -> int:
+    score = 0
+    for row in data_rows[:80]:
+        if col_i < 0:
+            continue
+        cell = _cell_str(row[col_i] if len(row) > col_i else "")
+        if _looks_like_label_pr_value(cell):
+            score += 1
+    return score
+
+
+def _resolve_label_pr_column_index(
+    header: list[str],
+    data_rows: list[list[str]],
+    *,
+    default_i: int,
+) -> int:
+    """
+    Pick the column that actually contains LabelPDF / Label1 values.
+
+    WorldShip CSVs often have an empty column at the env default while LABEL_PR
+    data lives in another column (commonly X). When the default column is blank,
+    scanning row content avoids misclassifying rows via the warehouse-vendor fallback.
+    """
+    sample = data_rows[:80]
+    ncol = len(header)
+    for row in sample:
+        ncol = max(ncol, len(row))
+
+    header_i = _header_index(header, LABEL_PR_HEADER_HINTS)
+    env_i = column_index_from_string(COL_LABEL_PR) - 1
+
+    best_i = default_i
+    best_score = _label_pr_column_score(sample, default_i)
+
+    for col_i in range(ncol):
+        score = _label_pr_column_score(sample, col_i)
+        if score > best_score:
+            best_score = score
+            best_i = col_i
+
+    if best_score > 0 and best_i != default_i:
+        hdr = header[best_i] if best_i < len(header) else ""
+        _log(
+            f"LABEL_PR column auto-detected: col {best_i + 1} "
+            f"({hdr!r} or {COL_LABEL_PR} default col {default_i + 1} was blank). "
+            f"Found {best_score} LabelPDF/Label1 value(s) in sample rows."
+        )
+    elif best_score == 0 and header_i is None:
+        hdr = header[default_i] if default_i < len(header) else ""
+        if not hdr:
+            _log(
+                f"WARN: No LabelPDF/Label1 values found in CornerstoneMaster sample; "
+                f"using col {default_i + 1} ({COL_LABEL_PR}) for LABEL_PR. "
+                f"Blank LABEL_PR falls back to warehouse-vendor list for print vs save."
+            )
+
+    return best_i
+
+
 def _column_indices(header: list[str]) -> tuple[int, int, int, int]:
     """SKU, PO, retailer, LABEL_PR column indices (0-based). Prefer named CSV headers."""
     sku_i = _header_index(header, SKU_HEADER_HINTS)
@@ -276,7 +347,12 @@ def _load_csv(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
 
     header_idx = _find_header_row_index(all_rows)
     header = [str(c).strip() for c in all_rows[header_idx]]
-    sku_i, po_i, retailer_i, label_pr_i = _column_indices(header)
+    sku_i, po_i, retailer_i, default_label_i = _column_indices(header)
+    data_start = max(header_idx + 1, DATA_START_ROW - 1)
+    data_rows = all_rows[data_start:]
+    label_pr_i = _resolve_label_pr_column_index(
+        header, data_rows, default_i=default_label_i
+    )
     label_hdr = header[label_pr_i] if label_pr_i < len(header) else COL_LABEL_PR
     _log(
         "CornerstoneMaster columns: "
@@ -287,8 +363,7 @@ def _load_csv(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
     )
 
     rows: list[CornerstoneOrderRow] = []
-    data_start = max(header_idx + 1, DATA_START_ROW - 1)
-    for offset, row in enumerate(all_rows[data_start:], start=data_start + 1):
+    for offset, row in enumerate(data_rows, start=data_start + 1):
         if limit is not None and len(rows) >= limit:
             break
         result = _append_order_row(
@@ -313,16 +388,34 @@ def _load_xlsx(path: Path, *, limit: int | None) -> list[CornerstoneOrderRow]:
         first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
         header = [str(c or "").strip() for c in (first_row or ())]
         if _header_index(header, SKU_HEADER_HINTS) is not None:
-            sku_i, po_i, retailer_i, label_pr_i = _column_indices(header)
+            sku_i, po_i, retailer_i, default_label_i = _column_indices(header)
             start_row = 2
         else:
-            sku_i, po_i, retailer_i, label_pr_i = _column_indices([])
+            sku_i, po_i, retailer_i, default_label_i = _column_indices([])
             start_row = DATA_START_ROW
 
+        raw_data: list[tuple[int, tuple]] = []
         for row_idx, row in enumerate(
             ws.iter_rows(min_row=start_row, values_only=True),
             start=start_row,
         ):
+            if not row or not any(_cell_str(c) for c in row):
+                break
+            raw_data.append((row_idx, row))
+
+        label_pr_i = _resolve_label_pr_column_index(
+            header,
+            [list(r) for _, r in raw_data],
+            default_i=default_label_i,
+        )
+        label_hdr = header[label_pr_i] if label_pr_i < len(header) else COL_LABEL_PR
+        _log(
+            "CornerstoneMaster columns: "
+            f"SKU col {sku_i + 1}, PO col {po_i + 1}, retailer col {retailer_i + 1}, "
+            f"LABEL_PR={label_hdr!r} (col {label_pr_i + 1})"
+        )
+
+        for row_idx, row in raw_data:
             if limit is not None and len(rows) >= limit:
                 break
             result = _append_order_row(

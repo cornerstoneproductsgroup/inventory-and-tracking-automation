@@ -46,14 +46,22 @@ def partition_worldship_label_rows(
     save_orders: list[CornerstoneOrderRow] = []
     print_orders: list[CornerstoneOrderRow] = []
     in_print_section = False
+    first_print: CornerstoneOrderRow | None = None
+    first_print_detail = ""
 
     for order in orders:
         vendor = vendor_maps.lookup(order.sku, order.retailer_key)
         label_action = is_cornerstone_warehouse_print_row(order.label_pr)
         if label_action is None:
             warehouse_print = is_warehouse_print_vendor(vendor)
+            classify_detail = (
+                f"warehouse vendor {vendor!r} (LABEL_PR blank)"
+                if warehouse_print
+                else f"not a warehouse vendor (LABEL_PR blank)"
+            )
         else:
             warehouse_print = label_action
+            classify_detail = f"LABEL_PR={order.label_pr!r}"
             if label_action and not is_warehouse_print_vendor(vendor):
                 _log(
                     f"WARN: row {order.row_number} LABEL_PR={order.label_pr!r} is print "
@@ -65,15 +73,23 @@ def partition_worldship_label_rows(
                     f"but SKU maps to warehouse vendor {vendor!r} — using LABEL_PR."
                 )
         if warehouse_print:
+            if first_print is None:
+                first_print = order
+                first_print_detail = classify_detail
             in_print_section = True
             print_orders.append(order)
             continue
         if in_print_section:
+            assert first_print is not None
             raise ValueError(
                 f"CornerstoneMaster row {order.row_number} is a SAVE row "
-                f"(LABEL_PR={order.label_pr!r}) but appears after warehouse-print rows. "
+                f"(LABEL_PR={order.label_pr!r}, vendor {vendor!r}) but appears after "
+                f"warehouse-print row {first_print.row_number} ({first_print_detail}, "
+                f"SKU {first_print.sku!r}, PO {first_print.po!r}). "
                 f"Put all LabelPDF rows at the top, then all Label1 rows at the bottom "
-                f"(SKU {order.sku!r}, PO {order.po!r})."
+                f"(SKU {order.sku!r}, PO {order.po!r}). "
+                f"If LABEL_PR is in another column, set WORLDSHIP_COL_LABEL_PR "
+                f"(default column X)."
             )
         save_orders.append(order)
 
