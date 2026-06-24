@@ -29,6 +29,10 @@ LABEL_ROOTS: dict[str, Path] = {
         "WORLDSHIP_LABELS_DEPOT_DIR",
         str(_PACKING_SLIPS / "2-Home Depot" / "1 - UPS Shipping Labels"),
     ),
+    "dfc": _p(
+        "WORLDSHIP_LABELS_DFC_DIR",
+        str(_PACKING_SLIPS / "7-DFC" / "1 - Shipping Labels"),
+    ),
     "thdso": _p(
         "WORLDSHIP_LABELS_THDSO_DIR",
         str(_PACKING_SLIPS / "12-Depot Special Orders" / "1 - UPS Shipping Labels"),
@@ -37,6 +41,33 @@ LABEL_ROOTS: dict[str, Path] = {
         "WORLDSHIP_LABELS_TRACTOR_DIR",
         str(_PACKING_SLIPS / "6-Tractor Supply" / "1 - UPS Shipping Labels"),
     ),
+}
+
+# Legacy DFC path (PDFs saved directly under 7-DFC\<Vendor> before routing fix).
+DFC_LEGACY_VENDOR_LABEL_ROOT = _p(
+    "WORLDSHIP_DFC_LEGACY_VENDOR_DIR",
+    str(_PACKING_SLIPS / "7-DFC"),
+)
+
+DAILY_VENDOR_ORDERS_DIR = _p(
+    "WORLDSHIP_DAILY_VENDOR_DIR",
+    str(
+        _PACKING_SLIPS
+        / "1-Orders Before Extraction"
+        / "Order Splitter Output"
+        / "z- Daily Vendor Orders"
+    ),
+)
+
+RETAILER_DAILY_LABEL_PREFIX: dict[str, str] = {
+    "depot": (os.environ.get("WORLDSHIP_DEPOT_DAILY_LABEL_PREFIX") or "Home Depot").strip(),
+    "dfc": (os.environ.get("WORLDSHIP_DFC_DAILY_LABEL_PREFIX") or "Home Depot DFC").strip(),
+    "thdso": (
+        os.environ.get("WORLDSHIP_THDSO_DAILY_LABEL_PREFIX") or "Depot Special Order"
+    ).strip(),
+    "tractor": (
+        os.environ.get("WORLDSHIP_TRACTOR_DAILY_LABEL_PREFIX") or "Tractor Supply"
+    ).strip(),
 }
 
 COL_SKU = (os.environ.get("WORLDSHIP_COL_SKU") or "L").strip().upper()
@@ -54,6 +85,7 @@ VENDOR_MAP_DIR = _p(
 
 RETAILER_VENDOR_MAP_FILES: dict[str, str] = {
     "depot": "vendor_map_hd.xlsx",
+    "dfc": "vendor_map_hd.xlsx",
     "thdso": "vendor_map_hd.xlsx",
     "tractor": "vendor_map_tsc.xlsx",
     "lowes": "vendor_map_lowes.xlsx",
@@ -139,8 +171,69 @@ def retailer_merchant_to_key(merchant: str) -> str:
         raise ValueError("Retailer/merchant column is empty.")
     if "thdso" in m or ("special" in m and ("depot" in m or "home depot" in m)):
         return "thdso"
+    if "dfc" in m:
+        return "dfc"
     if "tractor" in m:
         return "tractor"
     if "homedepot" in m.replace(" ", "") or "home depot" in m or m == "depot":
         return "depot"
     raise ValueError(f"Unsupported retailer/merchant value: {merchant!r}")
+
+
+def date_stamp(d=None) -> str:
+    from datetime import date
+
+    x = d or date.today()
+    return f"{x.month}-{x.day}-{x.year}"
+
+
+def daily_vendor_label_pdf_path(
+    retailer_key: str,
+    vendor_folder: str,
+    *,
+    order_date=None,
+) -> Path:
+    from datetime import date
+
+    prefix = RETAILER_DAILY_LABEL_PREFIX.get(retailer_key, retailer_key)
+    stamp = date_stamp(order_date or date.today())
+    return DAILY_VENDOR_ORDERS_DIR / vendor_folder / f"{prefix} {stamp} Labels.pdf"
+
+
+def label_postprocess_retailer_keys() -> frozenset[str]:
+    raw = (os.environ.get("WORLDSHIP_LABEL_POSTPROCESS_RETAILERS") or "dfc").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(k.strip().lower() for k in raw.split(",") if k.strip())
+
+
+def label_width_pts() -> float:
+    raw = (os.environ.get("WORLDSHIP_LABEL_WIDTH_IN") or "4").strip()
+    try:
+        return max(1.0, float(raw)) * 72.0
+    except ValueError:
+        return 4.0 * 72.0
+
+
+def label_height_pts() -> float:
+    raw = (os.environ.get("WORLDSHIP_LABEL_HEIGHT_IN") or "6").strip()
+    try:
+        return max(1.0, float(raw)) * 72.0
+    except ValueError:
+        return 6.0 * 72.0
+
+
+def label_crop_x_pts() -> float:
+    raw = (os.environ.get("WORLDSHIP_LABEL_CROP_X_IN") or "0").strip()
+    try:
+        return max(0.0, float(raw)) * 72.0
+    except ValueError:
+        return 0.0
+
+
+def label_crop_y_from_top_pts() -> float:
+    raw = (os.environ.get("WORLDSHIP_LABEL_CROP_Y_FROM_TOP_IN") or "0").strip()
+    try:
+        return max(0.0, float(raw)) * 72.0
+    except ValueError:
+        return 0.0

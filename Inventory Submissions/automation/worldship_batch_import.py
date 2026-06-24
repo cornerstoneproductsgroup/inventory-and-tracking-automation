@@ -1730,6 +1730,10 @@ def _save_shipping_labels(app, main) -> int:
             f"Continuing WorldShip batch with {len(failed_labels)} label(s) to re-print later."
         )
 
+    from automation.worldship_label_postprocess import postprocess_worldship_labels
+
+    postprocess_worldship_labels(plan, vendor_maps)
+
     from automation.worldship_after_print import run_after_print_workflow
 
     run_after_print_workflow(app, main, print_label_count=len(plan.print_orders))
