@@ -959,6 +959,75 @@ def _try_resume_batch_processing(progress_hwnd: int) -> bool:
     return False
 
 
+def _wait_for_shipment_advance(
+    *,
+    timeout_s: float,
+    step_label: str,
+) -> bool:
+    """
+    Wait for WorldShip to finish the current warehouse-print shipment.
+
+    Returns True when progress advances. Returns False if a Save dialog appears
+    (row may be LabelPDF despite LABEL_PR / vendor classification).
+    """
+    from automation.windows_save_as import find_save_as_dialog_hwnd
+
+    _log(f"{step_label}: waiting for warehouse print to finish…")
+    prog = _find_processing_progress()
+    prev_remaining = prog[1].get("remaining") if prog else None
+    prev_success = prog[1].get("successful") if prog else None
+
+    deadline = time.monotonic() + timeout_s
+    stalled_at: float | None = None
+    resume_attempted = False
+
+    while time.monotonic() < deadline:
+        if find_save_as_dialog_hwnd(log=False):
+            _log(
+                f"{step_label}: Save dialog appeared during warehouse-print step — "
+                "will save instead."
+            )
+            return False
+
+        prog = _find_processing_progress()
+        if prog:
+            hwnd, stats = prog
+            remaining = stats.get("remaining")
+            successful = stats.get("successful")
+
+            if prev_remaining is not None and remaining is not None and remaining < prev_remaining:
+                _log(f"{step_label}: next shipment (remaining {prev_remaining} → {remaining}).")
+                return True
+            if prev_success is not None and successful is not None and successful > prev_success:
+                _log(f"{step_label}: next shipment (successful {prev_success} → {successful}).")
+                return True
+
+            if remaining is not None and remaining == prev_remaining:
+                now = time.monotonic()
+                if stalled_at is None:
+                    stalled_at = now
+                elif now - stalled_at >= 18.0:
+                    if not resume_attempted and _try_resume_batch_processing(hwnd):
+                        resume_attempted = True
+                        stalled_at = None
+                        time.sleep(1.0)
+                        continue
+                    raise RuntimeError(
+                        f"{step_label}: WorldShip batch stalled during warehouse print. "
+                        f"Remaining={remaining}. Do not click Stop."
+                    )
+            else:
+                stalled_at = None
+        else:
+            stalled_at = None
+
+        time.sleep(0.4)
+
+    raise TimeoutError(
+        f"{step_label}: timed out waiting for warehouse print to finish."
+    )
+
+
 def _wait_for_processing_after_save(
     *,
     saves_completed: int,
@@ -1396,40 +1465,166 @@ def _log_failed_label_summary(failed: list[dict[str, str]]) -> None:
     _log("=" * 62)
 
 
-def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
-    """Phase 1: consecutive Save dialogs — one per save_items entry, strict verify."""
+def _save_one_label_step(
+    step,
+    *,
+    save_total: int,
+    dialog_hwnd: int,
+    save_index: int | None = None,
+) -> tuple[bool, int, list[dict[str, str]]]:
+    """Fill one Save dialog for a plan step. Returns (ok, hwnd, failed_entry_or_empty)."""
+    from automation.windows_save_as import fill_save_as_dialog, recover_after_failed_worldship_save
+    from automation.worldship_label_config import save_dialog_timeout_s
+
+    order = step.order
+    dest = step.dest
+    assert dest is not None
+    idx = save_index if save_index is not None else step.save_index
+    assert idx is not None
+
+    _log(
+        f"--- Save {idx}/{save_total}: step {step.step_index}, "
+        f"row {order.row_number}, PO {order.po!r}, SKU {order.sku!r}, "
+        f"retailer {order.retailer_raw!r} ---"
+    )
+    _log(f"  → folder: {dest.parent}")
+    _log(f"  → file:   {dest.name}")
+
+    last_hwnd = dialog_hwnd
+    failed: list[dict[str, str]] = []
+    save_ok = False
+    try:
+        save_ok = fill_save_as_dialog(
+            dest,
+            timeout_s=90.0,
+            dialog_hwnd=dialog_hwnd,
+            po=order.po,
+            sku=order.sku,
+        )
+        if save_ok:
+            _verify_saved_label(dest, order)
+    except Exception as exc:
+        _log(f"WARN: save verification failed for PO {order.po!r}: {exc}")
+        save_ok = False
+
+    if not save_ok:
+        failed.append(
+            {
+                "po": order.po,
+                "row": str(order.row_number),
+                "index": str(idx),
+                "total": str(save_total),
+                "dest": str(dest),
+            }
+        )
+        _log(
+            f"WARN: skipping PO {order.po!r} (save {idx}/{save_total}) — "
+            "file not on disk; continuing batch."
+        )
+        next_hwnd = recover_after_failed_worldship_save(
+            previous_hwnd=last_hwnd,
+            timeout_s=min(90.0, save_dialog_timeout_s(first=False)),
+        )
+        return False, next_hwnd or last_hwnd, failed
+
+    _log(f"Completed save {idx}/{save_total}: {dest.name}")
+    return True, last_hwnd, failed
+
+
+def _run_label_work_plan(plan) -> tuple[int, int, list[dict[str, str]]]:
+    """Process SAVE and PRINT steps in CSV row order while WorldShip runs the batch."""
     from automation.windows_save_as import (
-        fill_save_as_dialog,
+        find_save_as_dialog_hwnd,
+        reset_last_save_folder,
         wait_for_next_save_dialog,
         wait_for_save_as_dialog,
     )
-    from automation.worldship_label_config import save_dialog_timeout_s
+    from automation.worldship_label_config import save_dialog_timeout_s, warehouse_print_wait_s
 
-    items = plan.save_items
-    if not items:
-        return 0, []
+    steps = plan.steps
+    if not steps:
+        return 0, 0, []
 
-    _log(f"=== Phase 1/2: SAVE {len(items)} label(s) to share ===")
-    from automation.windows_save_as import reset_last_save_folder
-
+    save_total = len(plan.save_items)
+    print_total = len(plan.print_orders)
+    _log(
+        f"=== Label phase: {save_total} SAVE + {print_total} PRINT "
+        f"in CSV row order ({len(steps)} step(s)) ==="
+    )
     reset_last_save_folder()
     _log(
         "IMPORTANT: While Automatic Processing Progress is open, do NOT click Stop. "
         "WorldShip will pause the batch and later Save dialogs will not appear. "
         "Only click Save on each Save Print Output As window."
     )
+
     last_hwnd = 0
     saved = 0
+    printed = 0
     failed: list[dict[str, str]] = []
 
-    for item in items:
-        order = item.order
-        dest = item.dest
-        if item.index == 1:
+    for step in steps:
+        if step.action == "print":
+            _log(
+                f"--- Print step {step.step_index}/{len(steps)}: row {step.order.row_number}, "
+                f"PO {step.order.po!r}, SKU {step.order.sku!r} ---"
+            )
+            assert step.dest is not None
+            dialog_hwnd = find_save_as_dialog_hwnd(log=False)
+            if dialog_hwnd:
+                _log(
+                    "WARN: Save dialog open on a PRINT step — saving this row to share "
+                    f"(row {step.order.row_number}, PO {step.order.po!r})."
+                )
+                ok, last_hwnd, step_failed = _save_one_label_step(
+                    step,
+                    save_total=save_total,
+                    dialog_hwnd=dialog_hwnd,
+                    save_index=saved + 1,
+                )
+                failed.extend(step_failed)
+                if ok:
+                    saved += 1
+                if step.step_index < len(steps):
+                    _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=step.dest)
+                continue
+
+            advance_timeout = warehouse_print_wait_s()
+            advanced = _wait_for_shipment_advance(
+                timeout_s=advance_timeout,
+                step_label=f"Print step {step.step_index}",
+            )
+            if not advanced:
+                dialog_hwnd = find_save_as_dialog_hwnd(log=False) or wait_for_save_as_dialog(
+                    timeout_s=save_dialog_timeout_s(first=False)
+                )
+                if not dialog_hwnd:
+                    raise TimeoutError(
+                        f"Save dialog expected after print step {step.step_index} "
+                        f"(row {step.order.row_number})."
+                    )
+                ok, last_hwnd, step_failed = _save_one_label_step(
+                    step,
+                    save_total=save_total,
+                    dialog_hwnd=dialog_hwnd,
+                    save_index=saved + 1,
+                )
+                failed.extend(step_failed)
+                if ok:
+                    saved += 1
+                if step.step_index < len(steps):
+                    _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=step.dest)
+                continue
+
+            printed += 1
+            continue
+
+        assert step.action == "save" and step.dest is not None and step.save_index is not None
+        if saved == 0:
             timeout_s = save_dialog_timeout_s(first=True)
             _log(
-                f"Waiting for first Save dialog — save {item.index}/{len(items)}, "
-                f"row {order.row_number}, PO {order.po!r}…"
+                f"Waiting for first Save dialog — save {step.save_index}/{save_total}, "
+                f"row {step.order.row_number}, PO {step.order.po!r}…"
             )
             dialog_hwnd = wait_for_save_as_dialog(timeout_s=timeout_s)
         else:
@@ -1437,34 +1632,37 @@ def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
                 _dialog_still_open,
                 _find_filename_edit_hwnd,
                 _filename_matches,
-                find_save_as_dialog_hwnd,
             )
 
             timeout_s = save_dialog_timeout_s(first=False)
-            prior_dest = items[saved - 1].dest
+            prior_dest = None
+            for prev in reversed(plan.steps[: step.step_index - 1]):
+                if prev.action == "save" and prev.dest is not None:
+                    prior_dest = prev.dest
+                    break
             dialog_hwnd = find_save_as_dialog_hwnd(log=False)
             next_ready = False
             if dialog_hwnd:
                 if not _dialog_still_open(last_hwnd):
                     next_ready = True
-                else:
+                elif prior_dest is not None:
                     edit = _find_filename_edit_hwnd(dialog_hwnd)
                     if edit and not _filename_matches(edit, prior_dest):
                         next_ready = True
             if next_ready and dialog_hwnd:
                 _log(
-                    f"Next Save dialog already open — save {item.index}/{len(items)}, "
-                    f"row {order.row_number}, PO {order.po!r}"
+                    f"Next Save dialog already open — save {step.save_index}/{save_total}, "
+                    f"row {step.order.row_number}, PO {step.order.po!r}"
                 )
             else:
                 _wait_for_processing_after_save(
                     saves_completed=saved,
-                    saves_total=len(items),
+                    saves_total=save_total,
                     timeout_s=timeout_s,
                 )
                 _log(
-                    f"Waiting for next Save dialog — save {item.index}/{len(items)}, "
-                    f"row {order.row_number}, PO {order.po!r}…"
+                    f"Waiting for next Save dialog — save {step.save_index}/{save_total}, "
+                    f"row {step.order.row_number}, PO {step.order.po!r}…"
                 )
                 dialog_hwnd = wait_for_next_save_dialog(
                     previous_hwnd=last_hwnd, timeout_s=timeout_s
@@ -1472,89 +1670,40 @@ def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
 
         if not dialog_hwnd:
             raise TimeoutError(
-                f"Timed out waiting for Save dialog {item.index}/{len(items)} "
-                f"(row {order.row_number}, PO {order.po!r}). "
+                f"Timed out waiting for Save dialog {step.save_index}/{save_total} "
+                f"(row {step.order.row_number}, PO {step.order.po!r}). "
                 "Stop WorldShip, fix the previous label, and re-run."
             )
         last_hwnd = dialog_hwnd
 
-        _log(
-            f"--- Save {item.index}/{len(items)}: row {order.row_number}, "
-            f"PO {order.po!r}, SKU {order.sku!r}, retailer {order.retailer_raw!r} ---"
+        ok, last_hwnd, step_failed = _save_one_label_step(
+            step,
+            save_total=save_total,
+            dialog_hwnd=dialog_hwnd,
         )
-        _log(f"  → folder: {dest.parent}")
-        _log(f"  → file:   {dest.name}")
+        failed.extend(step_failed)
+        if ok:
+            saved += 1
+        if step.step_index < len(steps):
+            _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=step.dest)
 
-        from automation.windows_save_as import recover_after_failed_worldship_save
-
-        save_ok = False
-        try:
-            save_ok = fill_save_as_dialog(
-                dest,
-                timeout_s=90.0,
-                dialog_hwnd=dialog_hwnd,
-                po=order.po,
-                sku=order.sku,
-            )
-            if save_ok:
-                _verify_saved_label(dest, order)
-        except Exception as exc:
-            _log(f"WARN: save verification failed for PO {order.po!r}: {exc}")
-            save_ok = False
-
-        if not save_ok:
-            failed.append(
-                {
-                    "po": order.po,
-                    "row": str(order.row_number),
-                    "index": str(item.index),
-                    "total": str(len(items)),
-                    "dest": str(dest),
-                }
-            )
-            _log(
-                f"WARN: skipping PO {order.po!r} (save {item.index}/{len(items)}) — "
-                "file not on disk; continuing batch."
-            )
-            next_hwnd = recover_after_failed_worldship_save(
-                previous_hwnd=last_hwnd,
-                timeout_s=min(90.0, save_dialog_timeout_s(first=False)),
-            )
-            if next_hwnd:
-                last_hwnd = next_hwnd
-            continue
-
-        saved += 1
-        _log(f"Completed save {saved}/{len(items)}: {dest.name}")
-        if item.index < len(items):
-            _pause_between_labels(previous_hwnd=last_hwnd, saved_dest=dest)
-
-    _log(f"Phase 1 complete: {saved}/{len(items)} label(s) saved and verified.")
+    _log(
+        f"Label phase complete: {saved}/{save_total} saved, "
+        f"{printed}/{print_total} warehouse print step(s) advanced."
+    )
     if failed:
         _log(
             f"WARN: {len(failed)} label(s) were not saved on disk — "
             "batch will continue; re-print failed POs listed below."
         )
         _log_failed_label_summary(failed)
+    return saved, printed, failed
+
+
+def _run_save_label_phase(plan) -> tuple[int, list[dict[str, str]]]:
+    """Backward-compatible wrapper — runs interleaved plan, returns save count only."""
+    saved, _printed, failed = _run_label_work_plan(plan)
     return saved, failed
-
-
-def _run_warehouse_print_phase(plan) -> int:
-    """Phase 2: warehouse-print rows — WorldShip prints; automation waits for Close."""
-    orders = plan.print_orders
-    if not orders:
-        return 0
-
-    _log(f"=== Phase 2/2: WAREHOUSE PRINT {len(orders)} label(s) ===")
-    for order in orders:
-        _log(
-            f"  print row {order.row_number}: PO {order.po!r}, SKU {order.sku!r}"
-        )
-    _log(
-        "WorldShip is printing warehouse labels — automation will wait for "
-        "100% and click Close when ready (do not click Stop)."
-    )
-    return len(orders)
 
 
 def _save_shipping_labels(app, main) -> int:
@@ -1575,32 +1724,15 @@ def _save_shipping_labels(app, main) -> int:
     )
     log_worldship_label_work_plan(plan, vendor_maps)
 
-    saved, failed_labels = _run_save_label_phase(plan)
+    saved, printed, failed_labels = _run_label_work_plan(plan)
     if failed_labels:
         _log(
             f"Continuing WorldShip batch with {len(failed_labels)} label(s) to re-print later."
         )
 
-    if plan.save_items and plan.print_orders:
-        from automation.worldship_label_config import label_save_gap_s
-
-        gap_s = label_save_gap_s()
-        _log(f"Save phase done; waiting {gap_s:.0f}s before warehouse print phase…")
-        time.sleep(gap_s)
-        from automation.windows_save_as import wait_until_save_dialog_closed
-
-        if not wait_until_save_dialog_closed(timeout_s=30.0):
-            _log("WARN: Save dialog still visible entering print phase — continuing.")
-
-    printed = _run_warehouse_print_phase(plan)
-    if printed != len(plan.print_orders):
-        raise RuntimeError(
-            f"Expected {len(plan.print_orders)} warehouse print(s), counted {printed}."
-        )
-
     from automation.worldship_after_print import run_after_print_workflow
 
-    run_after_print_workflow(app, main, print_label_count=printed)
+    run_after_print_workflow(app, main, print_label_count=len(plan.print_orders))
 
     summary = (
         f"Label processing complete: {saved} saved to share, "
@@ -1675,7 +1807,7 @@ def run_worldship_batch_import_start() -> WorldShipBatchImportResult:
         _plan = partition_worldship_label_rows(
             _orders, VendorMapRegistry(), build_destination=_build_label_destination
         )
-        _proc_count = len(_plan.save_items) + len(_plan.print_orders)
+        _proc_count = len(_plan.steps)
     except Exception:
         _proc_count = 4
     proc_timeout = processing_timeout_s(order_count=_proc_count or 4)

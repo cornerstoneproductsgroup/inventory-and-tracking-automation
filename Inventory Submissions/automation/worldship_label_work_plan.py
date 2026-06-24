@@ -1,10 +1,10 @@
-"""Partition CornerstoneMaster rows: all SAVE rows first, then all PRINT rows."""
+"""Build WorldShip label steps in CornerstoneMaster row order (save / print)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from automation.worldship_cornerstone_master import is_cornerstone_warehouse_print_row
 from automation.warehouse_print_vendors import is_warehouse_print_vendor
@@ -22,13 +22,33 @@ def _log(msg: str) -> None:
 class SaveLabelItem:
     order: "CornerstoneOrderRow"
     dest: Path
-    index: int  # 1-based position in save phase (matches Nth Save dialog)
+    index: int  # 1-based among SAVE rows
+
+
+@dataclass(frozen=True)
+class LabelWorkStep:
+    order: "CornerstoneOrderRow"
+    action: Literal["save", "print"]
+    dest: Path | None
+    save_index: int | None  # 1-based when action == "save"
+    step_index: int  # 1-based in full batch row order
 
 
 @dataclass(frozen=True)
 class WorldshipLabelWorkPlan:
-    save_items: tuple[SaveLabelItem, ...]
-    print_orders: tuple["CornerstoneOrderRow", ...]
+    steps: tuple[LabelWorkStep, ...]
+
+    @property
+    def save_items(self) -> tuple[SaveLabelItem, ...]:
+        return tuple(
+            SaveLabelItem(order=s.order, dest=s.dest, index=s.save_index)
+            for s in self.steps
+            if s.action == "save" and s.dest is not None and s.save_index is not None
+        )
+
+    @property
+    def print_orders(self) -> tuple["CornerstoneOrderRow", ...]:
+        return tuple(s.order for s in self.steps if s.action == "print")
 
 
 def partition_worldship_label_rows(
@@ -38,30 +58,22 @@ def partition_worldship_label_rows(
     build_destination,
 ) -> WorldshipLabelWorkPlan:
     """
-    Require CSV row order: every SAVE row, then every warehouse PRINT row.
+    Build label steps in CSV row order (matches WorldShip batch processing order).
 
-    WorldShip shows Save dialogs in batch row order — mixed rows caused saves to
-    drift one label behind. Saves-first keeps dialog index aligned with save_items.
+    SAVE rows wait for Save Print Output dialogs; PRINT rows wait for WorldShip to
+    print and advance without saving. Mixed order is allowed.
     """
-    save_orders: list[CornerstoneOrderRow] = []
-    print_orders: list[CornerstoneOrderRow] = []
-    in_print_section = False
-    first_print: CornerstoneOrderRow | None = None
-    first_print_detail = ""
+    steps: list[LabelWorkStep] = []
+    save_n = 0
+    saw_print = False
 
     for order in orders:
         vendor = vendor_maps.lookup(order.sku, order.retailer_key)
         label_action = is_cornerstone_warehouse_print_row(order.label_pr)
         if label_action is None:
             warehouse_print = is_warehouse_print_vendor(vendor)
-            classify_detail = (
-                f"warehouse vendor {vendor!r} (LABEL_PR blank)"
-                if warehouse_print
-                else f"not a warehouse vendor (LABEL_PR blank)"
-            )
         else:
             warehouse_print = label_action
-            classify_detail = f"LABEL_PR={order.label_pr!r}"
             if label_action and not is_warehouse_print_vendor(vendor):
                 _log(
                     f"WARN: row {order.row_number} LABEL_PR={order.label_pr!r} is print "
@@ -72,36 +84,40 @@ def partition_worldship_label_rows(
                     f"WARN: row {order.row_number} LABEL_PR={order.label_pr!r} is save "
                     f"but SKU maps to warehouse vendor {vendor!r} — using LABEL_PR."
                 )
+
         if warehouse_print:
-            if first_print is None:
-                first_print = order
-                first_print_detail = classify_detail
-            in_print_section = True
-            print_orders.append(order)
-            continue
-        if in_print_section:
-            assert first_print is not None
-            raise ValueError(
-                f"CornerstoneMaster row {order.row_number} is a SAVE row "
-                f"(LABEL_PR={order.label_pr!r}, vendor {vendor!r}) but appears after "
-                f"warehouse-print row {first_print.row_number} ({first_print_detail}, "
-                f"SKU {first_print.sku!r}, PO {first_print.po!r}). "
-                f"Put all LabelPDF rows at the top, then all Label1 rows at the bottom "
-                f"(SKU {order.sku!r}, PO {order.po!r}). "
-                f"If LABEL_PR is in another column, set WORLDSHIP_COL_LABEL_PR "
-                f"(default column X)."
+            saw_print = True
+            dest = build_destination(order, vendor_maps)
+            steps.append(
+                LabelWorkStep(
+                    order=order,
+                    action="print",
+                    dest=dest,
+                    save_index=None,
+                    step_index=len(steps) + 1,
+                )
             )
-        save_orders.append(order)
+            continue
 
-    save_items: list[SaveLabelItem] = []
-    for i, order in enumerate(save_orders, start=1):
+        if saw_print:
+            _log(
+                f"NOTE: row {order.row_number} is SAVE after earlier PRINT row(s) — "
+                f"will save when the next Save dialog appears (PO {order.po!r})."
+            )
+
+        save_n += 1
         dest = build_destination(order, vendor_maps)
-        save_items.append(SaveLabelItem(order=order, dest=dest, index=i))
+        steps.append(
+            LabelWorkStep(
+                order=order,
+                action="save",
+                dest=dest,
+                save_index=save_n,
+                step_index=len(steps) + 1,
+            )
+        )
 
-    return WorldshipLabelWorkPlan(
-        save_items=tuple(save_items),
-        print_orders=tuple(print_orders),
-    )
+    return WorldshipLabelWorkPlan(steps=tuple(steps))
 
 
 def log_worldship_label_work_plan(
@@ -116,24 +132,23 @@ def log_worldship_label_work_plan(
     n_save = len(plan.save_items)
     n_print = len(plan.print_orders)
     _log(
-        f"Label work plan: {n_save} SAVE to share (phase 1), "
-        f"{n_print} warehouse PRINT (phase 2), "
-        f"{n_save + n_print} total row(s)."
+        f"Label work plan: {n_save} SAVE to share, "
+        f"{n_print} warehouse PRINT, "
+        f"{len(plan.steps)} step(s) in CSV row order."
     )
-    if n_save:
-        _log("Phase 1 — SAVE rows (must match WorldShip Save dialog order):")
-        for item in plan.save_items:
-            vendor = vendor_maps.lookup(item.order.sku, item.order.retailer_key)
+    for step in plan.steps:
+        vendor = vendor_maps.lookup(step.order.sku, step.order.retailer_key)
+        if step.action == "save":
+            assert step.dest is not None and step.save_index is not None
             _log(
-                f"  save {item.index}/{n_save}: row {item.order.row_number} — "
-                f"{vendor!r} (LABEL_PR={item.order.label_pr!r}) → "
-                f"{item.dest.parent.name}\\{item.dest.name}"
+                f"  step {step.step_index}: SAVE {step.save_index}/{n_save} — "
+                f"row {step.order.row_number}, {vendor!r} "
+                f"(LABEL_PR={step.order.label_pr!r}) → "
+                f"{step.dest.parent.name}\\{step.dest.name}"
             )
-    if n_print:
-        _log("Phase 2 — warehouse PRINT rows (no Save dialog):")
-        for order in plan.print_orders:
-            vendor = vendor_maps.lookup(order.sku, order.retailer_key)
+        else:
             _log(
-                f"  print: row {order.row_number} — {vendor!r} "
-                f"(LABEL_PR={order.label_pr!r}, SKU {order.sku!r}, PO {order.po!r})"
+                f"  step {step.step_index}: PRINT — row {step.order.row_number}, "
+                f"{vendor!r} (LABEL_PR={step.order.label_pr!r}, "
+                f"SKU {step.order.sku!r}, PO {step.order.po!r})"
             )
