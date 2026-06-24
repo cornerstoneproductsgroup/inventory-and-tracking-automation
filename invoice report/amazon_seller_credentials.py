@@ -51,7 +51,7 @@ def load_amazon_seller_credentials(*, required: bool = True) -> AmazonSellerCred
                 "  AMAZON_SELLER_EMAIL + AMAZON_SELLER_PASSWORD\n"
                 f"Checked: {_ENV_FILE}\n"
                 f"         {_INVENTORY_ENV}\n"
-                "Or configure AMAZON_CHROME_USER_DATA_DIR / AMAZON_CHROME_CDP_URL to reuse Chrome login."
+                "Or configure AMAZON_CHROME_USER_DATA_DIR to reuse a saved Chrome login."
             )
         return None
     return AmazonSellerCredentials(email=email, password=password)

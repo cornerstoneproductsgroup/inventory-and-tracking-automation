@@ -6,11 +6,17 @@ Downloads **Deferred Transaction** CSV from Payments → Reports Repository and 
 
 Filename: **`Amazon Invoice M-D-YYYY.csv`** (today’s date).
 
+## Security (no remote debugging)
+
+By default the script uses **Playwright direct control** of Chrome — it does **not** open a remote debugging port. That avoids security alerts (e.g. Huntress flags `--remote-debugging-port` like infostealer malware).
+
+Do **not** use `Run Amazon Chrome Debug.bat` unless IT has approved and set `AMAZON_ALLOW_UNSAFE_CDP=1`.
+
 ## Use your normal Chrome login (default)
 
-By default the script uses **your installed Chrome profile** (same cookies as when you open Chrome yourself). It does **not** use the empty `.amazon-chrome-profile` folder anymore.
+The script uses **your installed Chrome profile** (same cookies as daily Chrome).
 
-**First run:** Chrome closes briefly, reopens with Seller Central, and automation continues while you stay logged in.
+**First run:** Chrome closes briefly, reopens under automation, and navigates to Seller Central.
 
 Add to `Inventory Submissions\.env`:
 
@@ -20,21 +26,11 @@ AMAZON_KILL_CHROME=1
 
 (`AMAZON_KILL_CHROME=1` closes Chrome before reopening with your profile. Amazon **never** uses Edge — only Google Chrome.)
 
-### Option A — Let the script launch Chrome (easiest)
+### Run
 
 1. Close Chrome (or set `AMAZON_KILL_CHROME=1`)
 2. Run `Run Amazon Seller Download.bat` or menu **R → 6**
-3. Chrome reopens on debug port **9348** with your normal profile
-
-### Option B — Keep Chrome open yourself
-
-1. Run **`Run Amazon Chrome Debug.bat`** once (starts Chrome on port 9348)
-2. Sign in to Seller Central in that window if needed
-3. Add to `.env`:
-   ```
-   AMAZON_CHROME_CDP_URL=http://127.0.0.1:9348
-   ```
-4. Run the download — attaches to that Chrome without closing it
+3. Chrome reopens and automation continues while you stay logged in
 
 ## Credentials (fallback)
 
@@ -47,18 +43,29 @@ AMAZON_PASSWORD=...
 
 (Read from `Inventory Submissions\.env` or `invoice report\.env`.)
 
-## Disable system Chrome profile
-
-Use an isolated automation profile instead:
+## Isolated profile instead of system Chrome
 
 ```
 AMAZON_CHROME_USE_SYSTEM_PROFILE=false
 ```
 
-## Run
+Log in once in the isolated profile; session is saved under `invoice report\.amazon-chrome-profile`.
+
+## IT-only: remote debugging (disabled by default)
+
+Only if security has explicitly approved:
 
 ```
-Run Amazon Seller Download.bat
+AMAZON_ALLOW_UNSAFE_CDP=1
+AMAZON_CHROME_LAUNCH_MODE=cdp
 ```
+
+Optional attach to a running debug Chrome:
+
+```
+AMAZON_CHROME_CDP_URL=http://127.0.0.1:9348
+```
+
+## Post-process
 
 Post-process after download is **off** by default — use `Run Amazon Invoice Watcher.bat`.

@@ -25,14 +25,29 @@ def resolve_input_dir() -> Path:
     return Path(raw).expanduser()
 
 
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def allow_unsafe_cdp() -> bool:
+    """
+    CDP / --remote-debugging-port matches infostealer behavior (Huntress flags it).
+    Only enable when IT has explicitly approved: AMAZON_ALLOW_UNSAFE_CDP=1
+    """
+    return _env_bool("AMAZON_ALLOW_UNSAFE_CDP", default=False)
+
+
 def use_system_chrome_profile() -> bool:
-    """Use installed Chrome User Data (Default profile) via CDP — same login as daily Chrome."""
+    """Use installed Chrome User Data via Playwright direct control (no debug port)."""
     raw = (os.environ.get("AMAZON_CHROME_USE_SYSTEM_PROFILE") or "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
 def amazon_browser_cdp_port() -> int:
-    # 9348 avoids Edge/other tools that often bind 9222
+    """Only used when AMAZON_ALLOW_UNSAFE_CDP=1 and launch mode is cdp."""
     raw = (
         os.environ.get("AMAZON_CHROME_CDP_PORT")
         or os.environ.get("AMAZON_BROWSER_CDP_PORT")
@@ -44,11 +59,32 @@ def amazon_browser_cdp_port() -> int:
         return 9222
 
 
+def amazon_chrome_launch_mode() -> str:
+    """
+    How to open Chrome for Amazon automation.
+
+    - persistent (default): Playwright launch_persistent_context — no remote debugging
+    - cdp: attach via debug port (requires AMAZON_ALLOW_UNSAFE_CDP=1)
+    """
+    raw = (os.environ.get("AMAZON_CHROME_LAUNCH_MODE") or "persistent").strip().lower()
+    if raw == "cdp" and not allow_unsafe_cdp():
+        return "persistent"
+    if raw in ("persistent", "profile", "direct"):
+        return "persistent"
+    if raw == "cdp":
+        return "cdp"
+    return "persistent"
+
+
+def use_cdp_launch() -> bool:
+    return amazon_chrome_launch_mode() == "cdp" and allow_unsafe_cdp()
+
+
 def chrome_user_data_dir() -> Path | None:
     """
     Optional isolated Playwright profile (only when AMAZON_CHROME_USE_SYSTEM_PROFILE=false).
 
-    Default: None — automation uses your installed Chrome profile via CDP instead.
+    Default: None — automation uses your installed Chrome profile via Playwright direct control.
   """
     raw = (os.environ.get("AMAZON_CHROME_USER_DATA_DIR") or "").strip()
     if raw.lower() in ("0", "false", "no", "off", "none", "disable", "disabled"):
@@ -65,7 +101,9 @@ def chrome_channel() -> str:
 
 
 def chrome_cdp_url() -> str:
-    """Attach to Chrome already running with --remote-debugging-port=9222."""
+    """Attach to Chrome with --remote-debugging-port (disabled unless IT approved)."""
+    if not allow_unsafe_cdp():
+        return ""
     return (os.environ.get("AMAZON_CHROME_CDP_URL") or "").strip()
 
 
@@ -135,6 +173,6 @@ def seller_download_enabled() -> bool:
 
 ON_HOLD_REASON = (
     "Amazon Seller Central download needs either Chrome session reuse or explicit enable.\n"
-    "  Set AMAZON_CHROME_USER_DATA_DIR (or AMAZON_CHROME_CDP_URL) to reuse Chrome login, or\n"
-    "  set AMAZON_SELLER_DOWNLOAD_ENABLED=true with AMAZON_SELLER_EMAIL/PASSWORD in .env."
+    "  Set AMAZON_CHROME_USER_DATA_DIR to reuse a saved Chrome login, or\n"
+    "  set AMAZON_SELLER_DOWNLOAD_ENABLED=true with AMAZON_USERNAME/AMAZON_PASSWORD in .env."
 )

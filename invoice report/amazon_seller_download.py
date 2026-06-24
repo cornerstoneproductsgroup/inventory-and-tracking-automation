@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import date
 from pathlib import Path
@@ -669,6 +670,11 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
     home_url = (cfg.get("amazon", {}).get("home_url") or "").strip() or "https://sellercentral.amazon.com/home"
 
     cdp = chrome_cdp_url()
+    if (os.environ.get("AMAZON_CHROME_CDP_URL") or "").strip() and not cdp:
+        _log(
+            "AMAZON_CHROME_CDP_URL is set but ignored — remote debugging is disabled "
+            "(security). Remove it or set AMAZON_ALLOW_UNSAFE_CDP=1 only if IT approved."
+        )
     if cdp:
         _log(f"Connecting to Chrome over CDP: {cdp}")
         browser = p.chromium.connect_over_cdp(cdp)

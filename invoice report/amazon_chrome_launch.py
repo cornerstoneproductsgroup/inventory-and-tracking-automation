@@ -300,6 +300,7 @@ def launch_persistent_system_chrome(playwright, *, home_url: str):
         channel="chrome",
         headless=False,
         accept_downloads=True,
+        ignore_default_args=["--enable-automation"],
         args=[
             f"--profile-directory={profile}",
             "--disable-session-crashed-bubble",
@@ -648,22 +649,21 @@ def connect_system_chrome(
     port: int,
     log_dir: Path | None = None,
 ):
-    """Open Chrome with the normal profile. Returns (page, cleanup_fn)."""
+    """Open Chrome with the normal profile. Returns (page, cleanup_fn). No CDP by default."""
     _load_env()
-    mode = (os.environ.get("AMAZON_CHROME_LAUNCH_MODE") or "cdp").strip().lower()
-
-    if mode == "persistent":
-        context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
-        return page, context.close
-
     try:
+        from amazon_seller_config import allow_unsafe_cdp, use_cdp_launch
+    except ImportError:
+        allow_unsafe_cdp = lambda: False  # type: ignore[misc, assignment]
+        use_cdp_launch = lambda: False  # type: ignore[misc, assignment]
+
+    if use_cdp_launch():
+        _log("WARN: Using CDP / remote debugging (AMAZON_ALLOW_UNSAFE_CDP=1).")
         browser, page = connect_system_chrome_cdp(
             playwright, home_url=home_url, port=port, log_dir=log_dir
         )
         return page, lambda: None
-    except Exception as exc:
-        _log(f"WARN: CDP launch failed ({exc}) — trying direct profile launch…")
-        close_chrome_processes(force=True)
-        time.sleep(2.0)
-        context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
-        return page, context.close
+
+    _log("Opening Chrome with Playwright direct control (no remote debugging).")
+    context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
+    return page, context.close
