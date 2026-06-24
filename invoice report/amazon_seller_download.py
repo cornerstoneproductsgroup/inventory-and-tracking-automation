@@ -6,7 +6,7 @@ import json
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from playwright.sync_api import Frame, Page, TimeoutError as PlaywrightTimeout, sync_playwright
 
@@ -14,11 +14,16 @@ from amazon_seller_config import (
     STORAGE_STATE,
     amazon_input_path,
     auto_postprocess_after_download,
+    chrome_cdp_url,
+    chrome_channel,
+    chrome_user_data_dir,
     download_timeout_ms,
     headless as default_headless,
     report_ready_max_attempts,
     report_ready_poll_interval_s,
+    request_report_settle_s,
     resolve_input_dir,
+    uses_chrome_session,
 )
 from amazon_seller_credentials import AmazonSellerCredentials, load_amazon_seller_credentials
 
@@ -317,7 +322,83 @@ def _open_sign_in_page(page: Page, cfg: dict[str, Any]) -> None:
     page.wait_for_timeout(1200)
 
 
-def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials) -> None:
+def _has_seller_central_access(page: Page, cfg: dict[str, Any]) -> bool:
+    if _reports_ui_ready(page, cfg):
+        return True
+    if _is_sign_in_page(page, cfg):
+        return False
+    url = page.url.lower()
+    if "sellercentral.amazon.com" not in url:
+        return False
+    menu = _sel(
+        cfg,
+        "hamburger_menu",
+        "button[aria-label*='menu' i], header button:has(svg)",
+    )
+    if page.locator(menu).count() > 0:
+        return True
+    if page.locator("text=Seller Central").count() > 0:
+        return True
+    return False
+
+
+def _open_seller_central_home(page: Page, cfg: dict[str, Any]) -> None:
+    home_url = (cfg.get("amazon", {}).get("home_url") or "").strip()
+    if not home_url:
+        home_url = "https://sellercentral.amazon.com/home"
+    _log(f"Opening Seller Central home: {home_url}")
+    page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(2000)
+
+
+def _ensure_authenticated(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> None:
+    _open_seller_central_home(page, cfg)
+
+    if _has_seller_central_access(page, cfg):
+        _log("Already signed in to Seller Central (Chrome session).")
+        return
+
+    if _is_sign_in_page(page, cfg):
+        if creds is None:
+            raise AmazonSellerDownloadError(
+                "Amazon sign-in page is showing but no credentials are configured. "
+                "Log in once in the Chrome profile (AMAZON_CHROME_USER_DATA_DIR) or set "
+                "AMAZON_SELLER_EMAIL / AMAZON_SELLER_PASSWORD in invoice report/.env."
+            )
+        _log("Sign-in page — logging in with credentials from .env.")
+        _perform_amazon_login(page, cfg, creds)
+        _wait_for_logged_in(page, cfg)
+        return
+
+    reports_url = (cfg.get("amazon", {}).get("reports_url") or "").strip()
+    if reports_url:
+        _log(f"Trying reports URL: {reports_url}")
+        page.goto(reports_url, wait_until="domcontentloaded", timeout=120_000)
+        page.wait_for_timeout(2000)
+        if _has_seller_central_access(page, cfg) or _is_reports_page(page):
+            return
+
+    if _is_sign_in_page(page, cfg):
+        if creds is None:
+            raise AmazonSellerDownloadError("Amazon sign-in required — configure credentials or Chrome profile.")
+        _perform_amazon_login(page, cfg, creds)
+        _wait_for_logged_in(page, cfg)
+        return
+
+    if not _has_seller_central_access(page, cfg):
+        raise AmazonSellerDownloadError(
+            f"Could not confirm Seller Central login (URL: {page.url})."
+        )
+
+
+def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredentials | None) -> None:
+    if uses_chrome_session():
+        _ensure_authenticated(page, cfg, creds)
+        return
+
+    if creds is None:
+        raise AmazonSellerDownloadError("Amazon credentials are required when not using Chrome session reuse.")
+
     reports_url = (cfg.get("amazon", {}).get("reports_url") or "").strip()
     _log(f"Opening reports page: {reports_url}")
     page.goto(reports_url, wait_until="domcontentloaded", timeout=120_000)
@@ -327,7 +408,6 @@ def _login_if_needed(page: Page, cfg: dict[str, Any], creds: AmazonSellerCredent
         _log("Already logged in — Reports Repository form is ready.")
         return
 
-    # Email visible on current page (common redirect from reports URL) — never navigate away.
     if _is_sign_in_page(page, cfg):
         _log("Sign-in page open — logging in on current page.")
         _perform_amazon_login(page, cfg, creds)
@@ -422,15 +502,19 @@ def _open_reports_repository(page: Page, cfg: dict[str, Any]) -> None:
     payments = _sel(
         cfg,
         "payments_menu_item",
+        ".menu__button-item-link:has(.menu__button-item-label:has-text('Payments')), "
         ".menu__button-item-label:has-text('Payments'), text=Payments",
     )
     if not _click_first(page, payments, timeout_ms=15_000):
         raise AmazonSellerDownloadError('Could not click "Payments" in the navigation menu.')
 
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(900)
 
-    tab = _sel(cfg, "reports_repository_tab", "text=Reports Repository")
+    tab = _sel(
+        cfg,
+        "reports_repository_tab",
+        "span[slot='label']:has-text('Reports Repository'), text=Reports Repository",
+    )
     if not _click_first(page, tab, timeout_ms=20_000):
         raise AmazonSellerDownloadError('Could not open "Reports Repository" tab.')
     _wait_for_reports_repository_ui(page, cfg)
@@ -466,8 +550,9 @@ def _request_report(page: Page, cfg: dict[str, Any]) -> None:
     btn = _sel(cfg, "request_report_button", "button:has-text('Request Report'), text=Request Report")
     if not _click_first(page, btn, timeout_ms=15_000):
         raise AmazonSellerDownloadError('Could not click "Request Report".')
-    page.wait_for_timeout(1500)
-    _log("Report requested — waiting for Ready status…")
+    settle_s = request_report_settle_s()
+    _log(f"Report requested — waiting {settle_s:.0f}s before Refresh…")
+    page.wait_for_timeout(int(settle_s * 1000))
 
 
 def _top_report_row(page: Page, cfg: dict[str, Any]):
@@ -485,10 +570,23 @@ def _row_status_text(row) -> str:
         return ""
 
 
+def _click_top_row_action(row, selectors: str, *, label: str, timeout_ms: int = 12_000) -> bool:
+    for sel in _split_selectors(selectors):
+        try:
+            btn = row.locator(sel).first
+            btn.wait_for(state="visible", timeout=timeout_ms)
+            btn.click(timeout=timeout_ms)
+            _log(f"Clicked {label} on top report row ({sel!r}).")
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _wait_and_download_csv(page: Page, cfg: dict[str, Any], dest: Path) -> None:
     ready_sel = _sel(cfg, "status_ready", "text=Ready")
     progress_sel = _sel(cfg, "status_in_progress", "text=In Progress")
-    download_sel = _sel(cfg, "download_csv", "text=Download CSV")
+    download_sel = _sel(cfg, "download_csv", "text=Download CSV, button:has-text('Download CSV')")
     refresh_sel = _sel(cfg, "refresh_button", "button:has-text('Refresh'), text=Refresh")
     max_attempts = report_ready_max_attempts()
     interval_s = report_ready_poll_interval_s()
@@ -497,7 +595,7 @@ def _wait_and_download_csv(page: Page, cfg: dict[str, Any], dest: Path) -> None:
     for attempt in range(1, max_attempts + 1):
         row = _top_report_row(page, cfg)
         if row is None:
-            _log(f"Attempt {attempt}/{max_attempts}: no report rows yet — refreshing…")
+            _log(f"Attempt {attempt}/{max_attempts}: no report rows yet — refreshing page…")
         else:
             body = _row_status_text(row)
             is_ready = row.locator(ready_sel).count() > 0 or "Ready" in body
@@ -505,8 +603,10 @@ def _wait_and_download_csv(page: Page, cfg: dict[str, Any], dest: Path) -> None:
                 _log(f"Attempt {attempt}/{max_attempts}: top report is Ready — downloading CSV.")
                 try:
                     with page.expect_download(timeout=timeout_ms) as dl_info:
-                        if not _click_first(page, download_sel, timeout_ms=15_000):
-                            row.locator(download_sel).first.click(timeout=15_000)
+                        if not _click_top_row_action(row, download_sel, label="Download CSV"):
+                            raise AmazonSellerDownloadError(
+                                'Top report row is Ready but "Download CSV" was not found.'
+                            )
                     download = dl_info.value
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     if dest.exists():
@@ -517,12 +617,18 @@ def _wait_and_download_csv(page: Page, cfg: dict[str, Any], dest: Path) -> None:
                     _log(f"Saved {dest.name} ({dest.stat().st_size:,} bytes) → {dest}")
                     return
                 except PlaywrightTimeout as exc:
-                    raise AmazonSellerDownloadError("Download CSV click did not start a file download.") from exc
+                    raise AmazonSellerDownloadError(
+                        "Download CSV click on the top row did not start a file download."
+                    ) from exc
 
             if row.locator(progress_sel).count() > 0 or "In Progress" in body:
-                _log(f"Attempt {attempt}/{max_attempts}: still In Progress — waiting {interval_s:.0f}s…")
+                _log(f"Attempt {attempt}/{max_attempts}: top row still In Progress…")
             else:
-                _log(f"Attempt {attempt}/{max_attempts}: status={body[:80]!r} — refreshing…")
+                _log(f"Attempt {attempt}/{max_attempts}: top row status={body[:80]!r}")
+
+            if _click_top_row_action(row, refresh_sel, label="Refresh", timeout_ms=5000):
+                page.wait_for_timeout(1200)
+                continue
 
         page.wait_for_timeout(int(interval_s * 1000))
         if _click_first(page, refresh_sel, timeout_ms=4000):
@@ -549,6 +655,53 @@ def _maybe_postprocess(dest: Path) -> None:
         _log(f"WARN: post-process failed (CSV saved): {exc}")
 
 
+def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
+    """Return (page, cleanup_fn). cleanup is no-op for CDP attach."""
+    browser_cfg = cfg.get("browser", {})
+    use_headless = bool(browser_cfg.get("headless", default_headless()))
+    slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
+    default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
+
+    cdp = chrome_cdp_url()
+    if cdp:
+        _log(f"Connecting to Chrome over CDP: {cdp}")
+        browser = p.chromium.connect_over_cdp(cdp)
+        context = browser.contexts[0] if browser.contexts else browser.new_context(accept_downloads=True)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(default_timeout)
+        return page, lambda: None
+
+    profile_dir = chrome_user_data_dir()
+    if profile_dir:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        _log(f"Launching Chrome with profile: {profile_dir}")
+        context = p.chromium.launch_persistent_context(
+            str(profile_dir),
+            channel=chrome_channel(),
+            headless=use_headless,
+            slow_mo=slow_mo,
+            accept_downloads=True,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(default_timeout)
+        return page, context.close
+
+    browser = p.chromium.launch(headless=use_headless, slow_mo=slow_mo)
+    storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
+    context = browser.new_context(
+        accept_downloads=True,
+        storage_state=str(storage) if storage else None,
+    )
+    page = context.new_page()
+    page.set_default_timeout(default_timeout)
+
+    def _close_ephemeral() -> None:
+        context.close()
+        browser.close()
+
+    return page, _close_ephemeral
+
+
 def run_amazon_seller_download(
     *,
     config_path: Path,
@@ -557,37 +710,33 @@ def run_amazon_seller_download(
     skip_postprocess: bool = False,
 ) -> Path:
     cfg = _load_config(config_path)
-    creds = load_amazon_seller_credentials()
+    creds = load_amazon_seller_credentials(required=not uses_chrome_session())
     dest = (dest_path or amazon_input_path(run_date)).resolve()
     input_dir = resolve_input_dir()
     if not input_dir.is_dir():
         raise AmazonSellerDownloadError(f"Amazon Input folder not accessible: {input_dir}")
 
-    browser_cfg = cfg.get("browser", {})
-    use_headless = bool(browser_cfg.get("headless", default_headless()))
-    slow_mo = int(browser_cfg.get("slow_mo_ms", 0))
-    default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
-
     _log(f"Target file: {dest.name}")
     _log(f"Input folder: {input_dir}")
+    if uses_chrome_session():
+        _log("Chrome session reuse enabled — sign-in may be skipped if already logged in.")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=use_headless, slow_mo=slow_mo)
-        storage = STORAGE_STATE if STORAGE_STATE.is_file() else None
-        context = browser.new_context(accept_downloads=True, storage_state=str(storage) if storage else None)
-        page = context.new_page()
-        page.set_default_timeout(default_timeout)
+        page, cleanup = _launch_page(p, cfg)
         try:
             _login_if_needed(page, cfg, creds)
             _open_reports_repository(page, cfg)
             _select_deferred_transaction(page, cfg)
             _request_report(page, cfg)
             _wait_and_download_csv(page, cfg, dest)
-            context.storage_state(path=str(STORAGE_STATE))
-            _log(f"Session saved to {STORAGE_STATE}")
+            if not uses_chrome_session() and chrome_user_data_dir() is None:
+                try:
+                    page.context.storage_state(path=str(STORAGE_STATE))
+                    _log(f"Session saved to {STORAGE_STATE}")
+                except Exception as exc:
+                    _log(f"WARN: could not save session state: {exc}")
         finally:
-            context.close()
-            browser.close()
+            cleanup()
 
     if not skip_postprocess:
         _maybe_postprocess(dest)

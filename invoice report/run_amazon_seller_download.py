@@ -29,7 +29,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Amazon Seller Central: Payments → Reports Repository → Deferred Transaction → "
-            "save CSV to the Amazon Input share (previous calendar day in filename)."
+            "save CSV to the Amazon Input share (Amazon Invoice M-D-YYYY.csv)."
         )
     )
     parser.add_argument(
@@ -42,7 +42,7 @@ def main() -> int:
         "--date",
         metavar="DATE",
         default=None,
-        help="Run date for filename (default: today → file uses yesterday's date).",
+        help="Date for filename (default: today → Amazon Invoice M-D-YYYY.csv).",
     )
     parser.add_argument(
         "--output",

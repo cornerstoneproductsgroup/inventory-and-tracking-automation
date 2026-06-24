@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -11,9 +11,8 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_AMAZON_BASE_DIR = r"\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Amazon"
 DEFAULT_INPUT_DIR = DEFAULT_AMAZON_BASE_DIR + r"\Input"
 
-DEFAULT_REPORTS_URL = (
-    "https://sellercentral.amazon.com/payments/reports-repository"
-)
+DEFAULT_HOME_URL = "https://sellercentral.amazon.com/home"
+DEFAULT_REPORTS_URL = "https://sellercentral.amazon.com/payments/reports-repository"
 DEFAULT_LOGIN_URL = "https://sellercentral.amazon.com/ap/signin"
 
 STORAGE_STATE = Path(
@@ -26,21 +25,42 @@ def resolve_input_dir() -> Path:
     return Path(raw).expanduser()
 
 
-def report_day_for_run(run_day: date | None = None) -> date:
-    """Previous calendar day (file name date when run today)."""
-    d = run_day or date.today()
-    return d - timedelta(days=1)
+def chrome_user_data_dir() -> Path | None:
+    """
+    Chrome profile for Playwright persistent context (channel=chrome).
+
+    Default: invoice report/.amazon-chrome-profile (log in once; session persists).
+    Set AMAZON_CHROME_USER_DATA_DIR=disabled to use Playwright Chromium + .env credentials.
+    """
+    raw = (os.environ.get("AMAZON_CHROME_USER_DATA_DIR") or "").strip()
+    if raw.lower() in ("0", "false", "no", "off", "none", "disable", "disabled"):
+        return None
+    if raw:
+        return Path(raw).expanduser()
+    return _SCRIPT_DIR / ".amazon-chrome-profile"
+
+
+def chrome_channel() -> str:
+    return (os.environ.get("AMAZON_CHROME_CHANNEL") or "chrome").strip() or "chrome"
+
+
+def chrome_cdp_url() -> str:
+    """Attach to Chrome already running with --remote-debugging-port=9222."""
+    return (os.environ.get("AMAZON_CHROME_CDP_URL") or "").strip()
+
+
+def uses_chrome_session() -> bool:
+    return bool(chrome_cdp_url() or chrome_user_data_dir())
 
 
 def amazon_input_filename(report_day: date) -> str:
-    """e.g. Amazon Invoice Report 5-31-2026 Input.csv"""
-    return (
-        f"Amazon Invoice Report {report_day.month}-{report_day.day}-{report_day.year} Input.csv"
-    )
+    """e.g. Amazon Invoice 6-24-2026.csv"""
+    return f"Amazon Invoice {report_day.month}-{report_day.day}-{report_day.year}.csv"
 
 
 def amazon_input_path(run_day: date | None = None) -> Path:
-    return resolve_input_dir() / amazon_input_filename(report_day_for_run(run_day))
+    d = run_day or date.today()
+    return resolve_input_dir() / amazon_input_filename(d)
 
 
 def report_ready_poll_interval_s() -> float:
@@ -49,6 +69,15 @@ def report_ready_poll_interval_s() -> float:
         return max(3.0, float(raw))
     except ValueError:
         return 8.0
+
+
+def request_report_settle_s() -> float:
+    """Wait after Request Report before first Refresh (Amazon ~10s)."""
+    raw = (os.environ.get("AMAZON_REQUEST_REPORT_SETTLE_S") or "10").strip()
+    try:
+        return max(3.0, float(raw))
+    except ValueError:
+        return 10.0
 
 
 def report_ready_max_attempts() -> int:
@@ -68,8 +97,8 @@ def download_timeout_ms() -> int:
 
 
 def auto_postprocess_after_download() -> bool:
-    v = (os.environ.get("AMAZON_DOWNLOAD_AUTO_POSTPROCESS") or "true").strip().lower()
-    return v not in ("0", "false", "no", "")
+    v = (os.environ.get("AMAZON_DOWNLOAD_AUTO_POSTPROCESS") or "false").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def headless() -> bool:
@@ -78,17 +107,14 @@ def headless() -> bool:
 
 
 def seller_download_enabled() -> bool:
-    """
-    Seller Central browser download is ON HOLD (2FA every run).
-    Set AMAZON_SELLER_DOWNLOAD_ENABLED=true in .env to re-enable when ready.
-    """
-    v = (os.environ.get("AMAZON_SELLER_DOWNLOAD_ENABLED") or "false").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    v = (os.environ.get("AMAZON_SELLER_DOWNLOAD_ENABLED") or "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 ON_HOLD_REASON = (
-    "Amazon Seller Central download is on hold: sign-in requires phone 2FA on every "
-    "automated browser session. Code is kept in invoice report/ for a future approach "
-    "(manual OTP, persistent profile, etc.). Set AMAZON_SELLER_DOWNLOAD_ENABLED=true to "
-    "re-enable after that is solved."
+    "Amazon Seller Central download needs either Chrome session reuse or explicit enable.\n"
+    "  Set AMAZON_CHROME_USER_DATA_DIR (or AMAZON_CHROME_CDP_URL) to reuse Chrome login, or\n"
+    "  set AMAZON_SELLER_DOWNLOAD_ENABLED=true with AMAZON_SELLER_EMAIL/PASSWORD in .env."
 )

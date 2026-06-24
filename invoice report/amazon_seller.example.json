@@ -5,6 +5,7 @@
     "default_timeout_ms": 120000
   },
   "amazon": {
+    "home_url": "https://sellercentral.amazon.com/home",
     "login_url": "https://sellercentral.amazon.com/ap/signin",
     "reports_url": "https://sellercentral.amazon.com/payments/reports-repository",
     "report_type": "Deferred Transaction"

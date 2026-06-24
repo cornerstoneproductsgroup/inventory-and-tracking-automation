@@ -1,66 +1,70 @@
 # Amazon Seller Central download
 
-**ON HOLD** — Seller Central sign-in requires phone 2FA on every automated browser session.  
-The Playwright download code remains in this folder but is **not** in the morning schedule or workflow menu.
-
-**Still works:** drop a raw CSV in the Amazon **Input** share → `Run Amazon Invoice Watcher.bat` (format + print).
-
-**To re-enable later:**
-
-1. Set `AMAZON_SELLER_DOWNLOAD_ENABLED=true` in `invoice report/.env`
-2. Move `amazon_seller_download` from `_on_hold_steps` into `steps[]` in `scheduled_workflow.json`
-3. Restore menu option in `Run Full Workflow.bat` if desired
-
----
-
-# Amazon Seller Central download (implementation notes)
-
-Automates **Payments → Reports Repository → Deferred Transaction → Request Report → Download CSV**.
-
-## Output
-
-Saves to:
+Downloads **Deferred Transaction** CSV from Payments → Reports Repository and saves to:
 
 `\\rygarcorp.com\shares\Cornerstone\Invoice Reports\Amazon\Input`
 
-Filename uses **yesterday's date** (no leading zeros):
+Filename: **`Amazon Invoice M-D-YYYY.csv`** (today’s date, e.g. `Amazon Invoice 6-24-2026.csv`).
 
-`Amazon Invoice Report 5-31-2026 Input.csv`
+Your **Amazon Invoice Watcher** picks up the file from Input, formats, and prints.
 
-When run on **6-1-2026**, the file is named for **5-31-2026**.
+## Chrome session (recommended)
 
-## Setup
+By default Playwright launches **Google Chrome** with a persistent profile at:
 
-1. Copy `invoice report\.env.example` → `invoice report\.env` if needed.
-2. Add credentials:
-   ```
-   AMAZON_SELLER_EMAIL=your@email.com
-   AMAZON_SELLER_PASSWORD=your_password
-   ```
-3. Optional: copy `amazon_seller.example.json` → `amazon_seller.json` for selector tweaks.  
-   Login fields default to `#ap_email` and `#ap_password` (Amazon sign-in page).
-4. First run: visible browser (`headless: false`) — complete MFA if prompted; session saves to `amazon_seller_storage_state.json`.
+`invoice report/.amazon-chrome-profile`
 
-## Commands
+1. First run: Chrome opens → sign in to Seller Central once (including 2FA if prompted).
+2. Later runs: session is reused — no login each time.
 
-```bat
+### Reuse employee Chrome already open
+
+Start Chrome with remote debugging, then set in `invoice report/.env`:
+
+```
+AMAZON_CHROME_CDP_URL=http://127.0.0.1:9222
+```
+
+Example shortcut target:
+
+```
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+The script attaches to the open browser (employee must already be on Seller Central).
+
+### Disable Chrome profile (fallback)
+
+Use Playwright Chromium + credentials in `.env`:
+
+```
+AMAZON_CHROME_USER_DATA_DIR=disabled
+AMAZON_SELLER_EMAIL=...
+AMAZON_SELLER_PASSWORD=...
+```
+
+## Run
+
+```
 Run Amazon Seller Download.bat
-cd "invoice report"
-python run_amazon_seller_download.py --check-credentials
+```
+
+or
+
+```
 python run_amazon_seller_download.py
 ```
 
-After download, `amazon_invoice_postprocess` runs by default (format + print). Disable with `AMAZON_DOWNLOAD_AUTO_POSTPROCESS=false` if you only want the watcher to handle it.
-
-## Morning schedule
-
-Included in `scheduled_workflow.json` as step `amazon_seller_download` (after CommerceHub/SPS invoice reports).
+Post-process after download is **off** by default (`AMAZON_DOWNLOAD_AUTO_POSTPROCESS=false`) — use the watcher.
 
 ## Env
 
 | Variable | Default |
 |----------|---------|
-| `AMAZON_INVOICE_INPUT_DIR` | `...\Amazon\Input` |
+| `AMAZON_CHROME_USER_DATA_DIR` | `invoice report/.amazon-chrome-profile` |
+| `AMAZON_CHROME_CDP_URL` | (empty — attach to running Chrome) |
+| `AMAZON_REQUEST_REPORT_SETTLE_S` | 10 (wait after Request Report before Refresh) |
 | `AMAZON_REPORT_POLL_INTERVAL_S` | 8 |
 | `AMAZON_REPORT_MAX_REFRESH` | 20 |
-| `AMAZON_DOWNLOAD_AUTO_POSTPROCESS` | true |
+| `AMAZON_DOWNLOAD_AUTO_POSTPROCESS` | false |
+| `AMAZON_INVOICE_INPUT_DIR` | `...\Amazon\Input` |
