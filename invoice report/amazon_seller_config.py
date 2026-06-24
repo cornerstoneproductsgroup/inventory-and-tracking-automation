@@ -32,10 +32,11 @@ def use_system_chrome_profile() -> bool:
 
 
 def amazon_browser_cdp_port() -> int:
+    # 9348 avoids Edge/other tools that often bind 9222
     raw = (
         os.environ.get("AMAZON_CHROME_CDP_PORT")
         or os.environ.get("AMAZON_BROWSER_CDP_PORT")
-        or "9222"
+        or "9348"
     ).strip()
     try:
         return max(1024, int(raw))

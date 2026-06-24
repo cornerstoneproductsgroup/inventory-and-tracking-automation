@@ -673,10 +673,15 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
         _log(f"Connecting to Chrome over CDP: {cdp}")
         browser = p.chromium.connect_over_cdp(cdp)
         context = browser.contexts[0] if browser.contexts else browser.new_context(accept_downloads=True)
-        from amazon_chrome_launch import goto_seller_central_home, pick_seller_central_page
+        from amazon_chrome_launch import (
+            assert_chrome_context,
+            goto_seller_central_home,
+            pick_seller_central_page,
+        )
 
         page = pick_seller_central_page(context, home_url=home_url)
         page.set_default_timeout(default_timeout)
+        assert_chrome_context(context)
         goto_seller_central_home(page, home_url)
         return page, lambda: None
 

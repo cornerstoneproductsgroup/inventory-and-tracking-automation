@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "PORT=9222"
+set "PORT=9348"
 if defined AMAZON_CHROME_CDP_PORT set "PORT=%AMAZON_CHROME_CDP_PORT%"
 
 set "CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe"

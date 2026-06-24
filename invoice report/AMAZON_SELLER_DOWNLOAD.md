@@ -12,28 +12,27 @@ By default the script uses **your installed Chrome profile** (same cookies as wh
 
 **First run:** Chrome closes briefly, reopens with Seller Central, and automation continues while you stay logged in.
 
-Add to `Inventory Submissions\.env` (optional):
+Add to `Inventory Submissions\.env`:
 
 ```
-UPS_KILL_CHROME=1
-UPS_BROWSER_CHANNEL=chrome
+AMAZON_KILL_CHROME=1
 ```
 
-`UPS_KILL_CHROME=1` lets automation close Chrome before reopening with your profile. Without it, close all Chrome windows manually before running.
+(`AMAZON_KILL_CHROME=1` closes Chrome before reopening with your profile. Amazon **never** uses Edge — only Google Chrome.)
 
 ### Option A — Let the script launch Chrome (easiest)
 
-1. Close Chrome (or set `UPS_KILL_CHROME=1`)
+1. Close Chrome (or set `AMAZON_KILL_CHROME=1`)
 2. Run `Run Amazon Seller Download.bat` or menu **R → 6**
-3. Chrome reopens already logged in if you use it daily for Seller Central
+3. Chrome reopens on debug port **9348** with your normal profile
 
 ### Option B — Keep Chrome open yourself
 
-1. Run **`Run Amazon Chrome Debug.bat`** once (starts Chrome with debug port 9222)
+1. Run **`Run Amazon Chrome Debug.bat`** once (starts Chrome on port 9348)
 2. Sign in to Seller Central in that window if needed
 3. Add to `.env`:
    ```
-   AMAZON_CHROME_CDP_URL=http://127.0.0.1:9222
+   AMAZON_CHROME_CDP_URL=http://127.0.0.1:9348
    ```
 4. Run the download — attaches to that Chrome without closing it
 
