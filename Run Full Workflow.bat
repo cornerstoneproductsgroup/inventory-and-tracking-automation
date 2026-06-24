@@ -250,10 +250,12 @@ echo   2  CommerceHub ALL ^(Depot + Lowe's^)
 echo   3  Depot
 echo   4  Lowe's
 echo   5  Tractor Supply
+echo   6  Amazon ^(Seller Central Deferred Transaction CSV to Input share^)
 echo   0  Back to main menu
 echo.
-choice /C 012345 /N /M "Press 0-5: "
-REM 0=1 1=2 2=3 3=4 4=5 5=6
+choice /C 0123456 /N /M "Press 0-6: "
+REM 0=1 1=2 2=3 3=4 4=5 5=6 6=7
+if errorlevel 7 goto IR_AMAZON
 if errorlevel 6 goto IR_TRACTOR
 if errorlevel 5 goto IR_LOWES
 if errorlevel 4 goto IR_DEPOT
@@ -280,6 +282,10 @@ goto RUN
 
 :IR_TRACTOR
 set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes tractor"
+goto RUN
+
+:IR_AMAZON
+set "EXTRA_ARGS=--amazon-seller-download-only"
 goto RUN
 
 :RUN
