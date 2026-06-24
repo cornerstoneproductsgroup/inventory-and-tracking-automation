@@ -309,7 +309,7 @@ def launch_persistent_system_chrome(playwright, *, home_url: str):
         ],
     )
     page = context.pages[0] if context.pages else context.new_page()
-    goto_seller_central_home(page, home_url)
+    page = bootstrap_seller_central_page(context, home_url)
     assert_chrome_context(context)
     return context, page
 
@@ -398,46 +398,207 @@ def connect_playwright_cdp(playwright, port: int):
     return playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
 
 
+_BLANK_TAB_URLS = frozenset({"about:blank", "chrome://newtab/", "edge://newtab/", ""})
+
+
+def _page_url(page) -> str:
+    try:
+        return (page.url or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_blank_tab_url(url: str | None) -> bool:
+    text = (url or "").strip().lower()
+    return text in _BLANK_TAB_URLS or text.startswith("chrome://newtab") or text.startswith("edge://newtab")
+
+
+def _is_seller_central_url(url: str | None) -> bool:
+    return "sellercentral.amazon.com" in (url or "").lower()
+
+
+def _log_browser_tabs(context) -> None:
+    try:
+        urls = [_page_url(pg) for pg in context.pages]
+        _log(f"Browser tabs ({len(urls)}): {urls!r}")
+    except Exception:
+        pass
+
+
+def _close_extra_blank_tabs(context, *, keep) -> None:
+    for pg in list(context.pages):
+        if pg is keep:
+            continue
+        if _is_blank_tab_url(_page_url(pg)):
+            try:
+                _log(f"Closing blank tab: {_page_url(pg)!r}")
+                pg.close()
+            except Exception:
+                pass
+
+
+def _wait_until_tab_navigated(page, *, timeout_ms: int = 20_000) -> bool:
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if not _is_blank_tab_url(_page_url(page)):
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
+def _goto_tab_url(page, url: str) -> bool:
+    for wait_until in ("commit", "domcontentloaded"):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=45_000)
+        except Exception as exc:
+            _log(f"WARN: page.goto ({wait_until}) raised: {exc}")
+        if _wait_until_tab_navigated(page, timeout_ms=15_000):
+            return True
+    return False
+
+
+def _js_navigate_tab(page, url: str) -> bool:
+    try:
+        page.evaluate("(target) => { window.location.assign(target); }", url)
+        page.wait_for_load_state("domcontentloaded", timeout=45_000)
+    except Exception as exc:
+        _log(f"WARN: JS navigate failed: {exc}")
+        return False
+    return not _is_blank_tab_url(_page_url(page))
+
+
+def _paste_url_in_address_bar(page, url: str) -> bool:
+    page.bring_to_front()
+    page.wait_for_timeout(400)
+    try:
+        page.mouse.click(500, 400)
+        page.wait_for_timeout(200)
+    except Exception:
+        try:
+            page.locator("body").click(timeout=2000)
+        except Exception:
+            pass
+
+    for focus_key in ("Control+l", "Alt+d", "F6"):
+        try:
+            page.keyboard.press(focus_key)
+            page.wait_for_timeout(300)
+            page.keyboard.press("Control+a")
+            page.wait_for_timeout(80)
+            page.keyboard.insert_text(url)
+            page.wait_for_timeout(80)
+            page.keyboard.press("Enter")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            except Exception:
+                page.wait_for_timeout(2000)
+            if not _is_blank_tab_url(_page_url(page)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_seller_central_in_fresh_tab(page, url: str):
+    """First tabs in a real Chrome profile often stay on about:blank — open a new tab."""
+    context = page.context
+    fresh = context.new_page()
+    fresh.bring_to_front()
+    try:
+        for name, load in (
+            ("new tab page.goto", lambda: _goto_tab_url(fresh, url)),
+            ("new tab JS navigate", lambda: _js_navigate_tab(fresh, url)),
+            ("new tab address bar paste", lambda: _paste_url_in_address_bar(fresh, url)),
+        ):
+            try:
+                if load():
+                    _log(f"Loaded via {name}: {_page_url(fresh)!r}")
+                    _close_extra_blank_tabs(context, keep=fresh)
+                    return fresh
+            except Exception as exc:
+                _log(f"WARN: {name} error: {exc}")
+    except Exception as exc:
+        _log(f"WARN: fresh tab open failed: {exc}")
+    try:
+        fresh.close()
+    except Exception:
+        pass
+    return None
+
+
+def _load_seller_central_in_tab(page, home_url: str):
+    current = _page_url(page)
+    if _is_seller_central_url(current) and "signin" not in current.lower():
+        return page
+
+    _log(f"Tab URL is {current!r} — loading {home_url!r}")
+    page.bring_to_front()
+    page.wait_for_timeout(500)
+
+    loaders = (
+        ("page.goto", lambda: _goto_tab_url(page, home_url)),
+        ("JS navigate", lambda: _js_navigate_tab(page, home_url)),
+        ("address bar paste", lambda: _paste_url_in_address_bar(page, home_url)),
+    )
+    for attempt in range(1, 3):
+        _log(f"Seller Central load attempt {attempt}/2…")
+        for name, load in loaders:
+            try:
+                if load():
+                    _log(f"Loaded via {name}: {_page_url(page)!r}")
+                    return page
+            except Exception as exc:
+                _log(f"WARN: {name} error: {exc}")
+            page.wait_for_timeout(300)
+
+    fresh = _open_seller_central_in_fresh_tab(page, home_url)
+    if fresh is not None:
+        return fresh
+
+    raise RuntimeError(
+        f"Still on about:blank after loading Seller Central ({home_url!r}). "
+        "Close all Chrome windows and run again."
+    )
+
+
 def pick_seller_central_page(context, *, home_url: str):
+    if not context.pages:
+        return context.new_page()
     for pg in context.pages:
         try:
-            url = (pg.url or "").lower()
-            if "sellercentral.amazon.com" in url:
+            url = _page_url(pg)
+            if _is_seller_central_url(url) and not _is_blank_tab_url(url):
                 pg.bring_to_front()
                 return pg
         except Exception:
             continue
-    if context.pages:
-        pg = context.pages[0]
-        pg.bring_to_front()
-        return pg
-    return context.new_page()
+    pg = context.pages[0]
+    pg.bring_to_front()
+    return pg
 
 
-def goto_seller_central_home(page, home_url: str) -> None:
-    current = (page.url or "").strip()
-    _log(f"Active tab: {current!r}")
-    if "sellercentral.amazon.com" in current.lower() and "signin" not in current.lower():
-        _log(f"Already on Seller Central: {current}")
-        return
+def bootstrap_seller_central_page(context, home_url: str):
+    """Fix about:blank startup tab — call right after opening the browser."""
+    _log_browser_tabs(context)
+    driver = pick_seller_central_page(context, home_url=home_url)
+    driver.bring_to_front()
+    current = _page_url(driver).lower()
+    if _is_blank_tab_url(current) or not _is_seller_central_url(current):
+        driver = _load_seller_central_in_tab(driver, home_url)
+    _close_extra_blank_tabs(context, keep=driver)
+    driver.bring_to_front()
+    url = _page_url(driver).lower()
+    if "sellercentral.amazon.com" not in url:
+        raise RuntimeError(
+            f"Browser stayed on {_page_url(driver)!r}; could not open Seller Central."
+        )
+    _log(f"Seller Central loaded: {_page_url(driver)}")
+    return driver
 
-    last_err: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            _log(f"Navigating to {home_url} (attempt {attempt}/3)…")
-            page.goto(home_url, wait_until="domcontentloaded", timeout=120_000)
-            url = (page.url or "").lower()
-            if "sellercentral.amazon.com" in url:
-                _log(f"Seller Central loaded: {page.url}")
-                return
-        except Exception as exc:
-            last_err = exc
-            _log(f"WARN: navigation attempt {attempt} failed: {exc}")
-        time.sleep(1.0)
 
-    raise RuntimeError(
-        f"Browser stayed on {page.url!r}; could not open Seller Central. {last_err}"
-    )
+def goto_seller_central_home(page, home_url: str):
+    """Navigate to Seller Central; returns the active page (may be a new tab)."""
+    return bootstrap_seller_central_page(page.context, home_url)
 
 
 def assert_chrome_context(context) -> None:
@@ -476,7 +637,7 @@ def connect_system_chrome_cdp(
     context = browser.contexts[0]
     assert_chrome_context(context)
     page = pick_seller_central_page(context, home_url=home_url)
-    goto_seller_central_home(page, home_url)
+    page = bootstrap_seller_central_page(context, home_url)
     return browser, page
 
 
@@ -489,11 +650,20 @@ def connect_system_chrome(
 ):
     """Open Chrome with the normal profile. Returns (page, cleanup_fn)."""
     _load_env()
-    use_cdp = (os.environ.get("AMAZON_CHROME_LAUNCH_MODE") or "").strip().lower() == "cdp"
-    if use_cdp:
+    mode = (os.environ.get("AMAZON_CHROME_LAUNCH_MODE") or "cdp").strip().lower()
+
+    if mode == "persistent":
+        context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
+        return page, context.close
+
+    try:
         browser, page = connect_system_chrome_cdp(
             playwright, home_url=home_url, port=port, log_dir=log_dir
         )
         return page, lambda: None
-    context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
-    return page, context.close
+    except Exception as exc:
+        _log(f"WARN: CDP launch failed ({exc}) — trying direct profile launch…")
+        close_chrome_processes(force=True)
+        time.sleep(2.0)
+        context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
+        return page, context.close

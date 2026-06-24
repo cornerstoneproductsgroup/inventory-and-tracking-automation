@@ -680,16 +680,16 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
         )
 
         page = pick_seller_central_page(context, home_url=home_url)
+        page = goto_seller_central_home(page, home_url)
         page.set_default_timeout(default_timeout)
         assert_chrome_context(context)
-        goto_seller_central_home(page, home_url)
         return page, lambda: None
 
     if use_system_chrome_profile():
         from amazon_chrome_launch import connect_system_chrome
 
         port = amazon_browser_cdp_port()
-        _log("Using installed Chrome profile (direct Playwright control).")
+        _log("Using installed Chrome profile.")
         page, cleanup = connect_system_chrome(
             p,
             home_url=home_url,
