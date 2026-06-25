@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -145,144 +142,20 @@ def close_chrome_processes(*, force: bool | None = None) -> int:
     return remaining
 
 
-def cdp_endpoint_ready(port: int, *, timeout_s: float = 2.0) -> bool:
-    url = f"http://127.0.0.1:{port}/json/version"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return False
-
-
-def cdp_browser_name(port: int) -> str:
-    """Browser string from CDP /json/version (e.g. 'Chrome/131' or 'Microsoft Edge/131')."""
-    url = f"http://127.0.0.1:{port}/json/version"
-    try:
-        with urllib.request.urlopen(url, timeout=2.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        return str(data.get("Browser") or data.get("browser") or "")
-    except Exception:
-        return ""
-
-
-def _cdp_is_chrome(port: int) -> bool:
-    name = cdp_browser_name(port).lower()
-    if not name:
-        return False
-    if "edge" in name or "edg/" in name:
-        return False
-    return "chrome" in name
-
-
-def _read_devtools_port(user_data: Path, profile: str) -> int | None:
-    for rel in (Path(profile) / "DevToolsActivePort", Path("DevToolsActivePort")):
-        path = user_data / rel
-        if not path.is_file():
-            continue
-        try:
-            first = path.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
-            port = int(first)
-            return port if port > 0 else None
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
-
-
-def discover_chrome_cdp_port(
-    *,
-    preferred: int,
-    user_data: Path,
-    profile: str,
-    timeout_s: float = 120.0,
-) -> int | None:
-    deadline = time.monotonic() + timeout_s
-    last_log = 0.0
-    while time.monotonic() < deadline:
-        candidates: list[int] = []
-        for port in (preferred, _read_devtools_port(user_data, profile), 9222, 9348):
-            if port and port not in candidates:
-                candidates.append(port)
-        for port in candidates:
-            if cdp_endpoint_ready(port, timeout_s=1.0) and _cdp_is_chrome(port):
-                return port
-        elapsed = timeout_s - (deadline - time.monotonic())
-        if elapsed - last_log >= 15.0:
-            last_log = elapsed
-            dt = _read_devtools_port(user_data, profile)
+def _warn_if_debug_env_vars_set() -> None:
+    """Remote debugging env vars are ignored — they trigger IT security alerts."""
+    for key in (
+        "AMAZON_CHROME_CDP_URL",
+        "AMAZON_CHROME_CDP_PORT",
+        "AMAZON_BROWSER_CDP_PORT",
+        "AMAZON_ALLOW_UNSAFE_CDP",
+        "AMAZON_CHROME_LAUNCH_MODE",
+    ):
+        if (os.environ.get(key) or "").strip():
             _log(
-                f"Waiting for Chrome debug port… {int(elapsed)}s "
-                f"(chrome.exe={chrome_process_count()}, DevToolsActivePort={dt})"
+                f"WARN: {key} is set but ignored — Amazon automation does not use "
+                "remote debugging (remove it from .env)."
             )
-        time.sleep(0.5)
-    return None
-
-
-def wait_for_cdp_port(
-    port: int,
-    *,
-    user_data: Path | None = None,
-    profile: str = "Default",
-    timeout_s: float = 120.0,
-) -> int | None:
-    if user_data is not None:
-        found = discover_chrome_cdp_port(
-            preferred=port,
-            user_data=user_data,
-            profile=profile,
-            timeout_s=timeout_s,
-        )
-        return found
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if cdp_endpoint_ready(port) and _cdp_is_chrome(port):
-            return port
-        time.sleep(0.5)
-    return None
-
-
-def _build_chrome_cmd(
-    *,
-    exe: Path,
-    user_data: Path,
-    profile: str,
-    port: int,
-    home_url: str,
-    bind_localhost: bool,
-) -> list[str]:
-    cmd = [
-        str(exe),
-        f"--user-data-dir={user_data}",
-        f"--profile-directory={profile}",
-        f"--remote-debugging-port={port}",
-        "--remote-allow-origins=*",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-session-crashed-bubble",
-        "--disable-restore-session-state",
-        "--disable-notifications",
-        "--new-window",
-    ]
-    if bind_localhost:
-        cmd.append("--remote-debugging-address=127.0.0.1")
-    cmd.append(home_url)
-    return cmd
-
-
-def _start_chrome_process(cmd: list[str], *, log_dir: Path | None) -> subprocess.Popen | None:
-    _log("Chrome command: " + " ".join(cmd))
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "chrome_launch_cmd.txt").write_text(" ".join(cmd), encoding="utf-8")
-    try:
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-    except Exception as exc:
-        _log(f"WARN: could not start Chrome process: {exc}")
-        return None
 
 
 def ensure_chrome_closed_for_launch() -> None:
@@ -313,7 +186,6 @@ def launch_persistent_chrome(
         "--disable-restore-session-state",
         "--no-first-run",
         "--no-default-browser-check",
-        home_url,
     ]
     if extra_args:
         launch_args = extra_args + launch_args
@@ -381,90 +253,6 @@ def launch_persistent_system_chrome(playwright, *, home_url: str):
         home_url=home_url,
         extra_args=extra_args,
     )
-
-
-def launch_chrome_for_cdp(
-    *,
-    home_url: str,
-    port: int,
-    log_dir: Path | None = None,
-) -> int:
-    """Start Google Chrome with remote debugging — never Edge."""
-    exe = chrome_executable()
-    user_data = chrome_user_data_dir()
-    if exe is None:
-        raise RuntimeError(
-            "Google Chrome not found. Install Chrome or set AMAZON_CHROME_EXE in .env."
-        )
-    if user_data is None:
-        raise RuntimeError(
-            "Chrome User Data folder not found. Set AMAZON_CHROME_USER_DATA_DIR in .env."
-        )
-
-    profile = chrome_profile_directory()
-    _log(f"Chrome exe: {exe}")
-    _log(f"Chrome profile: {user_data} \\ {profile}")
-
-    if cdp_endpoint_ready(port) and _cdp_is_chrome(port):
-        _log(f"Chrome debug port {port} already open ({cdp_browser_name(port)}).")
-        return port
-
-    if cdp_endpoint_ready(port) and not _cdp_is_chrome(port):
-        name = cdp_browser_name(port) or "unknown browser"
-        raise RuntimeError(
-            f"Port {port} is in use by {name}, not Chrome. "
-            f"Close that browser or set AMAZON_CHROME_CDP_PORT to a different port."
-        )
-
-    remaining = close_chrome_processes()
-    if remaining > 0:
-        raise RuntimeError(
-            f"{remaining} Chrome process(es) still running. "
-            "Close Chrome manually or set AMAZON_KILL_CHROME=1 in .env."
-        )
-
-    discovered: int | None = None
-    for attempt_label, bind_localhost in (("localhost bind", True), ("no localhost bind", False)):
-        cmd = _build_chrome_cmd(
-            exe=exe,
-            user_data=user_data,
-            profile=profile,
-            port=port,
-            home_url=home_url,
-            bind_localhost=bind_localhost,
-        )
-        _log(f"Starting Google Chrome ({attempt_label}, port {port})…")
-        _start_chrome_process(cmd, log_dir=log_dir or _SCRIPT_DIR)
-
-        for _ in range(20):
-            if chrome_process_count() > 0:
-                break
-            time.sleep(0.5)
-
-        discovered = wait_for_cdp_port(
-            port,
-            user_data=user_data,
-            profile=profile,
-            timeout_s=60.0,
-        )
-        if discovered is not None:
-            break
-        _log(f"WARN: Chrome debug port not ready ({attempt_label}) — retrying…")
-        close_chrome_processes(force=True)
-        time.sleep(2.0)
-
-    if discovered is None:
-        raise RuntimeError(
-            f"Chrome did not open debug port {port}. "
-            "Close all Chrome windows and retry, or run Run Amazon Chrome Debug.bat."
-        )
-
-    _log(f"Chrome ready on port {discovered} ({cdp_browser_name(discovered)}).")
-    return discovered
-
-
-def connect_playwright_cdp(playwright, port: int):
-    return playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
 
 
 _BLANK_TAB_URLS = frozenset({"about:blank", "chrome://newtab/", "edge://newtab/", ""})
@@ -693,59 +481,16 @@ def assert_chrome_context(context) -> None:
     if ua and ("Edg/" in ua or "Edge" in ua) and "Chrome" not in ua:
         raise RuntimeError(
             "Connected browser is Microsoft Edge, not Google Chrome. "
-            "Set AMAZON_CHROME_CDP_PORT to an unused port and ensure only Chrome uses it."
+            "Amazon automation requires Google Chrome."
         )
     if ua:
         _log(f"Browser user-agent: {ua[:80]}…")
 
 
-def connect_system_chrome_cdp(
-    playwright,
-    *,
-    home_url: str,
-    port: int,
-    log_dir: Path | None = None,
-):
-    """Attach Playwright over CDP (used when AMAZON_CHROME_CDP_URL is set)."""
+def connect_system_chrome(playwright, *, home_url: str):
+    """Open Chrome with the normal profile. Returns (page, cleanup_fn). No remote debugging."""
     _load_env()
-
-    if cdp_endpoint_ready(port) and _cdp_is_chrome(port):
-        _log(f"Attaching to Chrome on port {port} ({cdp_browser_name(port)}).")
-    else:
-        launch_chrome_for_cdp(home_url=home_url, port=port, log_dir=log_dir)
-
-    browser = connect_playwright_cdp(playwright, port)
-    if not browser.contexts:
-        raise RuntimeError(f"Chrome on port {port} has no browser contexts.")
-    context = browser.contexts[0]
-    assert_chrome_context(context)
-    page = pick_seller_central_page(context, home_url=home_url)
-    page = bootstrap_seller_central_page(context, home_url)
-    return browser, page
-
-
-def connect_system_chrome(
-    playwright,
-    *,
-    home_url: str,
-    port: int,
-    log_dir: Path | None = None,
-):
-    """Open Chrome with the normal profile. Returns (page, cleanup_fn). No CDP by default."""
-    _load_env()
-    try:
-        from amazon_seller_config import allow_unsafe_cdp, use_cdp_launch
-    except ImportError:
-        allow_unsafe_cdp = lambda: False  # type: ignore[misc, assignment]
-        use_cdp_launch = lambda: False  # type: ignore[misc, assignment]
-
-    if use_cdp_launch():
-        _log("WARN: Using CDP / remote debugging (AMAZON_ALLOW_UNSAFE_CDP=1).")
-        browser, page = connect_system_chrome_cdp(
-            playwright, home_url=home_url, port=port, log_dir=log_dir
-        )
-        return page, lambda: None
-
+    _warn_if_debug_env_vars_set()
     _log("Opening Chrome with Playwright direct control (no remote debugging).")
     context, page = launch_persistent_system_chrome(playwright, home_url=home_url)
     return page, context.close

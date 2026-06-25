@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import date
 from pathlib import Path
@@ -15,7 +14,6 @@ from amazon_seller_config import (
     STORAGE_STATE,
     amazon_input_path,
     auto_postprocess_after_download,
-    chrome_cdp_url,
     chrome_channel,
     chrome_user_data_dir,
     download_timeout_ms,
@@ -668,11 +666,8 @@ def _maybe_postprocess(dest: Path) -> None:
 
 
 def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
-    """Return (page, cleanup_fn). cleanup is no-op for CDP attach."""
-    from amazon_seller_config import (
-        amazon_browser_cdp_port,
-        use_system_chrome_profile,
-    )
+    """Return (page, cleanup_fn)."""
+    from amazon_seller_config import use_system_chrome_profile
 
     browser_cfg = cfg.get("browser", {})
     use_headless = bool(browser_cfg.get("headless", default_headless()))
@@ -680,39 +675,11 @@ def _launch_page(p, cfg: dict[str, Any]) -> tuple[Page, Callable[[], None]]:
     default_timeout = int(browser_cfg.get("default_timeout_ms", 120_000))
     home_url = (cfg.get("amazon", {}).get("home_url") or "").strip() or "https://sellercentral.amazon.com/home"
 
-    cdp = chrome_cdp_url()
-    if (os.environ.get("AMAZON_CHROME_CDP_URL") or "").strip() and not cdp:
-        _log(
-            "AMAZON_CHROME_CDP_URL is set but ignored — remote debugging is disabled "
-            "(security). Remove it or set AMAZON_ALLOW_UNSAFE_CDP=1 only if IT approved."
-        )
-    if cdp:
-        _log(f"Connecting to Chrome over CDP: {cdp}")
-        browser = p.chromium.connect_over_cdp(cdp)
-        context = browser.contexts[0] if browser.contexts else browser.new_context(accept_downloads=True)
-        from amazon_chrome_launch import (
-            assert_chrome_context,
-            goto_seller_central_home,
-            pick_seller_central_page,
-        )
-
-        page = pick_seller_central_page(context, home_url=home_url)
-        page = goto_seller_central_home(page, home_url)
-        page.set_default_timeout(default_timeout)
-        assert_chrome_context(context)
-        return page, lambda: None
-
     if use_system_chrome_profile():
         from amazon_chrome_launch import connect_system_chrome
 
-        port = amazon_browser_cdp_port()
         _log("Using installed Chrome profile.")
-        page, cleanup = connect_system_chrome(
-            p,
-            home_url=home_url,
-            port=port,
-            log_dir=Path(__file__).resolve().parent,
-        )
+        page, cleanup = connect_system_chrome(p, home_url=home_url)
         page.set_default_timeout(default_timeout)
         return page, cleanup
 

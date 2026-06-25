@@ -25,59 +25,10 @@ def resolve_input_dir() -> Path:
     return Path(raw).expanduser()
 
 
-def _env_bool(name: str, *, default: bool = False) -> bool:
-    raw = (os.environ.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on")
-
-
-def allow_unsafe_cdp() -> bool:
-    """
-    CDP / --remote-debugging-port matches infostealer behavior (Huntress flags it).
-    Only enable when IT has explicitly approved: AMAZON_ALLOW_UNSAFE_CDP=1
-    """
-    return _env_bool("AMAZON_ALLOW_UNSAFE_CDP", default=False)
-
-
 def use_system_chrome_profile() -> bool:
     """Use installed Chrome User Data via Playwright direct control (no debug port)."""
     raw = (os.environ.get("AMAZON_CHROME_USE_SYSTEM_PROFILE") or "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
-
-
-def amazon_browser_cdp_port() -> int:
-    """Only used when AMAZON_ALLOW_UNSAFE_CDP=1 and launch mode is cdp."""
-    raw = (
-        os.environ.get("AMAZON_CHROME_CDP_PORT")
-        or os.environ.get("AMAZON_BROWSER_CDP_PORT")
-        or "9348"
-    ).strip()
-    try:
-        return max(1024, int(raw))
-    except ValueError:
-        return 9222
-
-
-def amazon_chrome_launch_mode() -> str:
-    """
-    How to open Chrome for Amazon automation.
-
-    - persistent (default): Playwright launch_persistent_context — no remote debugging
-    - cdp: attach via debug port (requires AMAZON_ALLOW_UNSAFE_CDP=1)
-    """
-    raw = (os.environ.get("AMAZON_CHROME_LAUNCH_MODE") or "persistent").strip().lower()
-    if raw == "cdp" and not allow_unsafe_cdp():
-        return "persistent"
-    if raw in ("persistent", "profile", "direct"):
-        return "persistent"
-    if raw == "cdp":
-        return "cdp"
-    return "persistent"
-
-
-def use_cdp_launch() -> bool:
-    return amazon_chrome_launch_mode() == "cdp" and allow_unsafe_cdp()
 
 
 def chrome_user_data_dir() -> Path | None:
@@ -100,15 +51,8 @@ def chrome_channel() -> str:
     return (os.environ.get("AMAZON_CHROME_CHANNEL") or "chrome").strip() or "chrome"
 
 
-def chrome_cdp_url() -> str:
-    """Attach to Chrome with --remote-debugging-port (disabled unless IT approved)."""
-    if not allow_unsafe_cdp():
-        return ""
-    return (os.environ.get("AMAZON_CHROME_CDP_URL") or "").strip()
-
-
 def uses_chrome_session() -> bool:
-    return bool(chrome_cdp_url() or use_system_chrome_profile() or chrome_user_data_dir())
+    return use_system_chrome_profile() or chrome_user_data_dir() is not None
 
 
 def amazon_input_filename(report_day: date) -> str:
