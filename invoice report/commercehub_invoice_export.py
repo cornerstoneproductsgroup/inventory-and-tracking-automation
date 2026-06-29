@@ -46,11 +46,14 @@ from sps_commerce_flow import (
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ENV_FILE = _SCRIPT_DIR / ".env"
+_INVENTORY_ENV = _SCRIPT_DIR.parent / "Inventory Submissions" / ".env"
 
 
 def load_project_dotenv() -> None:
-    """Load ``.env`` from this script's folder (not cwd — shortcuts / Task Scheduler often use another cwd)."""
-    load_dotenv(_ENV_FILE)
+    """Load secrets from invoice report/.env, then Inventory Submissions/.env (same as Amazon/UPS)."""
+    load_dotenv(_ENV_FILE, override=False)
+    if _INVENTORY_ENV.is_file():
+        load_dotenv(_INVENTORY_ENV, override=False)
 
 
 load_project_dotenv()
@@ -348,10 +351,12 @@ def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name, default)
     if v is None or v.strip() == "":
         example = _SCRIPT_DIR / ".env.example"
-        if not _ENV_FILE.is_file():
-            extra = f" Create {_ENV_FILE} (copy from {example})."
+        locations = [str(_ENV_FILE)]
+        if _INVENTORY_ENV.is_file():
+            locations.append(str(_INVENTORY_ENV))
         else:
-            extra = f" Add {name} to {_ENV_FILE} (see {example})."
+            locations.append(f"{_INVENTORY_ENV} (copy keys from {example})")
+        extra = f" Add {name} to one of: {' or '.join(locations)}."
         raise RuntimeError(f"Missing required environment variable: {name}.{extra}")
     return v.strip()
 

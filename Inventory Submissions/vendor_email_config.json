@@ -30,7 +30,7 @@
     {
       "vendor_folder": "Ez Pole",
       "to": [
-        "dennis@tdfab.com",
+        "daniela@ezpole.com",
         "sales@ezpole.com"
       ],
       "cc": "gfetzer@4cct.com",
@@ -138,6 +138,13 @@
         "dan@uprootclean.com",
         "rizza@uprootclean.com"
       ],
+      "cc": "gfetzer@4cct.com",
+      "subject": "New Orders Attached for Processing",
+      "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
+    },
+    {
+      "vendor_folder": "Reach Right USA",
+      "to": "orders@reachrightusa.com",
       "cc": "gfetzer@4cct.com",
       "subject": "New Orders Attached for Processing",
       "body": "Hi,\n\nPlease see the attached orders for your review. If you have any questions about the order details or need any additional information, please don't hesitate to reach out.\n\nThank you for your business and continued support. We truly appreciate the opportunity to work with you.\n\nBest,\n\nCornerstone"
