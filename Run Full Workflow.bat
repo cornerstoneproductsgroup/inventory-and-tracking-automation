@@ -23,7 +23,7 @@ echo   1  All Steps ^(vendor emails, invoice reports, inventories, tracking/invo
 echo   T  Tracking / Invoicing ^(submenu^)
 echo   I  Inventory ^(submenu^)
 echo   R  Invoice Reports ^(submenu^)
-echo   9  Custom Invoice Report Date ^(all retailers, date you enter^)
+echo   9  Custom Invoice Report Date ^(pick retailer, then enter date^)
 echo.
 echo Invoice reports need commercehub_invoice_export.py in "invoice report" folder.
 echo.
@@ -135,15 +135,55 @@ set "EXTRA_ARGS=--with-vendor-emails --invoice-report-modes all --run-grainger-a
 goto RUN
 
 :OPT_9
+goto SUBMENU_INVOICE_CUSTOM_DATE
+
+:SUBMENU_INVOICE_CUSTOM_DATE
+cls
+echo.
+echo ============================================================
+echo   Custom Invoice Report Date
+echo ============================================================
+echo   1  All ^(Depot, Lowe's, Tractor Supply^)
+echo   2  Depot
+echo   3  Lowe's
+echo   4  Tractor Supply
+echo   0  Back to main menu
+echo.
+choice /C 01234 /N /M "Press 0-4: "
+REM 0=1 1=2 2=3 3=4 4=5
+if errorlevel 5 goto IR9_TRACTOR
+if errorlevel 4 goto IR9_LOWES
+if errorlevel 3 goto IR9_DEPOT
+if errorlevel 2 goto IR9_ALL
+if errorlevel 1 goto MAIN_MENU
+goto SUBMENU_INVOICE_CUSTOM_DATE
+
+:IR9_PROMPT_DATE
 echo.
 set /p INVOICE_DATE="Enter invoice date (MM/DD/YYYY or YYYY-MM-DD): "
 if not defined INVOICE_DATE (
   echo No date entered — cancelled.
   pause
-  exit /b 1
+  goto MAIN_MENU
 )
-set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes all --invoice-report-date %INVOICE_DATE%"
+set "EXTRA_ARGS=--invoice-report-only --invoice-report-modes %IR9_MODE% --invoice-report-date %INVOICE_DATE%"
 goto RUN
+
+:IR9_ALL
+set "IR9_MODE=all"
+goto IR9_PROMPT_DATE
+
+:IR9_DEPOT
+set "IR9_MODE=depot"
+goto IR9_PROMPT_DATE
+
+:IR9_LOWES
+set "IR9_MODE=lowes"
+goto IR9_PROMPT_DATE
+
+:IR9_TRACTOR
+set "IR9_MODE=tractor"
+goto IR9_PROMPT_DATE
 
 :SUBMENU_TRACKING
 cls
