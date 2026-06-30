@@ -361,6 +361,25 @@ def _env(name: str, default: str | None = None) -> str:
     return v.strip()
 
 
+def _env_first(*names: str) -> str:
+    """Return the first non-empty env var (e.g. COMMERCEHUB_USERNAME or RITHUM_USERNAME)."""
+    for name in names:
+        v = (os.environ.get(name) or "").strip()
+        if v:
+            return v
+    aliases = " or ".join(names)
+    example = _SCRIPT_DIR / ".env.example"
+    locations = [str(_ENV_FILE)]
+    if _INVENTORY_ENV.is_file():
+        locations.append(str(_INVENTORY_ENV))
+    else:
+        locations.append(f"{_INVENTORY_ENV} (see {example})")
+    raise RuntimeError(
+        f"Missing required environment variable: {aliases}. "
+        f"Add one of these to: {' or '.join(locations)}."
+    )
+
+
 _POST_LOGIN_SELECTOR = 'a.application-identity-item, [data-test="dsmMenu-orders"]'
 
 
@@ -1037,8 +1056,8 @@ async def _run_commercehub_invoice_browser(
     """One CommerceHub session: optional Depot and/or Lowe's flows on the same ``page``."""
     if not run_depot and not run_lowes:
         return None, None
-    username = _env("COMMERCEHUB_USERNAME")
-    password = _env("COMMERCEHUB_PASSWORD")
+    username = _env_first("COMMERCEHUB_USERNAME", "RITHUM_USERNAME")
+    password = _env_first("COMMERCEHUB_PASSWORD", "RITHUM_PASSWORD")
     profile_text = os.environ.get("COMMERCEHUB_PROFILE_TEXT", "Cornerstone Products Group")
     profile_url = (os.environ.get("COMMERCEHUB_PROFILE_URL") or "").strip() or None
 
