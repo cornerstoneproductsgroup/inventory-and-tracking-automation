@@ -77,6 +77,20 @@ DOWNLOAD_TIMEOUT_MS = _ms("COMMERCEHUB_DOWNLOAD_TIMEOUT_MS", 600_000)  # generat
 LIST_SETTLE_MS = _ms("COMMERCEHUB_SAVED_SEARCH_LIST_SETTLE_MS", 3_500)  # saved-search list paint delay
 
 
+def _invoice_headless() -> bool:
+    """
+    Visible browser when false.
+
+    COMMERCEHUB_HEADLESS wins if set; otherwise HEADLESS from Inventory Submissions/.env;
+    default true (silent / Task Scheduler friendly).
+    """
+    for key in ("COMMERCEHUB_HEADLESS", "HEADLESS"):
+        raw = (os.environ.get(key) or "").strip().lower()
+        if raw:
+            return raw in ("1", "true", "yes")
+    return True
+
+
 def _invoice_fast() -> bool:
     raw = (os.environ.get("COMMERCEHUB_CHAIN_FAST") or os.environ.get("COMMERCEHUB_INVOICE_FAST") or "")
     return raw.strip().lower() in ("1", "true", "yes")
@@ -1103,7 +1117,8 @@ async def run_export(
     )
 
     download_dir = Path(os.environ.get("COMMERCEHUB_DOWNLOAD_DIR", "./downloads")).resolve()
-    headless = os.environ.get("COMMERCEHUB_HEADLESS", "true").lower() in ("1", "true", "yes")
+    headless = _invoice_headless()
+    _log(f"Browser headless: {headless}")
     day = report_day if report_day is not None else previous_business_day()
     if report_day is not None:
         _log(f"Report day: {day.isoformat()} (custom date)")
